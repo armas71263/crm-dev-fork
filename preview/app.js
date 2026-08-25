@@ -1,6 +1,7 @@
 // RubberTrack preview — data-driven SPA
 const NAV = [
   { id: 'dashboard', label: 'Dashboard', ico: '◈', grp: 'Core' },
+  { id: 'search',    label: 'Search', ico: '⌕' },
   { id: 'orders',    label: 'Order Records', ico: '▤' },
   { id: 'suppliers', label: 'Suppliers', ico: '◉' },
   { id: 'customers', label: 'Customers', ico: '◧' },
@@ -110,9 +111,6 @@ function route(){
 }
 window.addEventListener('hashchange', route);
 
-// load live data before first render; render anyway on failure (static fallback)
-loadLiveData().then(()=>route()).catch(()=>route());
-
 // ---------- Views ----------
 const charts = [];
 function render(id){
@@ -162,14 +160,21 @@ const CHARTS = {
     tooltip:{trigger:'item'},
     series:[{type:'pie',radius:['52%','78%'],itemStyle:{borderColor:'transparent'},
       label:{color:css('--muted')},
-      data:[{name:'Quality',value:2,itemStyle:{color:'#f87171'}},
-            {name:'Document',value:3,itemStyle:{color:'#f5a524'}},
-            {name:'Shipment',value:1,itemStyle:{color:'#2dd4bf'}}],
+      data:(DATA.issueMix || [{category:'Quality',value:2},{category:'Document',value:3},{category:'Shipment',value:1}])
+        .map((m,i)=>({name:m.category[0].toUpperCase()+m.category.slice(1), value:m.value,
+          itemStyle:{color:['#f87171','#f5a524','#2dd4bf','#8fd169','#a78bfa'][i%5]}})),
     }],
   }),
 };
 
 const VIEWS = {
+  search: () => `
+    <div class="card span-12">
+      <h3>Global Search <span class="tag teal" style="font-size:10px">tsvector + pg_trgm hybrid · RLS-scoped</span></h3>
+      <div class="ai-input"><input id="searchQ" placeholder="Search orders, parties, issues, feed…" autocomplete="off" onkeydown="if(event.key==='Enter')runSearch()">
+        <button class="btn" onclick="runSearch()">Search</button></div>
+      <div id="searchOut" style="margin-top:14px;color:var(--muted);font-family:var(--font-m);font-size:12px">Type a query to search across all tenant data.</div>
+    </div>`,
   dashboard: () => `
     <section class="kpis">${DATA.kpis.map(k=>`
       <div class="kpi" style="--c:var(${k.c})">
@@ -292,13 +297,37 @@ window.sendAI = async function(){
   const thinking = log.lastChild;
   try{
     const res = await fetch('/ai/chat', {method:'POST', headers:{'content-type':'application/json','x-tenant-id':currentTenant}, body: JSON.stringify({message:q})});
-    const txt = await res.text();
+    let msg;
+    try{ const j = JSON.parse(await res.text()); msg = j.reply || JSON.stringify(j); }
+    catch{ msg = '(empty response)'; }
     thinking.classList.remove('thinking');
-    thinking.textContent = txt || '(empty response)';
+    thinking.textContent = msg;
   }catch(e){ thinking.textContent = 'AI service unavailable.'; }
   log.scrollTop = log.scrollHeight;
 };
 document.addEventListener('keydown', e => { if (e.key==='Enter' && e.target?.id==='aiText'){ window.sendAI(); }});
+
+// ---------- Global Search ----------
+window.runSearch = async function(){
+  const inp = document.getElementById('searchQ');
+  const out = document.getElementById('searchOut');
+  const q = inp.value.trim(); if (!q) return;
+  out.innerHTML = '<span style="color:var(--muted)">Searching…</span>';
+  try{
+    const res = await fetch('/search?q=' + encodeURIComponent(q), { headers: { 'x-tenant-id': currentTenant } });
+    const d = await res.json();
+    const sect = (title, rows, fmt) => rows.length
+      ? `<div style="margin-top:12px"><b style="color:var(--text)">${title} (${rows.length})</b>${rows.map(fmt).join('')}</div>` : '';
+    const row = (html) => `<div style="padding:6px 0;border-bottom:1px solid var(--line)">${html}</div>`;
+    let html =
+      sect('Orders', d.records, r => row(`<span class="tag">${esc(r.order_id)}</span> ${esc(r.customer)} · ${esc(r.grade)} · ${r.mt} MT · ${esc(r.status)}`)) +
+      sect('Parties', d.parties, r => row(`${esc(r.name)} <span class="tag teal">${esc(r.type)}</span>`)) +
+      sect('Issues', d.tickets, r => row(`<span class="tag amber">${esc(r.ticket_id)}</span> ${esc(r.snippet)} <span class="tag">${esc(r.status)}</span>`)) +
+      sect('Feed', d.feed, r => row(`<span class="tag">${esc(r.category)}</span> ${esc(r.title)}`)) +
+      sect('Semantic matches', d.semantic, r => row(`<span class="tag teal">${esc(r.source_type)}</span> ${esc(r.snippet)} <span style="color:var(--muted)">(${(r.score*100).toFixed(0)}%)</span>`));
+    out.innerHTML = html || '<span style="color:var(--muted)">No results for “' + esc(q) + '”.</span>';
+  }catch(e){ out.innerHTML = '<span style="color:var(--red)">Search failed.</span>'; }
+};
 
 // ---------- Screen Config editor ----------
 let cfgPanels = [];
@@ -432,6 +461,19 @@ async function loadLiveData(){
     }
     if (parts.suppliers) DATA.suppliers = parts.suppliers;
     if (parts.customers) DATA.customers = parts.customers;
+    // KPI charts (Phase 2a): trend + grades + issue mix from the KPI engine.
+    const [trend, grades, issueKpi] = await Promise.all([
+      fetch(`${BFF}/data/kpi/trend`, {headers:hdr}).then(r=>r.json()).catch(()=>null),
+      fetch(`${BFF}/data/kpi/grades`, {headers:hdr}).then(r=>r.json()).catch(()=>null),
+      fetch(`${BFF}/data/kpi/issues`, {headers:hdr}).then(r=>r.json()).catch(()=>null),
+    ]);
+    if (trend?.months?.length){
+      DATA.trendMonths = trend.months.map(m => new Date(m+'-01').toLocaleString('en',{month:'short'}));
+      DATA.trendMT = trend.mt;
+      DATA.trendRev = trend.revenue.map(v => +(v/1e6).toFixed(3));
+    }
+    if (grades?.grades?.length) DATA.grades = grades.grades.map(g => ({name:g.grade, mt:g.mt}));
+    if (issueKpi?.by_category?.length) DATA.issueMix = issueKpi.by_category;
     DATA.tenant = TENANT_LABEL[currentTenant] || currentTenant;
   }catch(e){ console.warn('BFF unreachable, using static data', e); }
 }
@@ -441,3 +483,6 @@ function timeAgo(iso){
   if (d<86400) return Math.round(d/3600)+'h ago';
   return Math.round(d/86400)+'d ago';
 }
+
+// Initial load — called last so all functions/vars are defined (TDZ-safe).
+loadLiveData().then(()=>route()).catch(()=>route());

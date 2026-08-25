@@ -37,7 +37,7 @@ Sellable multi-tenant CRM + analytics dashboard + CMS. RubberTrack (rubber tradi
 ## Phase status
 - Phase 0 (scaffold): DONE — pgvector, helper.sql, app_role
 - Phase 1 (template engine): DONE — screen_configs table+RLS, Directus 12 roles/policies (7 roles, idempotent), Excel import/export (date-serial fix), screen-config editor endpoint (GET/PUT), 3 new preview screens (Doc Checker, AI Assistant, Screen Config), isolation Test F pass, Excel round-trip verified.
-- Phase 2 (dashboard + hybrid search): TODO — KPI engine, chart builder w/ config-in-DB, pgvector+tsvector+trgm hybrid search, global search UI, real AI RAG over tenant embeddings
+- Phase 2 (dashboard + hybrid search): DONE — KPI engine (/data/kpi/trend|grades|issues|chart), hybrid /search (tsvector+trgm+optional pgvector), real AI RAG (deterministic 768-dim hash embeddings, /index + /chat, RLS-scoped), global Search screen, dashboard charts wired to live KPI endpoints
 - Phase 3 (AI platform): TODO
 - Phase 4 (ops/escalation): TODO
 - Phase 5 (white-label + release): TODO
@@ -51,3 +51,6 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - **Postgres init scripts only run on fresh volumes** — to apply schema changes to a running DB, recreate the volume (`docker compose down -v`) or run a migration. The `app_role` is non-superuser so RLS+FORCE applies.
 - **RLS pattern**: one `tenant_isolation` policy per table (`FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (...)`), ENABLE + FORCE. `app.current_tenant()` reads `current_setting('app.tenant_id')`. Fail-closed when unset (returns NULL → 0 rows).
 - **Preview SPA**: `route()` runs once on load via `loadLiveData().then(route)`; direct-hash navigations rely on `hashchange`. The `render` function can be monkey-patched to hook per-screen init (e.g. load config on the config screen).
+- **CSP pitfall**: default helmet CSP sets `script-src-attr 'none'` which silently blocks all inline `onclick=` handlers — buttons look fine but never fire. The BFF now sets an explicit CSP allowing `scriptSrcAttr: 'unsafe-inline'` and `scriptSrc: 'self' + cdn.jsdelivr.net` (for echarts).
+- **TDZ pitfall**: calling `loadLiveData()` at the top of app.js threw a silent ReferenceError because it reads `let currentTenant` declared later — the catch fell back to static data so it looked fine. Initial load must run at the END of app.js.
+- **Docker-in-docker networking**: start dockerd WITHOUT `--iptables=false` (breaks embedded DNS at 127.0.0.11 → inter-container name resolution fails with EAI_AGAIN). Build images with `docker build --network=host` to bypass buildkit DNS issues reaching npmjs.

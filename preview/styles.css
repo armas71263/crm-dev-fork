@@ -167,7 +167,7 @@ tbody tr:hover{background:var(--panel2)}
 .ai-card{display:flex;flex-direction:column;min-height:60vh}
 .ai-log{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:12px;background:var(--bg2);border:1px solid var(--line);border-radius:8px;margin-bottom:12px}
 .ai-msg{max-width:80%;padding:9px 13px;border-radius:10px;font-size:13px;line-height:1.5}
-.ai-msg.bot{background:var(--panel2);border:1px solid var(--line2);align-self:flex-start}
+.ai-msg.bot{background:var(--panel2);border:1px solid var(--line2);align-self:flex-start;white-space:pre-wrap}
 .ai-msg.user{background:var(--teal);color:#04201d;align-self:flex-end;font-weight:500}
 .ai-msg.thinking{opacity:.6}
 .ai-input{display:flex;gap:8px}
