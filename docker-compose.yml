@@ -6,7 +6,7 @@ services:
     image: pgvector/pgvector:pg17
     ports: ["5432:5432"]
     environment: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: rubbertrack}
-    volumes: [pgdata:/var/lib/postgresql/data, ./infra/tenancy/helper.sql:/docker-entrypoint-initdb.d/01_helper.sql]
+    volumes: [pgdata:/var/lib/postgresql/data, ./infra/tenancy/helper.sql:/docker-entrypoint-initdb.d/01_helper.sql:ro, ./infra/tenancy/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql:ro]
 
   directus:
     image: directus/directus:latest
@@ -17,7 +17,8 @@ services:
   bff:
     build: {context: ./apps/bff}
     ports: ["4000:4000"]
-    environment: {BFF_PORT: "4000", DIRECTUS_URL: http://directus:8055, AI_SERVICE_URL: http://ai-service:5000}
+    environment: {BFF_PORT: "4000", DIRECTUS_URL: http://directus:8055, AI_SERVICE_URL: http://ai-service:5000, PG_HOST: postgres, PG_DATABASE: rubbertrack, PG_USER: app_role, PG_PASSWORD: apppass}
+    volumes: [./preview:/app/preview:ro]
     depends_on: [directus, ai-service]
 
   ai-service:

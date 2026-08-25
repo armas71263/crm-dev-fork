@@ -107,6 +107,9 @@ function route(){
 }
 window.addEventListener('hashchange', route);
 
+// load live data before first render; render anyway on failure (static fallback)
+loadLiveData().then(()=>route()).catch(()=>route());
+
 // ---------- Views ----------
 const charts = [];
 function render(id){
@@ -249,4 +252,49 @@ document.getElementById('globalSearch').addEventListener('keydown', e => {
   }
 });
 
-route();
+// ---------- Tenant select (live switch) ----------
+const TENANT_MAP = { 'RubberTrack Demo':'rubbertrack', 'Lexley Rubber':'lexley', 'Tiong Huat Trading':'tiong' };
+const TENANT_LABEL = Object.fromEntries(Object.entries(TENANT_MAP).map(([k,v])=>[v,k]));
+document.getElementById('tenantSelect').addEventListener('change', e => {
+  const id = TENANT_MAP[e.target.value] || 'rubbertrack';
+  currentTenant = id;
+  document.getElementById('tenantName').textContent = e.target.value;
+  loadLiveData().then(()=>route());
+});
+let currentTenant = 'rubbertrack';
+
+// ---------- Live data loader (BFF → Postgres RLS) ----------
+// Fetches from the BFF and merges into DATA. Falls back to static data if the
+// BFF is unreachable, so the preview never breaks offline. Layout adapts to
+// whatever data shape arrives (counts, columns auto-driven).
+// BFF serves both the static UI and /data/* on the same origin (single tunnel).
+const BFF = '';
+async function loadLiveData(){
+  try{
+    const hdr = { 'x-tenant-id': currentTenant };
+    const dash = await fetch(`${BFF}/data/dashboard`, {headers:hdr}).then(r=>r.json());
+    const parts = await fetch(`${BFF}/data/parties`, {headers:hdr}).then(r=>r.json()).catch(()=>({}));
+    if (dash.kpi){
+      DATA.kpis = [
+        { lbl:'Open Orders', val:+dash.kpi.open_orders, sub:'live from BFF', dir:'up', c:'--amber' },
+        { lbl:'Active MT',   val:(+dash.kpi.active_mt).toFixed(1), sub:'across FCL', dir:'up', c:'--teal' },
+        { lbl:'Revenue (Aug)', val:'$1.28M', sub:'est.', dir:'down', c:'--green' },
+        { lbl:'Open Issues', val:+dash.kpi.open_issues, sub:'quality · doc · ship', dir:'down', c:'--red' },
+        { lbl:'Suppliers', val:dash.kpi.suppliers, sub:'live', dir:'up', c:'--amber' },
+        { lbl:'Customers', val:dash.kpi.customers, sub:'live', dir:'up', c:'--teal' },
+      ];
+      DATA.orders = dash.orders.map(o=>[o.order_id,o.customer,o.supplier,o.grade,o.mt,o.fcl,o.price_usd,o.status]);
+      DATA.issues = dash.issues.map(i=>[i.ticket_id,i.category,i.description,i.status]);
+      DATA.feed = dash.feed.map(f=>[['⚡','◉','⚠','✓','▤'][['price','order','issue','doc','news'].indexOf(f.category)]||'◆', f.title, timeAgo(f.published_at)]);
+    }
+    if (parts.suppliers) DATA.suppliers = parts.suppliers;
+    if (parts.customers) DATA.customers = parts.customers;
+    DATA.tenant = TENANT_LABEL[currentTenant] || currentTenant;
+  }catch(e){ console.warn('BFF unreachable, using static data', e); }
+}
+function timeAgo(iso){
+  const d=(Date.now()-new Date(iso).getTime())/1000;
+  if (d<3600) return Math.round(d/60)+'m ago';
+  if (d<86400) return Math.round(d/3600)+'h ago';
+  return Math.round(d/86400)+'d ago';
+}
