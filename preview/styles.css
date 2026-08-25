@@ -146,3 +146,39 @@ tbody tr:hover{background:var(--panel2)}
   .bottomnav a .ico{font-size:17px}
   .bottomnav a.active{color:var(--amber)}
 }
+
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);color:var(--text);border:1px solid var(--line2);border-radius:7px;padding:8px 14px;font-family:var(--font-m);font-size:12px;cursor:pointer;transition:border-color .15s,background .15s}
+.btn:hover{border-color:var(--teal);background:#1d2a26}
+.btn.primary{background:var(--teal);color:#04201d;border-color:var(--teal);font-weight:600}
+.btn.primary:hover{background:#3edccc}
+.btn.sm{padding:5px 10px;font-size:11px}
+
+/* Doc Checker */
+.doc-diff{width:100%;min-height:180px;background:var(--bg2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:12px;font-family:var(--font-m);font-size:12px;resize:vertical}
+.diff-out{background:var(--bg2);border:1px solid var(--line);border-radius:8px;padding:8px;font-family:var(--font-m);font-size:12px;max-height:280px;overflow:auto}
+.d-line{padding:2px 8px;white-space:pre-wrap;word-break:break-word}
+.d-line.eq{color:var(--muted)}
+.d-line.add{background:rgba(52,211,153,.12);color:var(--green)}
+.d-line.del{background:rgba(248,113,113,.12);color:var(--red)}
+
+/* AI Assistant */
+.ai-card{display:flex;flex-direction:column;min-height:60vh}
+.ai-log{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:12px;background:var(--bg2);border:1px solid var(--line);border-radius:8px;margin-bottom:12px}
+.ai-msg{max-width:80%;padding:9px 13px;border-radius:10px;font-size:13px;line-height:1.5}
+.ai-msg.bot{background:var(--panel2);border:1px solid var(--line2);align-self:flex-start}
+.ai-msg.user{background:var(--teal);color:#04201d;align-self:flex-end;font-weight:500}
+.ai-msg.thinking{opacity:.6}
+.ai-input{display:flex;gap:8px}
+.ai-input input{flex:1;background:var(--bg2);border:1px solid var(--line2);border-radius:7px;padding:10px 12px;color:var(--text);font-family:var(--font-b);font-size:13px}
+.ai-input input:focus{outline:none;border-color:var(--teal)}
+
+/* Screen Config editor */
+.cfg-panels{display:flex;flex-direction:column;gap:8px}
+.cfg-row{display:flex;gap:8px;align-items:center}
+.cfg-row select,.cfg-row input{background:var(--bg2);border:1px solid var(--line);border-radius:6px;padding:7px 10px;color:var(--text);font-family:var(--font-m);font-size:12px}
+.cfg-row select{flex:0 0 90px}
+.cfg-row input{flex:1}
+.cfg-row input:focus,.cfg-row select:focus{outline:none;border-color:var(--teal)}
+

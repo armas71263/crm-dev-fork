@@ -3,8 +3,10 @@ import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import pg from 'pg'
 import fastifyStatic from '@fastify/static'
+import multipart from '@fastify/multipart'
 import { fileURLToPath } from 'url'
 import path from 'path'
+import * as XLSX from 'xlsx'
 
 const fastify = Fastify({ logger: true })
 const PORT = parseInt(process.env.BFF_PORT || '4000', 10)
@@ -21,6 +23,7 @@ const pool = new pg.Pool({
 
 await fastify.register(cors, { origin: true })
 await fastify.register(helmet)
+await fastify.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } })
 
 fastify.get('/health', async () => ({ ok: true, service: 'bff' }))
 
@@ -78,6 +81,74 @@ fastify.get('/data/parties', async (req) => {
 fastify.get('/data/checklists', async (req) => {
   const r = await tenantQuery(req, 'SELECT checklist_json FROM checklists WHERE active=true ORDER BY id DESC LIMIT 1')
   return { items: r.rows[0]?.checklist_json || [] }
+})
+
+// ---- Excel/CSV import & export (tenant-scoped via RLS) ----
+const IMPORTABLE = ['records', 'parties', 'tickets', 'feed_items']
+const EXPORT_FIELDS = {
+  records: ['order_id', 'date', 'customer', 'supplier', 'grade', 'mt', 'fcl', 'price_usd', 'status'],
+  parties: ['name', 'type', 'contact', 'tags'],
+  tickets: ['ticket_id', 'customer', 'supplier', 'category', 'status', 'description'],
+  feed_items: ['category', 'title', 'description', 'priority', 'published_at'],
+}
+
+// Export a collection to xlsx. ?type=records|parties|tickets|feed_items
+fastify.get('/data/export', async (req, reply) => {
+  const type = (req.query.type || 'records')
+  if (!IMPORTABLE.includes(type)) return reply.code(400).send({ error: 'unsupported type' })
+  const fields = EXPORT_FIELDS[type]
+  const r = await tenantQuery(req, `SELECT ${fields.join(',')} FROM ${type} ORDER BY created_at DESC`)
+  const ws = XLSX.utils.json_to_sheet(r.rows.length ? r.rows : [{}])
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, type)
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' })
+  reply.header('content-type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+  reply.header('content-disposition', `attachment; filename="${type}-${req.tenantId}.xlsx"`)
+  return buf
+})
+
+// Import xlsx/csv into a collection. Multipart upload: file + type.
+fastify.post('/data/import', async (req, reply) => {
+  const file = await req.file()
+  if (!file) return reply.code(400).send({ error: 'no file' })
+  const type = file.fields?.type?.value || 'records'
+  if (!IMPORTABLE.includes(type)) return reply.code(400).send({ error: 'unsupported type' })
+  const buf = await file.toBuffer()
+  const wb = XLSX.read(buf, { type: 'buffer', cellDates: true })
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { raw: false, dateNF: 'yyyy-mm-dd' })
+  if (!rows.length) return { imported: 0 }
+  const fields = EXPORT_FIELDS[type]
+  // Build a parameterized multi-row INSERT (all tenant-scoped by RLS WITH CHECK).
+  const cols = ['tenant_id', ...fields]
+  let paramIdx = 1
+  const values = []
+  const placeholders = rows.map((row) => {
+    const ph = cols.map(() => `$${paramIdx++}`).join(',')
+    values.push(req.tenantId, ...fields.map((f) => row[f] ?? null))
+    return `(${ph})`
+  }).join(',')
+  const sql = `INSERT INTO ${type} (${cols.join(',')}) VALUES ${placeholders}`
+  await tenantQuery(req, sql, values)
+  return { imported: rows.length, type }
+})
+
+// ---- Screen-config editor (per-tenant dashboard layout) ----
+// Stores which charts/cards each screen shows so admins can reconfigure without code.
+fastify.get('/data/screen-config', async (req) => {
+  const screen = req.query.screen || 'dashboard'
+  const r = await tenantQuery(req,
+    'SELECT config FROM screen_configs WHERE active=true AND screen=$1 ORDER BY id DESC LIMIT 1', [screen])
+  return { screen, config: r.rows[0]?.config || null }
+})
+
+fastify.put('/data/screen-config', async (req) => {
+  const { screen = 'dashboard', config = {} } = req.body || {}
+  // Deactivate old configs for this screen, then insert the new one (tenant-scoped).
+  await tenantQuery(req, "UPDATE screen_configs SET active=false WHERE screen=$1", [screen])
+  const r = await tenantQuery(req,
+    "INSERT INTO screen_configs (tenant_id, screen, config, active) VALUES ($1,$2,$3,true) RETURNING id",
+    [req.tenantId, screen, JSON.stringify(config)])
+  return { id: r.rows[0]?.id, screen, saved: true }
 })
 
 // Proxy to AI service (approve the AI contexts)

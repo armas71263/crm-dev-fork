@@ -123,6 +123,18 @@ CREATE TABLE IF NOT EXISTS embeddings (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Per-tenant screen layout config (dashboard panel arrangement). Lets a
+-- tenant-admin reconfigure which charts/cards each screen shows without code.
+CREATE TABLE IF NOT EXISTS screen_configs (
+  id          BIGSERIAL PRIMARY KEY,
+  tenant_id   TEXT NOT NULL REFERENCES app.tenants(id),
+  screen      TEXT NOT NULL DEFAULT 'dashboard',  -- dashboard | records | issues
+  config      JSONB NOT NULL DEFAULT '{}'::jsonb, -- {panels:[{type,source,title}]}
+  active      BOOLEAN NOT NULL DEFAULT true,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_screen_configs_tenant ON screen_configs(tenant_id, screen);
+
 -- ============================================================
 -- 3. INDEXES
 -- ============================================================
@@ -153,6 +165,7 @@ ALTER TABLE feed_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE checklists ENABLE ROW LEVEL SECURITY;
 ALTER TABLE files      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE screen_configs ENABLE ROW LEVEL SECURITY;
 
 -- One policy per table: tenant_id must equal the session's app.tenant_id.
 CREATE POLICY tenant_isolation ON records    FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
@@ -163,6 +176,7 @@ CREATE POLICY tenant_isolation ON feed_items FOR ALL USING (tenant_id = app.curr
 CREATE POLICY tenant_isolation ON checklists FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
 CREATE POLICY tenant_isolation ON files      FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
 CREATE POLICY tenant_isolation ON embeddings FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
+CREATE POLICY tenant_isolation ON screen_configs FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
 
 -- ============================================================
 -- 5. SEED TENANTS + DEMO DATA
@@ -229,6 +243,22 @@ INSERT INTO checklists (tenant_id, party_id, checklist_json, active) VALUES
 INSERT INTO records (tenant_id, order_id, date, customer, supplier, grade, mt, fcl, price_usd, status) VALUES
   ('lexley','LEX-2026-0001','2026-08-10','Pirelli','Lexley Rubber','TSR-20',50.4,2,1900,'In Production');
 
+-- Default dashboard layout for RubberTrack (panels the preview renders).
+INSERT INTO screen_configs (tenant_id, screen, config, active) VALUES
+  ('rubbertrack', 'dashboard', '{
+    "panels": [
+      {"type":"kpi","source":"open_orders","title":"Open Orders"},
+      {"type":"kpi","source":"active_mt","title":"Active MT"},
+      {"type":"kpi","source":"suppliers","title":"Suppliers"},
+      {"type":"kpi","source":"customers","title":"Customers"},
+      {"type":"kpi","source":"open_issues","title":"Open Issues"},
+      {"type":"table","source":"orders","title":"Recent Orders","limit":4},
+      {"type":"table","source":"issues","title":"Open Issues","limit":5},
+      {"type":"feed","source":"feed","title":"News & Alerts","limit":8}
+    ]
+  }'::jsonb, true)
+ON CONFLICT DO NOTHING;
+
 -- ============================================================
 -- 7. GRANTS + FORCE RLS for app_role
 -- ============================================================
@@ -249,4 +279,5 @@ ALTER TABLE feed_items FORCE ROW LEVEL SECURITY;
 ALTER TABLE checklists FORCE ROW LEVEL SECURITY;
 ALTER TABLE files      FORCE ROW LEVEL SECURITY;
 ALTER TABLE embeddings FORCE ROW LEVEL SECURITY;
+ALTER TABLE screen_configs FORCE ROW LEVEL SECURITY;
 

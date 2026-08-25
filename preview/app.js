@@ -10,7 +10,10 @@ const NAV = [
   { grp: 'Control' },
   { id: 'news',      label: 'News Feed', ico: '◆' },
   { id: 'docs',      label: 'Doc Tools', ico: '▦' },
+  { id: 'doccheck',  label: 'Doc Checker', ico: '⇄' },
   { id: 'checklists', label: 'Checklists', ico: '✓' },
+  { id: 'ai',        label: 'AI Assistant', ico: '✦' },
+  { id: 'config',    label: 'Screen Config', ico: '⚙' },
 ];
 
 const DATA = {
@@ -88,7 +91,7 @@ navEl.innerHTML = NAV.map(n => n.grp
   : `<a href="#/${n.id}" data-id="${n.id}"><span class="ico">${n.ico}</span>${n.label}</a>`).join('');
 
 const bottomnav = document.getElementById('bottomnav');
-const primary5 = ['dashboard','orders','issues','docs','checklists'];
+const primary5 = ['dashboard','orders','issues','ai','config'];
 bottomnav.innerHTML = primary5.map(id => {
   const n = NAV.find(x => x.id === id);
   return `<a href="#/${n.id}" data-id="${n.id}"><span class="ico">${n.ico}</span>${n.label.split(' ')[0]}</a>`;
@@ -202,6 +205,45 @@ const VIEWS = {
       `<label class="${done?'done':''}"><input type="checkbox" ${done?'checked':''}>${t}</label>`).join('')}</div></div>`,
   suppliers: () => `<div class="card span-12"><h3>Suppliers (${DATA.suppliers.length})</h3>${pillList(DATA.suppliers)}</div>`,
   customers: () => `<div class="card span-12"><h3>Customers (${DATA.customers.length})</h3>${pillList(DATA.customers)}</div>`,
+  doccheck: () => `
+    <section class="grid">
+      <div class="card span-6"><h3>Document A</h3>
+        <textarea id="docA" class="doc-diff" placeholder="Paste PI / B/L text…">PROFORMA INVOICE No. PI-2026-0042
+Seller: Tiong Huat (ID)
+Buyer: JK Tyre (IN)
+Grade: TSR-20 · Qty: 100.8 MT · 4 FCL
+Unit price: USD 1,875/MT
+Incoterms: FOB Belawan</textarea></div>
+      <div class="card span-6"><h3>Document B</h3>
+        <textarea id="docB" class="doc-diff" placeholder="Paste revised doc text…">PROFORMA INVOICE No. PI-2026-0042
+Seller: Tiong Huat (ID)
+Buyer: JK Tyre (IN)
+Grade: TSR-20 · Qty: 100.8 MT · 4 FCL
+Unit price: USD 1,890/MT
+Incoterms: DAP Mundra</textarea></div>
+      <div class="card span-12"><h3>Diff <button class="btn" onclick="runDiff()">Compare</button></h3>
+        <div id="diffOut" class="diff-out"><span style="color:var(--muted);font-family:var(--font-m);font-size:12px">Click Compare to highlight line-level differences.</span></div></div>
+    </section>`,
+  ai: () => `
+    <div class="card span-12 ai-card">
+      <h3>AI Assistant <span class="tag teal" style="font-size:10px">LlamaIndex + pgvector · RLS-scoped</span></h3>
+      <div id="aiLog" class="ai-log">
+        <div class="ai-msg bot">Ask me about orders, suppliers, quality issues, or market prices. I'm scoped to your tenant.</div>
+      </div>
+      <div class="ai-input"><input id="aiText" placeholder="e.g. Which orders have quality issues?" autocomplete="off">
+        <button class="btn" onclick="sendAI()">Send</button></div>
+    </div>`,
+  config: () => `
+    <div class="card span-12"><h3>Screen Configuration <span style="color:var(--muted);font-size:11px;font-weight:400">— re-arrange dashboard panels (saved per tenant)</span></h3>
+      <div id="cfgPanels" class="cfg-panels"></div>
+      <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" onclick="addPanel()">+ Add panel</button>
+        <button class="btn primary" onclick="saveConfig()">Save layout</button>
+        <button class="btn" onclick="exportData()">Export Records (xlsx)</button>
+        <label class="btn" style="cursor:pointer">Import (xlsx)<input type="file" id="impFile" accept=".xlsx,.csv" hidden onchange="importData(this)"></label>
+      </div>
+      <div id="cfgMsg" style="margin-top:8px;color:var(--muted);font-family:var(--font-m);font-size:12px"></div>
+    </div>`,
 };
 
 const ordersTable = rows => `<table class="tbl">
@@ -220,6 +262,107 @@ const attTable = rows => `<table class="tbl">
   <tbody>${rows.map(r=>`<tr><td style="font-family:var(--font-b)">${r[0]}</td>${r.slice(1).map(d=>`<td><span class="tag ${d==='IN'?'green':'red'}">${d}</span></td>`).join('')}</tr>`).join('')}</tbody></table>`;
 
 const pillList = items => `<div style="display:flex;flex-wrap:wrap;gap:8px">${items.map(s=>`<span class="tag teal">${s}</span>`).join('')}</div>`;
+
+// ---------- Doc Checker (line-level diff) ----------
+window.runDiff = function(){
+  const a = document.getElementById('docA').value.split('\n');
+  const b = document.getElementById('docB').value.split('\n');
+  const max = Math.max(a.length, b.length);
+  let out = '';
+  for (let i=0; i<max; i++){
+    const la = a[i] ?? '', lb = b[i] ?? '';
+    if (la === lb) out += `<div class="d-line eq">${i+1}  ${esc(la)}</div>`;
+    else {
+      if (la) out += `<div class="d-line del">- ${esc(la)}</div>`;
+      if (lb) out += `<div class="d-line add">+ ${esc(lb)}</div>`;
+    }
+  }
+  document.getElementById('diffOut').innerHTML = out || '<span style="color:var(--muted)">No differences.</span>';
+};
+function esc(s){ return (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+// ---------- AI Assistant ----------
+window.sendAI = async function(){
+  const inp = document.getElementById('aiText');
+  const q = inp.value.trim(); if (!q) return;
+  const log = document.getElementById('aiLog');
+  log.insertAdjacentHTML('beforeend', `<div class="ai-msg user">${esc(q)}</div>`);
+  inp.value = '';
+  log.insertAdjacentHTML('beforeend', `<div class="ai-msg bot thinking">…</div>`);
+  const thinking = log.lastChild;
+  try{
+    const res = await fetch('/ai/chat', {method:'POST', headers:{'content-type':'application/json','x-tenant-id':currentTenant}, body: JSON.stringify({message:q})});
+    const txt = await res.text();
+    thinking.classList.remove('thinking');
+    thinking.textContent = txt || '(empty response)';
+  }catch(e){ thinking.textContent = 'AI service unavailable.'; }
+  log.scrollTop = log.scrollHeight;
+};
+document.addEventListener('keydown', e => { if (e.key==='Enter' && e.target?.id==='aiText'){ window.sendAI(); }});
+
+// ---------- Screen Config editor ----------
+let cfgPanels = [];
+const PANEL_SOURCES = ['open_orders','active_mt','suppliers','customers','open_issues','orders','issues','feed'];
+const PANEL_TYPES = ['kpi','table','feed','chart'];
+window.renderCfgPanels = function(){
+  const el = document.getElementById('cfgPanels');
+  if (!el) return;
+  el.innerHTML = cfgPanels.map((p,i)=>`
+    <div class="cfg-row">
+      <select data-i="${i}" data-k="type">${PANEL_TYPES.map(t=>`<option ${p.type===t?'selected':''}>${t}</option>`).join('')}</select>
+      <input data-i="${i}" data-k="source" value="${esc(p.source||'')}" placeholder="source">
+      <input data-i="${i}" data-k="title" value="${esc(p.title||'')}" placeholder="title">
+      <button class="btn sm" onclick="rmPanel(${i})">✕</button>
+    </div>`).join('') || '<span style="color:var(--muted);font-family:var(--font-m);font-size:12px">No panels — add one.</span>';
+  el.querySelectorAll('[data-k]').forEach(inp => inp.addEventListener('change', e => {
+    cfgPanels[+e.target.dataset.i][e.target.dataset.k] = e.target.value;
+  }));
+};
+window.addPanel = function(){ cfgPanels.push({type:'kpi', source:'open_orders', title:'New KPI'}); window.renderCfgPanels(); };
+window.rmPanel = function(i){ cfgPanels.splice(i,1); window.renderCfgPanels(); };
+window.saveConfig = async function(){
+  const msg = document.getElementById('cfgMsg');
+  try{
+    const r = await fetch('/data/screen-config', {method:'PUT', headers:{'content-type':'application/json','x-tenant-id':currentTenant}, body: JSON.stringify({screen:'dashboard', config:{panels:cfgPanels}})});
+    const d = await r.json();
+    msg.textContent = `✓ Saved (id ${d.id}). Dashboard will use this layout.`;
+  }catch(e){ msg.textContent = 'Save failed — BFF unreachable.'; }
+};
+async function loadConfig(){
+  try{
+    const r = await fetch('/data/screen-config?screen=dashboard', {headers:{'x-tenant-id':currentTenant}});
+    const d = await r.json();
+    if (d.config?.panels){ cfgPanels = d.config.panels; }
+  }catch(e){}
+  window.renderCfgPanels();
+}
+// Hook: when config screen renders, load + render panels.
+const _render = render;
+render = function(id){ _render(id); if (id==='config') loadConfig(); };
+
+// ---------- Import / Export ----------
+window.exportData = function(){
+  const a = document.createElement('a');
+  a.href = `/data/export?type=records&x=${currentTenant}`;
+  a.setAttribute('download', `records-${currentTenant}.xlsx`);
+  // Use fetch to attach tenant header, then download blob.
+  fetch('/data/export?type=records', {headers:{'x-tenant-id':currentTenant}})
+    .then(r => r.blob()).then(b => {
+      const u = URL.createObjectURL(b);
+      a.href = u; a.click(); URL.revokeObjectURL(u);
+    });
+};
+window.importData = async function(input){
+  const f = input.files[0]; if (!f) return;
+  const msg = document.getElementById('cfgMsg');
+  const fd = new FormData(); fd.append('type','records'); fd.append('file', f);
+  try{
+    const r = await fetch('/data/import', {method:'POST', headers:{'x-tenant-id':currentTenant}, body: fd});
+    const d = await r.json();
+    msg.textContent = d.imported ? `✓ Imported ${d.imported} ${d.type}` : `Import: ${JSON.stringify(d)}`;
+    loadLiveData().then(()=>route());
+  }catch(e){ msg.textContent = 'Import failed.'; }
+};
 
 // ---------- Ticker ----------
 const track = document.getElementById('tickerTrack');

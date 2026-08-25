@@ -48,3 +48,12 @@ SET app.tenant_id='lexley';
 \echo 'E.2 current_tenant() returns lexley (expect lexley):'
 SELECT app.current_tenant() AS current;
 RESET app.tenant_id;
+
+\echo ''
+\echo '=== Test F: screen_configs isolated per tenant ==='
+SET app.tenant_id='rubbertrack';
+\echo 'F.1 rubbertrack sees dashboard config (expect 1):'
+SELECT count(*) AS rt_configs FROM screen_configs WHERE screen='dashboard';
+SET app.tenant_id='lexley';
+\echo 'F.2 lexley sees no dashboard config (expect 0):'
+SELECT count(*) AS lexley_configs FROM screen_configs WHERE screen='dashboard';
