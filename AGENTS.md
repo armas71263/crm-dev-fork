@@ -36,11 +36,18 @@ Sellable multi-tenant CRM + analytics dashboard + CMS. RubberTrack (rubber tradi
 
 ## Phase status
 - Phase 0 (scaffold): DONE — pgvector, helper.sql, app_role
-- Phase 1 (template engine): IN PROGRESS — schema + RLS + seed + BFF data endpoints + live preview wiring done; remaining: module registry, screen-config editor, Excel import/export, Directus RBAC mapping, isolation tests D-E (customer scope, staff admin-UI block)
-- Phase 2 (dashboard + hybrid search): TODO — KPI engine, chart builder w/ config-in-DB, pgvector+tsvector+trgm hybrid search, global search UI
+- Phase 1 (template engine): DONE — screen_configs table+RLS, Directus 12 roles/policies (7 roles, idempotent), Excel import/export (date-serial fix), screen-config editor endpoint (GET/PUT), 3 new preview screens (Doc Checker, AI Assistant, Screen Config), isolation Test F pass, Excel round-trip verified.
+- Phase 2 (dashboard + hybrid search): TODO — KPI engine, chart builder w/ config-in-DB, pgvector+tsvector+trgm hybrid search, global search UI, real AI RAG over tenant embeddings
 - Phase 3 (AI platform): TODO
 - Phase 4 (ops/escalation): TODO
 - Phase 5 (white-label + release): TODO
 
 ## Repo
-Local git only (`/workspace/project`, branch `master`). No remote configured. Commits: bf93e5c → ac957ce → c1e2cb6 → 187d0ad.
+Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). No remote configured. Commits: ac957ce → c1e2cb6 → 187d0ad → 8843782 → c24637a (phase0/1 gap closure).
+
+## Key learnings (avoid re-discovering)
+- **Directus 12 RBAC** uses policies+access model, NOT legacy `permissions` endpoint directly. Create role → create policy (links role) → POST /access (role+policy) → POST /permissions with `policy` field. Filter hyphenated role names with `limit=-1` list + grep (the `filter[name][_eq]` breaks on hyphens).
+- **Excel date parsing**: XLSX serializes dates as serial numbers (e.g. 46235). On import use `XLSX.read(buf,{type:'buffer',cellDates:true})` + `sheet_to_json(ws,{raw:false,dateNF:'yyyy-mm-dd'})` to get ISO strings.
+- **Postgres init scripts only run on fresh volumes** — to apply schema changes to a running DB, recreate the volume (`docker compose down -v`) or run a migration. The `app_role` is non-superuser so RLS+FORCE applies.
+- **RLS pattern**: one `tenant_isolation` policy per table (`FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (...)`), ENABLE + FORCE. `app.current_tenant()` reads `current_setting('app.tenant_id')`. Fail-closed when unset (returns NULL → 0 rows).
+- **Preview SPA**: `route()` runs once on load via `loadLiveData().then(route)`; direct-hash navigations rely on `hashchange`. The `render` function can be monkey-patched to hook per-screen init (e.g. load config on the config screen).
