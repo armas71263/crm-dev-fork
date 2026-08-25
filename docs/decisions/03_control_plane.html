@@ -1,0 +1,93 @@
+<!doctype html><html><head><meta charset="utf-8"><title>03_control_plane.md</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:14px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}h1,h2,h3{color:#0f172a}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}</style></head><body><h1>Decision 3: What Directus Does (admin panel, login, permissions, API)</h1>
+<h2>What Directus is (in plain words)</h2>
+<p>Directus is an <strong>open-source "data studio in a box"</strong>. You point it to a database, and it gives you:</p>
+<ol>
+<li>A ready <strong>admin UI</strong> (add/edit/view data — no coding).</li>
+<li>A ready <strong>API</strong> (REST + GraphQL for your app).</li>
+<li>Ready <strong>authentication</strong> (email/password login, tokens).</li>
+<li>Ready <strong>role-based permissions</strong> (RBAC).</li>
+<li>Ready <strong>file storage</strong> (uploads).</li>
+</ol>
+<p>Instead of coding all of that from scratch (2–4 weeks of work), we run one Docker container and it's live.</p>
+<h2>Why this matters for your multi-clients model</h2>
+<ul>
+<li><strong>New client setup (RubberTrack vs. anything else)</strong>: You log into Directus, define that client's collections (tables) and roles. No code changes needed.</li>
+<li><strong>New role or permission</strong>: Set role + collection + field rules in the UI (e.g., "customers can only see their own orders").</li>
+<li><strong>Admin UI out of the box</strong>: The privileged-admin (you) and tenant admins get a full back office with no coding.</li>
+</ul>
+<h2>How Directus + your custom frontend work together</h2>
+<ul>
+<li><strong>Frontend</strong> (your custom React screens) uses Directus SDK/API for all data.</li>
+<li><strong>Directus admin UI</strong> runs on the same backend but is accessible ONLY to <code>privileged-admin</code> and <code>tenant-admin</code> roles.</li>
+<li>Custom screens (Dashboard, AI panel, Doc checker) stay custom React; the underlying data still flows through Directus.</li>
+</ul>
+<h2>How it'll look (sets of screens)</h2>
+<p><strong>For you (privileged-admin)</strong> and <strong>tenant-admin</strong>:
+- Directus Admin UI at <code>https://api.yourapp.com/admin</code> — collections, users, roles, settings, files.</p>
+<p><strong>For staff + customers</strong>:
+- Your custom React app (the beautiful Figma-designed interface).
+- They never see Directus. They see your pretty dashboard.</p>
+<h2>Security (who gets Directus admin)</h2>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Directus admin UI access?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>privileged-admin</code> (you)</td>
+<td>✅ Full</td>
+</tr>
+<tr>
+<td><code>tenant-admin</code> (client's admin)</td>
+<td>✅ Full</td>
+</tr>
+<tr>
+<td><code>staff-*</code> (staff roles)</td>
+<td>❌ No (custom app only)</td>
+</tr>
+<tr>
+<td><code>customer</code> (external client)</td>
+<td>❌ No (custom app only)</td>
+</tr>
+</tbody>
+</table>
+<p>We remove admin UI access for staff/customer to prevent them from bypassing your custom business logic.</p>
+<h2>What Directus will NOT do</h2>
+<ul>
+<li>It doesn't build your custom dashboard, charts, AI assistant, or document checker UIs.</li>
+<li>It doesn't do your specific business logic workflows (like order pipeline states) — those live in the custom frontend.</li>
+<li>It doesn't intentionally allow cross-tenant access — that's enforced via Postgres RLS (Decision 1).</li>
+</ul>
+<h2>The hardware/deployment</h2>
+<ul>
+<li>Runs as 1 Docker container in your compose.</li>
+<li>Connects to Supabase Postgres (or Neon — works either way).</li>
+<li>Directus v12+ — current active project with good versioning.</li>
+</ul>
+<h2>Alternatives considered</h2>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Why we chose Directus</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NestJS API from scratch</td>
+<td>More code, full control — we can still do this later if needed</td>
+</tr>
+<tr>
+<td>Payload CMS (headless)</td>
+<td>Since Directus already gives admin UI + API + RBAC</td>
+</tr>
+<tr>
+<td>Hasura</td>
+<td>GraphQL-first; less extensible for admin UI</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Decision question</strong>: Approve Directus as the admin UI + API + RBAC + auth, alongside custom React frontend for user-facing screens? (Yes/No)</p></body></html>

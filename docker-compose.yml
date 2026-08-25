@@ -1,0 +1,96 @@
+version: "3.8"
+name: rubbertrack-platform
+
+services:
+  # ---- Control plane: Directus (admin UI + REST/GraphQL + auth/RBAC + files)
+  directus:
+    image: directus/directus:12.x
+    ports:
+      - "8055:8055"
+    environment:
+      KEY: rubbertrack-app-key-change-me
+      SECRET: rubbertrack-app-secret-change-me
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: admin1234
+      DB_CLIENT: pg
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: rubbertrack
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      CACHE_ENABLED: "true"
+      CACHE_STORE: memory
+      WEBSOCKETS_ENABLED: "true"
+      CONTENT_VERSIONING: "true"
+      FLOWS_EXEC_LOG_RETENTION: 1w
+      ACTIVITY_RETENTION: 52w
+      REVISIONS_RETENTION: 52w
+    volumes:
+      - directus-uploads:/directus/uploads
+      - ./infra:/directus/snapshots
+    depends_on:
+      - postgres
+
+  # ---- Local dev DB (in prod use Supabase)
+  postgres:
+    image: tensorchord/pgvector:pg17
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rubbertrack
+    command: ["postgres", "-c", "wal_level=replica"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/tenancy/helper.sql:/docker-entrypoint-initdb.d/01_helper.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Skinny BFF (tenant detection + AI proxy)
+  bff:
+    build:
+      context: ./apps/bff
+    ports:
+      - "4000:4000"
+    environment:
+      BFF_PORT: 4000
+      DIRECTUS_URL: http://directus:8055
+      AI_SERVICE_URL: http://ai-service:5000
+    depends_on:
+      - directus
+      - ai-service
+
+  # ---- AI Orchestrator (Vercel AI SDK + LlamaIndex + provider router)
+  ai-service:
+    build:
+      context: ./apps/ai
+    ports:
+      - "5000:5000"
+    environment:
+      AI_PORT: 5000
+      OPENROUTER_API_KEY: ""
+      NIM_API_KEY: ""
+      OLLAMA_HOST: http://host.docker.internal:11434
+    depends_on:
+      - postgres
+
+  # ---- Frontend (Next.js + Refine headless + shadcn/ui)
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_BFF_URL: http://localhost:4000
+      NEXT_PUBLIC_DIRECTUS_URL: http://localhost:8055
+    depends_on:
+      - bff
+
+volumes:
+  pgdata:
+  directus-uploads:

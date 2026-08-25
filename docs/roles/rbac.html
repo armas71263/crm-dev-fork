@@ -1,0 +1,79 @@
+<!doctype html><html><head><meta charset="utf-8"><title>rbac.md</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:14px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}h1,h2,h3{color:#0f172a}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}</style></head><body><h1>Roles (RBAC) — Who Can Do What</h1>
+<p>RBAC = Role-Based Access Control. We use Directus permissions layered on top of Postgres RLS.</p>
+<h2>The roles to create</h2>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Description</th>
+<th>Access</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>privileged-admin</code></td>
+<td><strong>You</strong> (the platform creator)</td>
+<td>Full access to everything including Directus system settings, templates, and all tenants.</td>
+</tr>
+<tr>
+<td><code>tenant-admin</code></td>
+<td><strong>Client's main admin</strong></td>
+<td>Full access to their tenant; Directus admin UI incl. collections, users, roles (guarded, no system)</td>
+</tr>
+<tr>
+<td><code>staff-sales</code></td>
+<td>Client's sales team</td>
+<td>Table + card screens; CRUD own records, view customers</td>
+</tr>
+<tr>
+<td><code>staff-logistics</code></td>
+<td>Client's operations team</td>
+<td>Table screens + tracking/pending docs checklists</td>
+</tr>
+<tr>
+<td><code>staff-documentation</code></td>
+<td>Docs handling</td>
+<td>Doc checker, Diffchecker, files</td>
+</tr>
+<tr>
+<td><code>staff-technical</code></td>
+<td>Tech support</td>
+<td>Tickets flow, settings (within tenant)</td>
+</tr>
+<tr>
+<td><code>customer</code></td>
+<td><strong>External client of your client</strong></td>
+<td>Own company records/documents/issues (read + comment/upload) — login with invite</td>
+</tr>
+</tbody>
+</table>
+<h2>Unrestricted-role access</h2>
+<p>There's NO role like that. Everything is tenant-scoped. <code>privileged-admin</code> is max-privilege but still bound to a specific tenant context (or "all context" by design).</p>
+<h2>Destroyable-level safety</h2>
+<ul>
+<li>RLS and presets allow <code>tenant-admin</code> to curate roles in their own tenant.</li>
+<li>The <code>privileged-admin</code> can modify the template but template changes don't suddenly re-shape flagged clients.</li>
+</ul>
+<h2>Logging examples (implemented per role)</h2>
+<table>
+<thead>
+<tr>
+<th>Log</th>
+<th>Who sees it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AI usage logs (embeddings, calls, costs)</td>
+<td>tenant-admin</td>
+</tr>
+<tr>
+<td>Audit logs (row changes, login, UI access)</td>
+<td>tenant-admin + privileged-admin</td>
+</tr>
+<tr>
+<td>Tenant scale (RLS bypass attempts)</td>
+<td>privileged-admin</td>
+</tr>
+</tbody>
+</table></body></html>

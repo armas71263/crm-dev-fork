@@ -1,0 +1,36 @@
+<!doctype html><html><head><meta charset="utf-8"><title>isolation.md</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:14px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}h1,h2,h3{color:#0f172a}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}</style></head><body><h1>Tenant Isolation (How Client A Can't See Client B)</h1>
+<p>This is the most important section because selling the same platform to multiple clients means one leaking client is a critical failure.</p>
+<h2>Layer 1 — Postgres RLS (enforced at DB level)</h2>
+<p><strong>Every request touches the DB with a tenant scope.</strong> Example:</p>
+<p>User logs in as <code>rubbertrack</code> → the app sets <code>SET LOCAL app.tenant_id = 'rubbertrack'</code>.</p>
+<p>Even if the app's code has a bug (worst case), the DB rejects wrong rows.</p>
+<p>Proof via tests (pgTAP or integration tests):</p>
+<pre><code>user: rubbertrack
+expected: rows only for rubbertrack returned
+</code></pre>
+<h2>Layer 2 — Directus presets</h2>
+<p>Directus enforces <code>tenant_id</code> at creation and filtering (e.g., preset: <code>$CURRENT_USER.tenant_id</code>). We also run it inside transactions to avoid pool leakage across requests.</p>
+<h2>Layer 3 — BFF check (defense)</h2>
+<p>Our gateway validates JWT claims before forwarding.</p>
+<h2>Tiering per client</h2>
+<ul>
+<li><strong>Tier A (default)</strong>: shared DB + RLS (rubbertrack, grocercorp etc. all in one DB).</li>
+<li><strong>Tier B (schema-per-tenant)</strong>: when client is heavy or needs schema-level customization.</li>
+<li><strong>Tier C (db-per-tenant)</strong>: when client is regulated or pays premium.</li>
+</ul>
+<h2>Isolation tests we run into CI</h2>
+<ol>
+<li><em>Test A</em>: 2 tenants trying to read/write each other's rows. Expected: permission denied.</li>
+<li><em>Test B</em>: A <code>tenant-admin</code> cannot see collections of another tenant.</li>
+<li><em>Test C</em>: A <code>staff-*</code> user cannot use the Directus admin UI.</li>
+<li><em>Test D</em>: An <code>external customer</code> only accesses own company rows.</li>
+<li><em>Test E</em>: An AI Assistant is unable to use a tool without tenant scope injection.</li>
+</ol>
+<h2>A runbook (if there's a device issue)</h2>
+<ol>
+<li>Check recent changes (schema/UI/flow).</li>
+<li>Run the isolation test suite locally.</li>
+<li>If confirmed leak: enable tenant's audit-log and rotate API keys.</li>
+<li>Move affected tenant to Tier B (schema-level) or C (db-level) for isolation hardening.</li>
+<li>Present short incident report with exact root block and safeguard fix.</li>
+</ol></body></html>

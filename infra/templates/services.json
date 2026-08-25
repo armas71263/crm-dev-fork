@@ -1,0 +1,37 @@
+{
+  "name": "services",
+  "label": "Generic Services",
+  "collections": {
+    "parties": {
+      "fields": [
+        { "key": "name", "type": "string" },
+        { "key": "type", "type": "string" },
+        { "key": "contact", "type": "json" },
+        { "key": "tags", "type": "json" }
+      ]
+    },
+    "tickets": {
+      "fields": [
+        { "key": "id", "type": "string" },
+        { "key": "customer", "type": "string" },
+        { "key": "kind", "type": "string" },
+        { "key": "status", "type": "string" },
+        { "key": "description", "type": "string" }
+      ]
+    },
+    "feed_items": {
+      "fields": [
+        { "key": "category", "type": "string" },
+        { "key": "title", "type": "string" },
+        { "key": "description", "type": "string" },
+        { "key": "priority", "type": "string" }
+      ]
+    },
+    "checklists": {
+      "fields": [
+        { "key": "party_id", "type": "integer" },
+        { "key": "checklist_json", "type": "json" }
+      ]
+    }
+  }
+}

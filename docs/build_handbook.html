@@ -1,0 +1,322 @@
+<!doctype html><html><head><meta charset="utf-8"><title>RubberTrack Build Handbook</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%;page-break-inside:auto}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left;page-break-inside:avoid}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:13px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto;page-break-inside:avoid;white-space:pre}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}h2,h3{color:#0f172a;margin-top:2em}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}@media print{body{margin:0;font-size:11px}}</style></head><body><h1>RubberTrack Multi-Tenant CRM/CMS/Dashboard Build Handbook</h1>
+<p><strong>Approved decisions:</strong> Tenancy=RLS+tiered escalation · AI=Vercel AI SDK v5+LlamaIndex.TS+OpenRouter/NIM/Ollama/Workers · Control plane=Directus 12 · Templates=RubberTrack+generic Services</p>
+<hr />
+<h2>1. SYSTEM OVERVIEW</h2>
+<p>A multi-tenant business platform sold to multiple clients. Tenant (e.g., RubberTrack) is a template-driven deployment on shared infra with database-enforced isolation.</p>
+<pre><code>┌─── Frontend (Next.js 14 PWA) ────────────────────────────┐
+│ React + shadcn/ui + Recharts + Vercel AI SDK useChat     │
+│ Bespo-designed screens per tenant template              │
+│ Refine headless behind (scaffold helper)                │
+└────────────────────────────────┬──────────────────────────┘
+                                 │
+┌────────────────────────────────▼──────── BFF (Fastify) ─┐
+│ Tenant detection, auth with Directus                   │
+│ AI route proxying, audit logging                         │
+│ Signed for top-level RLS enforced at DB layer          │
+└────────────────────────────────┬──────────────────────────┘
+                                 │
+        ┌────────────────────────▼───────────────────────┐
+        │               Directus (control plane)          │
+        │  Admin UI + REST/GraphQL + Auth/RBAC + Files    │
+        └────────────────────────┬───────────────────────┘
+                                 │
+            ┌────────────────────▼───────────────────┐
+            │     Supabase Postgres (managed)         │
+            │  pgvector + tsvector + trgm             │
+            │  tenant_id tagging + Row-Level Security │
+            │  JSONB for tenant-spec data             │
+            └───────────────────────────────────────┘
+                              AI Orchestrator
+                    ┌───────────▼───────────────┐
+                    │ Vercel AI SDK v5 (agent)  │
+                    │ LlamaIndex.TS (ingest)    │
+                    │ OpenRouter (LLM)          │
+                    │ NVIDIA NIM (embeddings)   │
+                    │ Ollama (local dev)        │
+                    │ Workers AI (edge)         │
+                    └───────────────────────────┘
+</code></pre>
+<hr />
+<h2>2. STACK &amp; PINS</h2>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Selected</th>
+<th>Version/pin</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Managed Postgres</td>
+<td><strong>Supabase</strong> (openalternative)</td>
+<td>v17+</td>
+<td>pgvector, tsvector, trgm ready</td>
+</tr>
+<tr>
+<td>Backend/API/Admin/UI/RBAC/Auth</td>
+<td><strong>Directus</strong> (openalternative)</td>
+<td><code>directus:12.x</code></td>
+<td>control plane</td>
+</tr>
+<tr>
+<td>Frontend</td>
+<td><strong>Next.js 14 + React 18 + shadcn/ui + Recharts + Refine headless</strong></td>
+<td><code>next@14</code>, <code>shadcn</code>, <code>recharts</code>, <code>@refinedev/core@5</code></td>
+<td>Figma screens, dashboard</td>
+</tr>
+<tr>
+<td>AI orchestration</td>
+<td><strong>Vercel AI SDK v5</strong> (own research, own research)</td>
+<td><code>ai@5.x</code></td>
+<td>agentic chat/planner/tools</td>
+</tr>
+<tr>
+<td>Ingestion &amp; retriev</td>
+<td><strong>LlamaIndex.TS</strong></td>
+<td><code>llamaindex@latest</code></td>
+<td>RAG/doc pipeline</td>
+</tr>
+<tr>
+<td>Providers</td>
+<td><strong>OpenRouter</strong> primary (LLM), <strong>NVIDIA NIM</strong> (embeddings), <strong>Ollama</strong> (dev), <strong>Cloudflare Workers</strong> (edge)</td>
+<td>bound by tenant</td>
+<td>model routing</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>3. TENANT ONBOARDING (OPERATIONS)</h2>
+<ol>
+<li>Clone template (RubberTrack or Services).</li>
+<li>Run script → tenant row + roles + permission presets + collections + seed.</li>
+<li>Configure theme/labels/roles per tenant.</li>
+<li>Tier A default (RLS). Tier B/C script when heavy/regulated.</li>
+</ol>
+<hr />
+<h2>4. TEMPLATES DEFINE WHAT TURNS ON</h2>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Kind</th>
+<th>RubberTrack</th>
+<th>Services</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dashboard</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Records</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Parties (Customers/Suppliers)</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Issues/Tickets</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Attendance</td>
+<td>su</td>
+<td>✔</td>
+<td>optional</td>
+</tr>
+<tr>
+<td>News &amp; Updates (CMS)</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Doc Checker (AI)</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Diff Checker</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Checklists</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>Pending Documents</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+<tr>
+<td>AI Assistant</td>
+<td>su</td>
+<td>✔</td>
+<td>✔</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>5. PHASED BUILD PLAN (with exit criteria per phase)</h2>
+<h3>Phase 0 — Scaffold (1 week)</h3>
+<ul>
+<li>Supabase project + extension pgvector</li>
+<li>docker-compose: directus + frontend + bff + ai service + mock auth</li>
+<li>tenancy helper SQL <code>current_tenant()</code> + RLS policies on every entity</li>
+<li>Onboarding script → clone template, statuses, roles, permission presets</li>
+<li>roles: <code>privileged-admin</code>, <code>tenant-admin</code>, <code>staff-*</code>, <code>customer</code></li>
+</ul>
+<h3>Phase 1 — Template Engine (2 weeks)</h3>
+<ul>
+<li>Dynamic module registry (enabled per tenant template)</li>
+<li>RLS-aware Directus SDK hooks for custom screens</li>
+<li>RubberTrack demo template reproducing ALL Figma screens</li>
+<li>Import/Export Excel, screen-config editor (choose charts/cards)</li>
+<li>Generic Services template optional in parallel</li>
+</ul>
+<h3>Phase 2 — Dashboard + Hybrid Search (2 weeks)</h3>
+<ul>
+<li>KPI engine (compute from DB, watch YoY)</li>
+<li>Chart builder with config-in-DB</li>
+<li>pgvector + tsvector + trgm hybrid search w/ merge+re-rank</li>
+<li>Global Search UI</li>
+</ul>
+<h3>Phase 3 — AI Platform (3 weeks)</h3>
+<ul>
+<li>Provider router (OpenRouter/NIM/Ollama) w/ tenant config</li>
+<li>Assistant: planner→tools→synthesis, streaming UI</li>
+<li>Insights generator (nightly + on-demand)</li>
+<li>Doc Checker (extraction), Diff (side-by-side + flag mismatches)</li>
+<li>AI usage logs (costs/tools per tenant)</li>
+</ul>
+<h3>Phase 4 — Ops/Tenancy Escalation (2 weeks)</h3>
+<ul>
+<li>Tenant-onboarding automation &amp; cloning</li>
+<li>Schema-per-tenant / DB-per-tenant escalation script</li>
+<li>Per-tenant logical backup</li>
+<li>Isolation tests in CI</li>
+</ul>
+<h3>Phase 5 — White-label + release (2 weeks)</h3>
+<ul>
+<li>per-tenant branding (theme.json in DB)</li>
+<li>External customer portal (login→scoped views)</li>
+<li>Deployment runbooks</li>
+<li>Demo-reset pipeline</li>
+</ul>
+<hr />
+<h2>6. SAMPLE TEMPLATE SCHEMA (RubberTrack)</h2>
+<p>Collections (in tenant template JSON):</p>
+<ul>
+<li><code>records</code> — order/master data. eg <code>order_id</code>, <code>date</code>, <code>customer</code>, <code>supplier</code>, <code>grade</code>, <code>mt</code>, <code>fcl</code>, <code>price_usd</code>, <code>status</code>, <code>tenant_id</code>, JSONB <code>extra</code></li>
+<li><code>parties</code> — <code>type</code> psvod/<code>customer</code>; contact info, tags, embedding of details for assistant</li>
+<li><code>tickets</code> — <code>category</code>, <code>status</code>, <code>description</code>, fields for <code>kind</code> like <code>quality/shipment/doc</code></li>
+<li><code>hr_events</code> — employee, department, attendance fields</li>
+<li><code>feed_items</code> — category, title, description, priority</li>
+<li><code>checklists</code> — customer/supplier-specific checklist sets</li>
+<li><code>files</code> — uploads and associations</li>
+<li><code>embeddings</code> — unified schema per Cerebras blog (source_type, source_id, vector, metadata, tenant_id)</li>
+</ul>
+<p>Labels provided: <code>records</code>→<code>Order Records</code>, <code>parties_customer</code>→<code>Customers</code>, <code>parties_supplier</code>→<code>Suppliers</code>.</p>
+<hr />
+<h2>7. TENANT ISOLATION TESTS (proof)</h2>
+<ul>
+<li>Test A: 2 tenants attempting read/write cross — expect deny.</li>
+<li>Test B: tenant-admin sees own collections only.</li>
+<li>Test C: staff cannot use Directus admin UI.</li>
+<li>Test D: external customer only sees own company rows.</li>
+<li>Test E: AI tools must inject tenant scope.</li>
+</ul>
+<hr />
+<h2>8. SECURITY RAC MATRIX</h2>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Rest</th>
+<th>Admin UI</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>privileged-admin</code></td>
+<td>all layers</td>
+<td>Full</td>
+<td>system+templates</td>
+</tr>
+<tr>
+<td><code>tenant-admin</code></td>
+<td>within tenant</td>
+<td>Full within tenant</td>
+<td>roles+data</td>
+</tr>
+<tr>
+<td><code>staff-sales</code></td>
+<td>within tenant</td>
+<td>No</td>
+<td>sales records</td>
+</tr>
+<tr>
+<td><code>staff-logistics</code></td>
+<td>within tenant</td>
+<td>No</td>
+<td>ops records</td>
+</tr>
+<tr>
+<td><code>staff-documentation</code></td>
+<td>within tenant</td>
+<td>No</td>
+<td>docs</td>
+</tr>
+<tr>
+<td><code>staff-technical</code></td>
+<td>within tenant</td>
+<td>No</td>
+<td>tickets</td>
+</tr>
+<tr>
+<td><code>customer</code></td>
+<td>within tenant and own company</td>
+<td>No</td>
+<td>own documents</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>9. APPENDIX — Where each file lives post-scaffold</h2>
+<pre><code>workspace/project/
+├── docker-compose.yml
+├── .env.example
+├── docs/
+│   └── build_handbook.md
+├── apps/
+│   ├── web/   ← Next.js + Refine headless + shadcn/ui
+│   ├── bff/   ← Fastify, tenant-detection + AI-proxy
+│   └── ai/    ← Vercel AI SDK + LlamaIndex + provider router
+├── infra/
+│   ├── tenancy/helper.sql      ← pg function + RLS
+│   ├── templates/rubbertrack.json
+│   └── scripts/normalize.sh
+└── README.md
+</code></pre>
+<hr />
+<h2>END OF HANDBOOK</h2>
+<p><strong>Signatories</strong>: celebrate under (privileged-admin) &amp; project sponsor — both approvals on the 4 decisions recorded.</p></body></html>

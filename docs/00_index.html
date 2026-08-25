@@ -1,0 +1,72 @@
+<!doctype html><html><head><meta charset="utf-8"><title>00_index.md</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:14px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}h1,h2,h3{color:#0f172a}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}</style></head><body><h1>Platform Design Documents</h1>
+<p>These documents explain each architectural decision in plain language, with examples.</p>
+<h2>The 4 Decisions You Need to Approve</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Decision</th>
+<th>Document</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><strong>How we separate each client's data</strong> (tenancy)</td>
+<td><a href="decisions/01_tenancy.md">decisions/01-tenancy</a></td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>How the AI features work</strong> (assistant, insights, doc parsing)</td>
+<td><a href="decisions/02_ai.md">decisions/02-ai</a></td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>What Directus does</strong> (admin panel, login, permissions, API)</td>
+<td><a href="decisions/03_control_plane.md">decisions/03-control-plane</a></td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>Which client templates we start with</strong></td>
+<td><a href="decisions/04_templates.md">decisions/04-templates</a></td>
+</tr>
+</tbody>
+</table>
+<h2>Background Docs</h2>
+<ul>
+<li><a href="architecture/overview.md">architecture/overview.md</a> — the whole system picture</li>
+<li><a href="roles/rbac.md">roles/rbac.md</a> — who can do what (privileged-admin, tenant-admin, staff, customer)</li>
+<li><a href="tenancy/isolation.md">tenancy/isolation.md</a> — data separation tiers A/B/C explained</li>
+</ul>
+<h2>Approval Status</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Decision</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Tenancy (RLS + escalation tiers)</td>
+<td>PENDING</td>
+</tr>
+<tr>
+<td>2</td>
+<td>AI frameworks (Vercel AI SDK + LlamaIndex.TS + providers)</td>
+<td>PENDING</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Directus as control plane</td>
+<td>PENDING</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Initial templates (RubberTrack + generic Services)</td>
+<td>PENDING</td>
+</tr>
+</tbody>
+</table></body></html>

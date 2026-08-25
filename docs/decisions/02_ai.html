@@ -1,0 +1,94 @@
+<!doctype html><html><head><meta charset="utf-8"><title>02_ai.md</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:14px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}h1,h2,h3{color:#0f172a}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}</style></head><body><h1>Decision 2: How the AI Features Work (assistant, insights, document checker)</h1>
+<h2>The features the AI powers</h2>
+<ol>
+<li><strong>AI Assistant</strong> (top-right button in your Figma): Ask "Which supplier has ISO expiring &lt; 90 days?" or "Total orders by grade" — the assistant queries your data and answers.</li>
+<li><strong>AI Business Insights</strong> (the live panel in the dashboard): A nightly or on-demand job that reads your data and writes natural-language insights.</li>
+<li><strong>Document Checker / Diffchecker</strong> (Figma pages 10/11): Upload a sales invoice or supplier invoice; AI extracts fields and reports match/mismatch/missing.</li>
+</ol>
+<h2>Two frameworks work together</h2>
+<p>We use <strong>two TypeScript libraries</strong>, each doing its own job:</p>
+<h3>A) Vercel AI SDK (the "chat brain")</h3>
+<p>This is how the assistant streams answers and calls your data tools.</p>
+<ul>
+<li><code>useChat</code> hook in React gives streaming answers (like ChatGPT streaming text).</li>
+<li><code>stopWhen</code> and <code>prepareStep</code> let the model decide when to keep going and which "tool" (function) to call next (the Cerebras planner pattern).</li>
+</ul>
+<p>Example of the planner → tool-calling flow:</p>
+<p>User: "Summarize JK Tyre's top grade this year"</p>
+<ol>
+<li>Assistant's <strong>planner</strong> (small LLM pass) chooses tools: <code>search_records</code>, <code>get_monthly_stats</code>.</li>
+<li><strong>executor</strong> runs them in parallel on the tenant's data.</li>
+<li><strong>synthesis</strong> LLM merges results into the final answer.</li>
+<li>Vercel AI SDK streams the answer token by token to your React panel.</li>
+</ol>
+<h3>B) LlamaIndex.TS (the "retrieval brain")</h3>
+<p>Handles the RAG pipeline when we need document/knowledge search:</p>
+<ul>
+<li>Reads uploaded documents, chunks them, embeds them (into pgvector in your Postgres).</li>
+<li>Exposes "tools" like <code>search_docs</code>, <code>search_records</code> to the Cerebras-style assistant.</li>
+</ul>
+<p><strong>Why two frameworks?</strong> Vercel AI SDK is great at chat/agent; LlamaIndex.TS is great at document indexing. They complement each other and both work with the same API.</p>
+<h2>Model providers — never tied to one vendor</h2>
+<p>You asked to be able to use: <strong>OpenRouter</strong>, <strong>NVIDIA NIM</strong>, <strong>Cloudflare Workers</strong>, <strong>Ollama</strong>.</p>
+<p>We route to these providers through one layer:</p>
+<table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Default provider</th>
+<th>Client can config</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Embeddings</td>
+<td>NVIDIA NIM (or OpenRouter)</td>
+<td>per-tenant settings</td>
+</tr>
+<tr>
+<td>Assistant planner+answer</td>
+<td>OpenRouter</td>
+<td>which model (e.g., cheap vs fast)</td>
+</tr>
+<tr>
+<td>Document extraction</td>
+<td>OpenRouter (vision/extraction-capable model)</td>
+<td>switchable</td>
+</tr>
+<tr>
+<td>Local dev</td>
+<td>Ollama (free, no internet needed)</td>
+<td>developer-local</td>
+</tr>
+<tr>
+<td>Edge deployments</td>
+<td>Cloudflare Workers AI</td>
+<td>optional per client</td>
+</tr>
+</tbody>
+</table>
+<p>Work in code (conceptually):</p>
+<pre><code class="language-ts">// thin router picks provider
+const model = router.pick('assistant', { clientPrefs });
+
+// stream answer
+const result = await generateText({ model, messages, tools });
+</code></pre>
+<h2>What the AI can actually do</h2>
+<ul>
+<li><strong>Answer with tools</strong> (<code>search_records</code>, <code>get_monthly_stats</code>, <code>diff_documents</code>, <code>find_expiring_iso</code>).</li>
+<li><strong>Retrieve knowledge</strong> via embeddings (pgvector) + keyword (<code>tsvector</code>) — the Instacart blog pattern.</li>
+<li><strong>Extract</strong> documents (invoice, PO, certificate) → structured fields.</li>
+<li><strong>Generate insights</strong> nightly: "TSR-20 contributed 31% of 2026 volume."</li>
+</ul>
+<h2>Tenant isolation in AI (critical)</h2>
+<p>Every AI call is scoped to the tenant:
+- <code>tenant_id</code> injected into every tool call.
+- Every tool queries SQL with the tenancy helper (Decision 1).
+- The Cerebras-style "plan + execute" loop is tenant-coded — can't leak cross-client.</p>
+<h2>What I will also build</h2>
+<ul>
+<li>An <strong>AI usage log</strong> per tenant (costs, calls, tools used) in database.</li>
+<li><strong>Safety rails</strong>: assistant can't create/update records by default — only reads unless explicitly granted write tools.</li>
+</ul>
+<p><strong>Decision question</strong>: Approve Vercel AI SDK (chat/agent) + LlamaIndex.TS (ingestion/RAG), the provider router, and tenant-scoped AI tools? (Yes/No)</p></body></html>

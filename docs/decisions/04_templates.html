@@ -1,0 +1,81 @@
+<!doctype html><html><head><meta charset="utf-8"><title>04_templates.md</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:14px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}h1,h2,h3{color:#0f172a}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}</style></head><body><h1>Decision 4: Which Client Templates We Start With</h1>
+<h2>What's a "template" (and why you need it)</h2>
+<p>Since you're selling this to many clients, you need a way to deploy a new client in minutes — not weeks. A <strong>template</strong> = a shippable data+UI preset that gets cloned when onboarding a new client.</p>
+<p>Templates define:</p>
+<ul>
+<li><strong>Collections</strong> (tables/entities) with their schemas.</li>
+<li><strong>Pre-configured layouts/screens</strong> (table view vs card view vs lists).</li>
+<li><strong>KPI definitions &amp; chart configs</strong>.</li>
+<li><strong>Screens to install</strong> (e.g., "Document Checker" for trading). </li>
+<li><strong>Roles and permissions</strong>.</li>
+<li><strong>Seed data</strong> (sample records).</li>
+</ul>
+<h2>"Schemas" vs "template" — two different things</h2>
+<ol>
+<li><strong>Schema</strong> = the data shape (e.g., "orders have date, customer, grade, volume").</li>
+<li><strong>Template</strong> = the schema + UI + screening hints + sample data + onboarding script — the whole setup.</li>
+</ol>
+<h2>Initial templates recommended</h2>
+<h3>1. RubberTrack — the demo/example client template</h3>
+<p>This replicates what your Figma shows and becomes the sales-demo template for trade-grade/goods clients (rubber, chemicals, agriculture etc.). Anyone can see what the platform can do.</p>
+<ul>
+<li>Collections: <code>records</code>, <code>parties</code> (customers/suppliers), <code>tickets</code>, <code>hr_events</code>, <code>feed_items</code>, <code>checklists</code>, <code>files</code></li>
+<li>Screens: table record view, cards for parties, ticket lists, assistant, insights, doc checker, diff checker</li>
+<li>KPI preset: volume MT, orders count, grade mix, issues open, ISO expiry countdown</li>
+<li>Demo data: seeded with the Figma sample values</li>
+</ul>
+<h3>2. Generic Services template (optional but recommended)</h3>
+<p>A clean template for service businesses (consulting, agencies, clinics, logistics services). Use-case: clients who don't have the trading/order-pattern.</p>
+<ul>
+<li>Collections: <code>parties</code> (customers, vendors), <code>tickets</code> (service requests), <code>feed_items</code> (posts/docs), <code>checklists</code></li>
+<li>Screens: table + card party pages, tickets flow, feed with categories, assistant</li>
+<li>KPI preset: open tickets, ticket volume by status, clients count, deadlines</li>
+</ul>
+<h3>Optional later: retail/inventory template</h3>
+<p>If a client later needs product/SKU-based analytics, we create a "retail" template with different schema (products, stock, sales).</p>
+<h2>What onboarding a new client does (concrete)</h2>
+<p>Example: onboarding "Biryani B2C Foods" (a restaurant chain):</p>
+<ol>
+<li>User clicks "Create tenant → Clone RubberTrade template".</li>
+<li>Script creates:</li>
+<li>schema with collections,</li>
+<li>menu/screening config (record table, cards, charts),</li>
+<li><code>tenant-admin</code> role for client with access to admin UI,</li>
+<li><code>staff-sales</code> &amp; <code>staff-logistics</code> roles,</li>
+<li>seed data optional (sample/demo or skip).</li>
+<li>Tenant is live, isolated (RLS policy) — this happens in under a minute.</li>
+</ol>
+<h2>Tenant label config (their own business language)</h2>
+<p>Clients can rename the modules:
+- <code>records</code> → they might rename to "Orders"
+- <code>parties</code> → "Clients &amp; Suppliers"
+- <code>tickets</code> → "Service Calls"</p>
+<p>This is simply a label stored per client; the schema stays the same.</p>
+<h2>What the privileged-client admin can customize safely</h2>
+<table>
+<thead>
+<tr>
+<th>Customization</th>
+<th>In scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Add/remove fields in collections</td>
+<td>✅ via Directus admin (guarded)</td>
+</tr>
+<tr>
+<td>Add/remove screens, filters, labels</td>
+<td>✅ via screen-config editor</td>
+</tr>
+<tr>
+<td>Add/edit roles &amp; permissions</td>
+<td>✅ within their tenant</td>
+</tr>
+<tr>
+<td>Schema change that would affect other tenants</td>
+<td>❌ restricted (only you)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Decision question</strong>: Do we launch with <strong>only the RubberTrack template</strong> or with <strong>RubberTrack + generic Services template</strong>? (I recommend both but RubberTrack alone is your demo client). Approve RobotTrack + generic Services? (Yes/No)</p></body></html>

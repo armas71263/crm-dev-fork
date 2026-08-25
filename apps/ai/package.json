@@ -1,0 +1,13 @@
+{
+  "name": "rubbertrack-ai-service",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js"
+  },
+  "dependencies": {
+    "fastify": "^4.26.0"
+  }
+}

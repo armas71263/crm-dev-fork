@@ -1,0 +1,56 @@
+<!doctype html><html><head><meta charset="utf-8"><title>overview.md</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:14px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}h1,h2,h3{color:#0f172a}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}</style></head><body><h1>Architecture Overview</h1>
+<pre><code>┌─────────────────── Frontend (Next.js PWA) ───────────────────┐
+│ React + shadcn/ui + Recharts + Vercel AI SDK useChat          │
+│ · Bespoke Figma-designed screens                             │
+│ · Responsive card/table layouts                              │
+│ · AI Assistant panel, Doc checker wizard                     │
+│ · Refine headless behind for easy scaffolding                │
+└──────────────────────────────────┬───────────────────────────┘
+                                   │
+┌────────────────────────────── ▼ ─────────────────────────────┐
+│ Skinny BFF (thin backend inside same Docker)               │
+│ · Tenant detection from auth token                          │
+│ · Issue tokens after auth                                   │
+│ · Route AI orchestrator requests                             │
+│ · Audit logging                                              │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+        ┌──────────────────────▼──────────────────────┐
+        │ Directus Control Plane                      │
+        │  · REST + GraphQL API for all data           │
+        │  · Admin UI (you/tenant-admin)               │
+        │  · Auth + Roles (RBAC)                       │
+        │  · Files storage                             │
+        └──────────────┬───────────────┬──────────────┘
+                       │               │
+                DB layer              AI layer
+                       │               │
+        ┌──────────────▼──────┐  ┌────▼─────────────┐
+        │ Supabase Postgres   │  │ AI Orchestrator  │
+        │ · pgvector, tsvector│  │  Vercel AI SDK   │
+        │ · RLS (tenant split)│  │  planner→tools   │
+        └─────────────────────┘  │  synthesis→answer│
+                                  └──────────────────┘
+</code></pre>
+<h2>Read this in plain words</h2>
+<ol>
+<li><strong>User opens your app</strong> → sees a login screen.</li>
+<li><strong>Login</strong> (Directus auth) → assigned roles (privileged-admin, tenant-admin, staff-*, customer).</li>
+<li><strong>App fetches data</strong> via Directus → every request carries the tenant id. Postgres RLS filters rows at DB level (Decision 1).</li>
+<li><strong>User queries AI assistant</strong> → BFF routes to AI orchestrator. Planner picks tools, tools query DB with tenant filter, synthesis computes answer (Decision 2).</li>
+<li><strong>Admin/clients on Directus UI</strong> — tenant admin can customize collections/screens/roles within own tenant (Decision 3).</li>
+</ol>
+<h2>Long view (deployment choices)</h2>
+<ol>
+<li>Simplest: one Docker compose on one VPS: frontend + BFF + Directus + AI service.</li>
+<li>Managed PG: Supabase (pgvector!). Neon works too.</li>
+<li>Edge later: frontend on Cloudflare Pages; AI service → Workers AI.</li>
+</ol>
+<h2>Key security pattern</h2>
+<ul>
+<li>Tenant isolation is enforced at <strong>3 layers</strong> (DB RLS, Directus presets, BFF check) — defense-in-depth.</li>
+<li>Directus admin UI accessible only to privileged-admin and tenant-admin roles.</li>
+<li>Staff and customers NEVER see the Directus Admin UI. They always see your custom screens.</li>
+</ul>
+<h2>Availability of modules per tenant</h2>
+<p>Screens (dashboard, doc checker, diff checker, news feed, etc.) are enabled/disabled per template/configs (Decision 4). A "Trading" client gets doc-checker; a "Services" client gets tickets; a "Retail" client gets inventory — same engine, differing modules on.</p></body></html>

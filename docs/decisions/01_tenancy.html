@@ -1,0 +1,120 @@
+<!doctype html><html><head><meta charset="utf-8"><title>01_tenancy.md</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;color:#111;line-height:1.65}table{border-collapse:collapse;width:100%}th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}th{background:#f1f5f9}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;font-size:14px}pre{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}h1,h2,h3{color:#0f172a}h1{border-bottom:2px solid #3b82f6;padding-bottom:8px}blockquote{border-left:4px solid #3b82f6;padding-left:16px;color:#475569;margin:8px 0}</style></head><body><h1>Decision 1: How We Separate Each Client's Data (Tenancy)</h1>
+<h2>The Problem</h2>
+<p>You're going to sell this to many clients. RubberTrack is client 1. Another client could be, say, "GrocerCorp" (retail inventory). Another, "MediSafe Clinics". Each has different data (orders vs. patients vs. SKUs), different staff roles, and MUST NOT see each other's data.</p>
+<p>"Tenancy" = how we keep each client separate and safe.</p>
+<hr />
+<h2>How it works — three tiers (like apartments, floors, separate buildings)</h2>
+<h3>Tier A — Default: Everyone in one database, each row tagged by tenant</h3>
+<p><strong>Idea</strong>: One shared Postgres database. Every table has a <code>tenant_id</code> column (like an apartment number). When RubberTrack asks "show me my orders", the database answers only rows where <code>tenant_id = 'rubbertrack'</code>.</p>
+<p>The enforcement is done at the <strong>database level</strong> using Postgres "Row-Level Security" (RLS). Even if our app code has a bug, the database blocks cross-client access anyway. That's the safety net.</p>
+<p><strong>Analogy</strong>: An apartment building. One building, each flat has a lock. Cheap, fast, and good enough for most clients initially.</p>
+<p><strong>Concrete example</strong> (two clients, table <code>records</code>):</p>
+<table>
+<thead>
+<tr>
+<th>id</th>
+<th>tenant_id</th>
+<th>entity</th>
+<th>grade</th>
+<th>mt</th>
+<th>customer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>rubbertrack</td>
+<td>order</td>
+<td>TSR-20</td>
+<td>100.8</td>
+<td>JK Tyre</td>
+</tr>
+<tr>
+<td>2</td>
+<td>rubbertrack</td>
+<td>order</td>
+<td>STR-20</td>
+<td>2240</td>
+<td>CEAT</td>
+</tr>
+<tr>
+<td>3</td>
+<td>grocer-corp</td>
+<td>product</td>
+<td>skincare</td>
+<td>340</td>
+<td>Metro store</td>
+</tr>
+<tr>
+<td>4</td>
+<td>grocer-corp</td>
+<td>product</td>
+<td>snacks</td>
+<td>220</td>
+<td>B2B</td>
+</tr>
+</tbody>
+</table>
+<p>RLS policy (Postgres blocks wrong rows at DB level):</p>
+<pre><code class="language-sql">CREATE POLICY &quot;tenant_isolation&quot; ON records
+  FOR ALL TO app_users
+  USING (tenant_id = current_setting('app.tenant_id'));
+</code></pre>
+<p>Every user's request carries <code>SET app.tenant_id = 'rubbertrack'</code> and the database refuses to see rows of <code>grocer-corp</code>.</p>
+<h3>Tier B — Middle: Each tenant gets its own schema (separate floor)</h3>
+<p><strong>Idea</strong>: Heavy client or one with compliance needs gets a dedicated "schema" (a named partition of the same DB). Same server, separate space. Easier customizations (extra tables per client), per-tenant backups.</p>
+<p><strong>Analogy</strong>: You move the VIP from the shared building to their own floor.</p>
+<h3>Tier C — Strict: Each tenant gets its own database (separate building)</h3>
+<p><strong>Idea</strong>: Fully separate Postgres DB (optionally separate Directus project too). Strongest isolation + own backup/export. Needed for a regulated/heavy client.</p>
+<p><strong>Analogy</strong>: You build them their own house.</p>
+<hr />
+<h2>How we choose the tier</h2>
+<ul>
+<li>Start <strong>all new clients on Tier A (RLS + tenant_id)</strong>.</li>
+<li><strong>Move to Tier B</strong> when:</li>
+<li>The client needs schema-level customizations beyond templates.</li>
+<li>They want per-tenant logical backups.</li>
+<li>They have &gt; ~50 GB of data or heavy query volume.</li>
+<li><strong>Move to Tier C</strong> for:</li>
+<li>Regulated industries (healthcare, finance, government).</li>
+<li>Clients paying for "own-server" level isolation.</li>
+</ul>
+<p>We keep the same application code; the database routing changes.</p>
+<h2>Trade-offs at a glance</h2>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Cost</th>
+<th>Isolation strength</th>
+<th>Who it's for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A — shared schema + RLS</td>
+<td>$</td>
+<td>Medium</td>
+<td>Most clients, initially</td>
+</tr>
+<tr>
+<td>B — schema-per-tenant</td>
+<td>$$</td>
+<td>Strong</td>
+<td>Heavy / personalized clients</td>
+</tr>
+<tr>
+<td>C — db-per-tenant</td>
+<td>$$$</td>
+<td>Strongest</td>
+<td>Regulated or "bundle-price" clients</td>
+</tr>
+</tbody>
+</table>
+<h2>What we build (concrete)</h2>
+<ul>
+<li>SQL migration creating a helper function <code>current_tenant()</code> + RLS policies on every entity.</li>
+<li>A tenant onboarding script that runs <code>SET app.tenant_id</code> per request, and an escalation script (Tier A → Tier B/C).</li>
+<li>Database tests simulating each client's users to prove no cross-tenant leakage.</li>
+</ul>
+<p><strong>Decision question</strong>: Do you agree all this happens automatically (RLS now, escalation scripts ready) and I implement the helper + the tests? (Yes/No)</p></body></html>

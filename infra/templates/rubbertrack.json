@@ -1,0 +1,87 @@
+{
+  "name": "rubbertrack",
+  "label": "RubberTrack",
+  "collections": {
+    "records": {
+      "fields": [
+        { "key": "order_id", "type": "string" },
+        { "key": "date", "type": "date" },
+        { "key": "customer", "type": "string" },
+        { "key": "supplier", "type": "string" },
+        { "key": "grade", "type": "string" },
+        { "key": "mt", "type": "number" },
+        { "key": "fcl", "type": "number" },
+        { "key": "price_usd", "type": "number" },
+        { "key": "status", "type": "string" },
+        { "key": "extra", "type": "json" }
+      ]
+    },
+    "parties": {
+      "fields": [
+        { "key": "name", "type": "string" },
+        { "key": "type", "type": "string" },
+        { "key": "contact", "type": "json" },
+        { "key": "tags", "type": "json" },
+        { "key": "embedding", "type": "vector" }
+      ]
+    },
+    "tickets": {
+      "fields": [
+        { "key": "id", "type": "string" },
+        { "key": "customer", "type": "string" },
+        { "key": "supplier", "type": "string" },
+        { "key": "category", "type": "string" },
+        { "key": "status", "type": "string" },
+        { "key": "description", "type": "string" },
+        { "key": "kind", "type": "string" }
+      ]
+    },
+    "hr_events": {
+      "fields": [
+        { "key": "employee", "type": "string" },
+        { "key": "department", "type": "string" },
+        { "key": "present", "type": "number" },
+        { "key": "absent", "type": "number" },
+        { "key": "leave", "type": "number" },
+        { "key": "late", "type": "number" }
+      ]
+    },
+    "feed_items": {
+      "fields": [
+        { "key": "category", "type": "string" },
+        { "key": "title", "type": "string" },
+        { "key": "description", "type": "string" },
+        { "key": "priority", "type": "string" },
+        { "key": "published_at", "type": "datetime" }
+      ]
+    },
+    "checklists": {
+      "fields": [
+        { "key": "party_id", "type": "integer" },
+        { "key": "checklist_json", "type": "json" },
+        { "key": "active", "type": "boolean" }
+      ]
+    },
+    "files": {
+      "fields": [
+        { "key": "name", "type": "string" },
+        { "key": "mime", "type": "string" },
+        { "key": "record_id", "type": "string" },
+        { "key": "party_id", "type": "integer" },
+        { "key": "tag", "type": "string" }
+      ]
+    },
+    "embeddings": {
+      "fields": [
+        { "key": "source_type", "type": "string" },
+        { "key": "source_id", "type": "string" },
+        { "key": "vector", "type": "vector" },
+        { "key": "metadata", "type": "json" }
+      ],
+      "indexes": [
+        { "name": "idx_embeddings_source_type_source_id", "on": ["source_type", "source_id"] },
+        { "name": "idx_embeddings_vector_hnsw", "on": ["vector"], "using": "vector_hnsw" }
+      ]
+    }
+  }
+}
