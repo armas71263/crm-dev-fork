@@ -14,6 +14,7 @@ const NAV = [
   { id: 'doccheck',  label: 'Doc Checker', ico: '⇄' },
   { id: 'checklists', label: 'Checklists', ico: '✓' },
   { id: 'ai',        label: 'AI Assistant', ico: '✦' },
+  { id: 'insights',  label: 'Insights', ico: '✧' },
   { id: 'config',    label: 'Screen Config', ico: '⚙' },
 ];
 
@@ -231,12 +232,23 @@ Incoterms: DAP Mundra</textarea></div>
     </section>`,
   ai: () => `
     <div class="card span-12 ai-card">
-      <h3>AI Assistant <span class="tag teal" style="font-size:10px">LlamaIndex + pgvector · RLS-scoped</span></h3>
+      <h3>AI Assistant <span class="tag teal" style="font-size:10px">Agent · streaming · tools · RLS-scoped</span></h3>
       <div id="aiLog" class="ai-log">
-        <div class="ai-msg bot">Ask me about orders, suppliers, quality issues, or market prices. I'm scoped to your tenant.</div>
+        <div class="ai-msg bot">I plan a tool sequence, run it against your tenant data, then synthesize — streaming token by token. Ask about orders, issues, suppliers, or request an overview.</div>
       </div>
-      <div class="ai-input"><input id="aiText" placeholder="e.g. Which orders have quality issues?" autocomplete="off">
+      <div id="aiTools" class="ai-tools"></div>
+      <div class="ai-input"><input id="aiText" placeholder="e.g. Which orders have quality issues? / give me an overview" autocomplete="off">
         <button class="btn" onclick="sendAI()">Send</button></div>
+      <div id="aiUsage" style="margin-top:8px;color:var(--muted);font-family:var(--font-m);font-size:11px"></div>
+    </div>`,
+  insights: () => `
+    <div class="card span-12">
+      <h3>AI Insights <span class="tag teal" style="font-size:10px">computed from tenant KPIs</span></h3>
+      <p style="color:var(--muted);font-family:var(--font-m);font-size:12px">Auto-generated nightly + on-demand. Grounded in your live data.</p>
+      <button class="btn primary" onclick="genInsights()">Generate insights</button>
+      <div id="insightsOut" style="margin-top:14px;color:var(--muted);font-family:var(--font-m);font-size:12px">Click Generate to compute fresh insights.</div>
+      <div id="aiUsagePanel" style="margin-top:18px"></div>
+      <button class="btn" style="margin-top:10px" onclick="loadUsage()">View AI usage</button>
     </div>`,
   config: () => `
     <div class="card span-12"><h3>Screen Configuration <span style="color:var(--muted);font-size:11px;font-weight:400">— re-arrange dashboard panels (saved per tenant)</span></h3>
@@ -268,44 +280,110 @@ const attTable = rows => `<table class="tbl">
 
 const pillList = items => `<div style="display:flex;flex-wrap:wrap;gap:8px">${items.map(s=>`<span class="tag teal">${s}</span>`).join('')}</div>`;
 
-// ---------- Doc Checker (line-level diff) ----------
+// ---------- Doc Checker (field extraction + line diff + mismatch flags) ----------
+// Extracts structured PI fields from free text so diffs flag *what* changed
+// (price, qty, Incoterms) not just that a line differs.
+function extractFields(text){
+  const f = {};
+  const m = (re) => { const r = text.match(re); return r ? r[1].trim() : ''; };
+  f.invoice   = m(/(?:PROFORMA\s+INVOICE|Invoice)\s*(?:No\.?|#)?\s*([A-Z0-9-]+)/i) || m(/^([A-Z]+-\d{4}-\d+)/);
+  f.seller    = m(/Seller:?\s*(.+)/i);
+  f.buyer     = m(/Buyer:?\s*(.+)/i);
+  f.grade     = m(/Grade:?\s*([A-Z0-9% -]+)/i);
+  f.qty       = m(/Qty:?\s*([\d.]+)\s*MT/i);
+  f.fcl       = m(/(\d+)\s*FCL/i);
+  f.price     = m(/(?:Unit\s+price|Price):?\s*(?:USD|US\$|\$)?\s*([\d,]+)\/?MT/i);
+  f.incoterms = m(/Incoterms:?\s*([A-Z]{3}\s+\w+)/i);
+  return f;
+}
 window.runDiff = function(){
-  const a = document.getElementById('docA').value.split('\n');
-  const b = document.getElementById('docB').value.split('\n');
-  const max = Math.max(a.length, b.length);
-  let out = '';
+  const a = document.getElementById('docA').value;
+  const b = document.getElementById('docB').value;
+  const fa = extractFields(a), fb = extractFields(b);
+  // Field-level mismatch flags (the high-value signals for a trader).
+  const fields = ['invoice','seller','buyer','grade','qty','fcl','price','incoterms'];
+  const flags = fields.filter(k => fa[k] && fb[k] && fa[k].toUpperCase() !== fb[k].toUpperCase())
+    .map(k => `<div class="d-line flag">⚠ ${k}: "${esc(fa[k])}" → "${esc(fb[k])}"</div>`);
+  let out = flags.length ? `<div style="margin-bottom:10px;color:var(--amber);font-weight:600">Field mismatches (${flags.length})</div>${flags.join('')}<div style="margin:12px 0 6px;color:var(--muted);font-size:11px">Line-level diff</div>` : '';
+  // Line-level diff.
+  const la = a.split('\n'), lb = b.split('\n'), max = Math.max(la.length, lb.length);
   for (let i=0; i<max; i++){
-    const la = a[i] ?? '', lb = b[i] ?? '';
-    if (la === lb) out += `<div class="d-line eq">${i+1}  ${esc(la)}</div>`;
-    else {
-      if (la) out += `<div class="d-line del">- ${esc(la)}</div>`;
-      if (lb) out += `<div class="d-line add">+ ${esc(lb)}</div>`;
-    }
+    const xa = la[i] ?? '', xb = lb[i] ?? '';
+    if (xa === xb) out += `<div class="d-line eq">${i+1}  ${esc(xa)}</div>`;
+    else { if (xa) out += `<div class="d-line del">- ${esc(xa)}</div>`; if (xb) out += `<div class="d-line add">+ ${esc(xb)}</div>`; }
   }
   document.getElementById('diffOut').innerHTML = out || '<span style="color:var(--muted)">No differences.</span>';
 };
 function esc(s){ return (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
-// ---------- AI Assistant ----------
+// ---------- AI Assistant (streaming agent) ----------
 window.sendAI = async function(){
   const inp = document.getElementById('aiText');
   const q = inp.value.trim(); if (!q) return;
   const log = document.getElementById('aiLog');
+  const toolsEl = document.getElementById('aiTools');
+  const usageEl = document.getElementById('aiUsage');
   log.insertAdjacentHTML('beforeend', `<div class="ai-msg user">${esc(q)}</div>`);
   inp.value = '';
-  log.insertAdjacentHTML('beforeend', `<div class="ai-msg bot thinking">…</div>`);
-  const thinking = log.lastChild;
+  log.insertAdjacentHTML('beforeend', `<div class="ai-msg bot thinking"></div>`);
+  const bubble = log.lastChild;
+  if (toolsEl) toolsEl.innerHTML = '';
+  if (usageEl) usageEl.textContent = '';
+  let text = '';
   try{
-    const res = await fetch('/ai/chat', {method:'POST', headers:{'content-type':'application/json','x-tenant-id':currentTenant}, body: JSON.stringify({message:q})});
-    let msg;
-    try{ const j = JSON.parse(await res.text()); msg = j.reply || JSON.stringify(j); }
-    catch{ msg = '(empty response)'; }
-    thinking.classList.remove('thinking');
-    thinking.textContent = msg;
-  }catch(e){ thinking.textContent = 'AI service unavailable.'; }
+    const res = await fetch('/ai/chat/stream', {method:'POST', headers:{'content-type':'application/json','x-tenant-id':currentTenant}, body: JSON.stringify({message:q})});
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true){
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream:true });
+      const events = buf.split('\n\n'); buf = events.pop();
+      for (const ev of events){
+        const lines = ev.split('\n');
+        const evt = (lines.find(l=>l.startsWith('event:'))||'event:token').slice(6).trim();
+        const data = JSON.parse((lines.find(l=>l.startsWith('data:'))||'data:{}').slice(5));
+        if (evt === 'tool' && toolsEl) toolsEl.insertAdjacentHTML('beforeend', `<span class="tag teal" style="margin-right:6px">🔧 ${esc(data.name)}</span>`);
+        else if (evt === 'observation' && toolsEl) toolsEl.insertAdjacentHTML('beforeend', `<span class="tag" style="margin-right:6px">${data.count} rows</span>`);
+        else if (evt === 'token'){ text += data.text; bubble.classList.remove('thinking'); bubble.textContent = text; }
+        else if (evt === 'done' && usageEl) usageEl.textContent = `provider: ${data.usage.provider} · tools: ${(data.tools||[]).join(', ')} · ${data.usage.latency_ms}ms · req ${data.usage.request_id.slice(0,8)}`;
+        else if (evt === 'start' && usageEl) usageEl.textContent = `provider: ${data.provider}…`;
+      }
+      log.scrollTop = log.scrollHeight;
+    }
+    if (!text){ bubble.classList.remove('thinking'); bubble.textContent = '(empty response)'; }
+  }catch(e){ bubble.classList.remove('thinking'); bubble.textContent = 'AI service unavailable.'; }
   log.scrollTop = log.scrollHeight;
 };
 document.addEventListener('keydown', e => { if (e.key==='Enter' && e.target?.id==='aiText'){ window.sendAI(); }});
+
+// ---------- Insights generator ----------
+window.genInsights = async function(){
+  const out = document.getElementById('insightsOut');
+  out.innerHTML = '<span style="color:var(--muted)">Generating…</span>';
+  try{
+    const res = await fetch('/ai/insights', {method:'POST', headers:{'x-tenant-id':currentTenant}, body:'{}'});
+    const d = await res.json();
+    if (d.insights){
+      out.innerHTML = d.insights.map((s,i)=>`<div style="padding:8px 0;border-bottom:1px solid var(--line)"><b>${i+1}.</b> ${esc(s)}</div>`).join('')
+        + `<div style="margin-top:8px;color:var(--muted);font-size:11px">generated ${new Date(d.generated_at).toLocaleString()} · ${d.usage.provider}</div>`;
+    } else { out.innerHTML = '<span style="color:var(--red)">Error: ' + esc(d.error||'unknown') + '</span>'; }
+  }catch(e){ out.innerHTML = '<span style="color:var(--red)">Insights failed.</span>'; }
+};
+window.loadUsage = async function(){
+  const panel = document.getElementById('aiUsagePanel');
+  panel.innerHTML = '<span style="color:var(--muted)">Loading…</span>';
+  try{
+    const res = await fetch('/ai/usage?limit=10', { headers: { 'x-tenant-id': currentTenant } });
+    const d = await res.json();
+    let html = '<h4 style="margin:14px 0 6px">By provider</h4>';
+    html += d.by_provider.map(p=>`<div class="ai-msg bot" style="max-width:100%;margin-bottom:6px"><b>${esc(p.provider)}</b> · ${p.calls} calls · ${p.tokens} tokens · $${p.cost.toFixed(4)}</div>`).join('') || '<span style="color:var(--muted)">No usage yet.</span>';
+    html += '<h4 style="margin:14px 0 6px">Recent calls</h4>';
+    html += d.recent.length ? `<table class="tbl"><thead><tr><th>Provider</th><th>Tool</th><th>Tokens out</th><th>Latency</th><th>When</th></tr></thead><tbody>${d.recent.map(r=>`<tr><td>${esc(r.provider)}</td><td>${esc(r.tool)}</td><td>${r.tokens_out}</td><td>${r.latency_ms}ms</td><td style="color:var(--muted)">${new Date(r.created_at).toLocaleTimeString()}</td></tr>`).join('')}</tbody></table>` : '<span style="color:var(--muted)">No calls yet.</span>';
+    panel.innerHTML = html;
+  }catch(e){ panel.innerHTML = '<span style="color:var(--red)">Failed.</span>'; }
+};
 
 // ---------- Global Search ----------
 window.runSearch = async function(){

@@ -271,6 +271,46 @@ fastify.post('/ai/reindex', async (req, reply) => {
   reply.send(await res.text())
 })
 
+// Generate tenant insights (top customer/grade, issue mix, trend, totals).
+fastify.post('/ai/insights', async (req, reply) => {
+  const res = await fetch(`${AI_SERVICE_URL}/insights`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
+    body: '{}'
+  })
+  reply.send(await res.text())
+})
+
+// Streaming chat (SSE) — passthrough the ai-service event stream.
+fastify.post('/ai/chat/stream', async (req, reply) => {
+  const res = await fetch(`${AI_SERVICE_URL}/chat/stream`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
+    body: JSON.stringify(req.body),
+  })
+  reply.raw.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  })
+  // Pipe the upstream SSE straight through to the client.
+  for await (const chunk of res.body) reply.raw.write(chunk)
+  reply.raw.end()
+})
+
+// AI usage logs (RLS-scoped) — for the tenant's usage dashboard.
+fastify.get('/ai/usage', async (req) => {
+  const limit = Math.min(parseInt(req.query.limit || '20', 10), 100)
+  const r = await tenantQuery(req, `
+    SELECT provider, model, tool, tokens_in, tokens_out, cost_usd, latency_ms, created_at
+    FROM ai_usage_logs ORDER BY created_at DESC LIMIT $1`, [limit])
+  const agg = await tenantQuery(req, `
+    SELECT provider, count(*)::int AS calls, coalesce(sum(tokens_out),0)::int AS tokens,
+           coalesce(sum(cost_usd),0)::float AS cost
+    FROM ai_usage_logs GROUP BY provider ORDER BY calls DESC`)
+  return { recent: r.rows, by_provider: agg.rows }
+})
+
 const start = async () => {
   try {
     // Serve the static preview/ UI from the BFF so a single tunnel exposes both.

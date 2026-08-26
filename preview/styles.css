@@ -162,6 +162,7 @@ tbody tr:hover{background:var(--panel2)}
 .d-line.eq{color:var(--muted)}
 .d-line.add{background:rgba(52,211,153,.12);color:var(--green)}
 .d-line.del{background:rgba(248,113,113,.12);color:var(--red)}
+.d-line.flag{background:rgba(245,165,36,.14);color:var(--amber);border-left:3px solid var(--amber);padding-left:10px}
 
 /* AI Assistant */
 .ai-card{display:flex;flex-direction:column;min-height:60vh}
@@ -170,6 +171,7 @@ tbody tr:hover{background:var(--panel2)}
 .ai-msg.bot{background:var(--panel2);border:1px solid var(--line2);align-self:flex-start;white-space:pre-wrap}
 .ai-msg.user{background:var(--teal);color:#04201d;align-self:flex-end;font-weight:500}
 .ai-msg.thinking{opacity:.6}
+.ai-tools{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;min-height:8px}
 .ai-input{display:flex;gap:8px}
 .ai-input input{flex:1;background:var(--bg2);border:1px solid var(--line2);border-radius:7px;padding:10px 12px;color:var(--text);font-family:var(--font-b);font-size:13px}
 .ai-input input:focus{outline:none;border-color:var(--teal)}

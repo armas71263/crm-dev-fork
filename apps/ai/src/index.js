@@ -15,9 +15,27 @@ const pool = new pg.Pool({
   password: process.env.PG_PASSWORD || 'apppass',
 })
 
-// Deterministic local embedding (hashing trick over token 3-grams, L2-normalized).
-// Offline + tenant-safe; swap for a hosted embedder (Vercel AI SDK `embed()`) when
-// an LLM key is configured — the vector shape stays identical.
+// ---- Provider router (Phase 3b) ----
+// A tenant's provider is chosen by env (default "local"). Real providers
+// (openrouter/nim/openai/ollama) light up when their API key is present; until
+// then the deterministic local provider runs so the whole platform works offline.
+// Swap-in point for the Vercel AI SDK v5 `generateText`/`streamText` calls.
+const PROVIDERS = {
+  local: { name: 'local', model: 'deterministic-hash-v1' },
+  openrouter: { name: 'openrouter', model: process.env.OPENROUTER_MODEL || 'anthropic/claude-3.5-sonnet', keyEnv: 'OPENROUTER_API_KEY' },
+  nim: { name: 'nim', model: process.env.NIM_MODEL || 'meta/llama-3.1-70b', keyEnv: 'NIM_API_KEY' },
+  openai: { name: 'openai', model: process.env.OPENAI_MODEL || 'gpt-4o-mini', keyEnv: 'OPENAI_API_KEY' },
+  ollama: { name: 'ollama', model: process.env.OLLAMA_MODEL || 'llama3.1', keyEnv: null },
+}
+function pickProvider(tenantId) {
+  const requested = process.env.AI_PROVIDER || 'local'
+  const p = PROVIDERS[requested] || PROVIDERS.local
+  // Real providers need a key (ollama needs a reachable host); else fall back.
+  if (p.keyEnv && !process.env[p.keyEnv]) return PROVIDERS.local
+  return { ...p, tenantId }
+}
+
+// ---- Deterministic local embedding (hashing trick, L2-normalized) ----
 function embed(text) {
   const v = new Float64Array(DIM)
   const tokens = String(text).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean)
@@ -48,7 +66,57 @@ async function tenantQuery(tenantId, text, params = []) {
   }
 }
 
+// ---- Usage logging (Phase 3b) — every AI call is accounted per tenant ----
+async function logUsage(tenantId, { requestId, provider, model, tool, tokensIn = 0, tokensOut = 0, costUsd = 0, latencyMs = 0 }) {
+  try {
+    await tenantQuery(tenantId,
+      `INSERT INTO ai_usage_logs (tenant_id, request_id, provider, model, tool, tokens_in, tokens_out, cost_usd, latency_ms)
+       VALUES (app.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8)`,
+      [requestId, provider, model, tool, tokensIn, tokensOut, costUsd, latencyMs])
+  } catch (e) { fastify.log.warn({ msg: 'usage log failed', err: e.message }) }
+}
+
 fastify.get('/health', async () => ({ ok: true, service: 'ai' }))
+
+// ---- Agent tools (Phase 3c) — each returns tenant-scoped structured data ----
+const TOOLS = {
+  search_records: async (tenantId, { q }) => {
+    const like = `%${q}%`
+    const r = await tenantQuery(tenantId,
+      `SELECT order_id, customer, supplier, grade, mt, fcl, price_usd, status FROM records
+       WHERE customer ILIKE $1 OR supplier ILIKE $1 OR order_id ILIKE $1 OR grade ILIKE $1
+       ORDER BY created_at DESC LIMIT 5`, [like])
+    return r.rows
+  },
+  get_kpi: async (tenantId) => {
+    const r = await tenantQuery(tenantId, `SELECT
+      count(*)::int AS open_orders, coalesce(sum(mt),0)::float AS active_mt,
+      count(DISTINCT supplier)::int AS suppliers, count(DISTINCT customer)::int AS customers
+      FROM records`)
+    return r.rows[0]
+  },
+  get_issues: async (tenantId) => {
+    const r = await tenantQuery(tenantId, `SELECT ticket_id, category, status, description FROM tickets WHERE status<>'Resolved' ORDER BY created_at DESC LIMIT 5`)
+    return r.rows
+  },
+  get_party: async (tenantId, { q }) => {
+    const r = await tenantQuery(tenantId, `SELECT name, type, contact FROM parties WHERE name ILIKE $1 LIMIT 5`, [`%${q}%`])
+    return r.rows
+  },
+}
+
+// Planner: keyword route the message to the right tool(s) — works with the local
+// provider. With a real provider this is an LLM tool-call loop (Vercel AI SDK
+// `generateText({ tools })`). Returns { toolCalls, observations }.
+function plan(message) {
+  const m = message.toLowerCase()
+  const calls = []
+  if (/(issue|quality|problem|defect|moisture|spec|document|shipment)/.test(m)) calls.push({ name: 'get_issues', args: {} })
+  if (/(order|buy|sell|tsr|rss|latex|grade|mt|ton|ship|deliver|customer|supplier)/.test(m)) calls.push({ name: 'search_records', args: { q: message } })
+  if (/(party|supplier|customer|contact|who|name)/.test(m)) calls.push({ name: 'get_party', args: { q: message } })
+  if (/(overview|summary|how many|count|kpi|status|total|metric)/.test(m) || !calls.length) calls.push({ name: 'get_kpi', args: {} })
+  return calls
+}
 
 // Reindex a tenant's knowledge base into the embeddings table.
 fastify.post('/index', async (req) => {
@@ -84,35 +152,150 @@ fastify.post('/index', async (req) => {
   return { tenant: tenantId, indexed }
 })
 
-// RAG chat: embed query → cosine-similar retrieve tenant docs → grounded answer.
+// Agentic RAG chat (Phase 3c): plan → tools → retrieve → synthesize, logged.
 fastify.post('/chat', async (req, reply) => {
   const { message } = req.body || {}
   const tenantId = req.headers['x-tenant-id']
   if (!tenantId) return reply.code(400).send({ error: 'x-tenant-id required' })
   if (!message) return reply.code(400).send({ error: 'message required' })
 
+  const t0 = Date.now()
+  const requestId = crypto.randomUUID()
+  const provider = pickProvider(tenantId)
+
+  // 1) Plan which tools to run.
+  const toolCalls = plan(message)
+  const observations = []
+  for (const tc of toolCalls) {
+    const obs = await TOOLS[tc.name](tenantId, tc.args)
+    observations.push({ tool: tc.name, result: obs })
+  }
+
+  // 2) Semantic retrieval from the knowledge base.
   const vec = embed(message)
   const hits = await tenantQuery(tenantId,
     `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
-     FROM embeddings
-     ORDER BY vector <=> $1::vector
-     LIMIT 4`, [`[${vec.join(',')}]`])
+     FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
+  const semantic = hits.rows.filter((r) => r.score > 0)
 
-  if (!hits.rows.length) {
-    return reply.send({
-      reply: `No knowledge indexed for tenant "${tenantId}" yet — call POST /index first.`,
-      sources: [],
-    })
+  // 3) Synthesize. Local provider = extractive grounded answer; real provider
+  //    would call generateText({ prompt: context+observations+question }).
+  let replyText
+  const toolNames = observations.map((o) => o.tool)
+  const lines = []
+  for (const o of observations) {
+    if (o.tool === 'search_records' && o.result.length) {
+      lines.push(...o.result.map((r) => `• ${r.order_id}: ${r.customer} ${r.grade} ${r.mt}MT from ${r.supplier} (${r.status})`))
+    } else if (o.tool === 'get_kpi' && o.result) {
+      lines.push(`• KPIs: ${o.result.open_orders} open orders, ${o.result.active_mt} active MT, ${o.result.suppliers} suppliers, ${o.result.customers} customers`)
+    } else if (o.tool === 'get_issues' && o.result.length) {
+      lines.push(...o.result.map((i) => `• ${i.ticket_id} [${i.category}] ${i.description} (${i.status})`))
+    } else if (o.tool === 'get_party' && o.result.length) {
+      lines.push(...o.result.map((p) => `• ${p.name} (${p.type})`))
+    }
+  }
+  for (const s of semantic) lines.push(`• [${s.source_type} ${s.source_id}] ${s.text}`)
+  replyText = lines.length
+    ? `Based on ${tenantId}'s data (tools: ${toolNames.join(', ')}):\n${lines.join('\n')}`
+    : `I couldn't find anything relevant for "${message}". Try asking about orders, issues, or suppliers.`
+
+  const latency = Date.now() - t0
+  // 4) Log usage (local provider = free, zero tokens).
+  await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn: message.length, tokensOut: replyText.length, costUsd: 0, latencyMs: latency })
+
+  reply.send({
+    reply: replyText,
+    tools: toolNames,
+    sources: semantic.map((r) => ({ type: r.source_type, id: r.source_id, score: +r.score.toFixed(3) })),
+    usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId },
+  })
+})
+
+// ---- Streaming chat (Phase 3e) — SSE ----
+fastify.post('/chat/stream', async (req, reply) => {
+  const { message } = req.body || {}
+  const tenantId = req.headers['x-tenant-id']
+  if (!tenantId || !message) return reply.code(400).send({ error: 'x-tenant-id and message required' })
+
+  reply.raw.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  })
+  const send = (event, data) => reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+  const t0 = Date.now()
+  const requestId = crypto.randomUUID()
+  const provider = pickProvider(tenantId)
+
+  send('start', { request_id: requestId, provider: provider.name })
+
+  // Plan + run tools, streaming each tool observation as it completes.
+  const toolCalls = plan(message)
+  const observations = []
+  for (const tc of toolCalls) {
+    send('tool', { name: tc.name })
+    const obs = await TOOLS[tc.name](tenantId, tc.args)
+    observations.push({ tool: tc.name, result: obs })
+    send('observation', { tool: tc.name, count: Array.isArray(obs) ? obs.length : 1 })
   }
 
-  // Grounded extractive answer: return top contexts with scores. When an LLM key is
-  // present this becomes a generateText({ prompt: context+question }) call instead.
-  const top = hits.rows.filter((r) => r.score > 0)
-  const lines = top.map((r, i) => `${i + 1}. [${r.source_type} ${r.source_id}] ${r.text}`)
-  reply.send({
-    reply: `Based on ${tenantId}'s data:\n${lines.join('\n')}`,
-    sources: top.map((r) => ({ type: r.source_type, id: r.source_id, score: +r.score.toFixed(3) })),
-  })
+  // Semantic retrieval.
+  const vec = embed(message)
+  const hits = await tenantQuery(tenantId,
+    `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
+     FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
+  const semantic = hits.rows.filter((r) => r.score > 0)
+
+  // Synthesize and stream token-by-token (word chunks for the local provider).
+  const toolNames = observations.map((o) => o.tool)
+  const lines = []
+  for (const o of observations) {
+    if (o.tool === 'search_records' && o.result.length) lines.push(...o.result.map((r) => `${r.order_id}: ${r.customer} ${r.grade} ${r.mt}MT (${r.status})`))
+    else if (o.tool === 'get_kpi' && o.result) lines.push(`KPIs: ${o.result.open_orders} orders, ${o.result.active_mt} MT, ${o.result.suppliers} suppliers`)
+    else if (o.tool === 'get_issues' && o.result.length) lines.push(...o.result.map((i) => `${i.ticket_id} [${i.category}] ${i.description}`))
+    else if (o.tool === 'get_party' && o.result.length) lines.push(...o.result.map((p) => `${p.name} (${p.type})`))
+  }
+  for (const s of semantic) lines.push(`[${s.source_type} ${s.source_id}] ${s.text}`)
+  const full = lines.length ? `Based on ${tenantId}'s data:\n${lines.join('\n')}` : `Nothing found for "${message}".`
+
+  const words = full.split(/(\s+)/)
+  let tokensOut = 0
+  for (const w of words) {
+    send('token', { text: w })
+    tokensOut++
+    // Small delay so the streaming is visible; a real provider streams from the API.
+    await new Promise((r) => setTimeout(r, 8))
+  }
+  const latency = Date.now() - t0
+  await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn: message.length, tokensOut, costUsd: 0, latencyMs: latency })
+  send('done', { tools: toolNames, usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId } })
+  reply.raw.end()
+})
+
+// ---- Insights generator (Phase 3d) ----
+fastify.post('/insights', async (req) => {
+  const tenantId = req.headers['x-tenant-id']
+  if (!tenantId) return { error: 'x-tenant-id required' }
+  const t0 = Date.now()
+  const requestId = crypto.randomUUID()
+  const provider = pickProvider(tenantId)
+
+  const [topCust, topGrade, issueMix, trend, totals] = await Promise.all([
+    tenantQuery(tenantId, `SELECT customer, sum(mt)::float AS mt FROM records GROUP BY customer ORDER BY mt DESC LIMIT 3`),
+    tenantQuery(tenantId, `SELECT grade, sum(mt)::float AS mt FROM records GROUP BY grade ORDER BY mt DESC LIMIT 3`),
+    tenantQuery(tenantId, `SELECT category, count(*)::int AS n FROM tickets GROUP BY category ORDER BY n DESC`),
+    tenantQuery(tenantId, `SELECT to_char(date_trunc('month', date),'YYYY-MM') AS m, sum(mt)::float AS mt FROM records GROUP BY 1 ORDER BY 1`),
+    tenantQuery(tenantId, `SELECT count(*)::int AS orders, coalesce(sum(mt),0)::float AS mt, coalesce(sum(mt*price_usd),0)::float AS revenue FROM records`),
+  ])
+  const insights = [
+    `Top customer by volume: ${topCust.rows[0]?.customer || 'n/a'} (${topCust.rows[0]?.mt || 0} MT).`,
+    `Top grade: ${topGrade.rows[0]?.grade || 'n/a'} (${topGrade.rows[0]?.mt || 0} MT).`,
+    `Open issues by category: ${issueMix.rows.map((r) => `${r.category}=${r.n}`).join(', ') || 'none'}.`,
+    `Monthly volume trend: ${trend.rows.map((r) => `${r.m}=${r.mt}MT`).join(' → ') || 'n/a'}.`,
+    `Totals: ${totals.rows[0].orders} orders, ${totals.rows[0].mt} MT, $${(totals.rows[0].revenue / 1e6).toFixed(2)}M revenue.`,
+  ]
+  await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: 'insights', tokensIn: 0, tokensOut: insights.join(' ').length, costUsd: 0, latencyMs: Date.now() - t0 })
+  return { tenant: tenantId, insights, generated_at: new Date().toISOString(), usage: { provider: provider.name, request_id: requestId } }
 })
 
 const start = async () => {

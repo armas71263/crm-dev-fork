@@ -135,6 +135,23 @@ CREATE TABLE IF NOT EXISTS screen_configs (
 );
 CREATE INDEX IF NOT EXISTS idx_screen_configs_tenant ON screen_configs(tenant_id, screen);
 
+-- AI usage logs: per-tenant accounting of every AI call (cost, tokens, tools).
+-- Lets tenant-admins see spend and lets the platform bill tier B/C tenants.
+CREATE TABLE IF NOT EXISTS ai_usage_logs (
+  id          BIGSERIAL PRIMARY KEY,
+  tenant_id   TEXT NOT NULL REFERENCES app.tenants(id),
+  request_id  TEXT NOT NULL,                     -- client correlation id
+  provider    TEXT NOT NULL,                      -- local | openrouter | nim | ollama | openai
+  model       TEXT NOT NULL DEFAULT '',
+  tool        TEXT NOT NULL DEFAULT '',           -- rag | kpi | search | planner
+  tokens_in   INTEGER NOT NULL DEFAULT 0,
+  tokens_out  INTEGER NOT NULL DEFAULT 0,
+  cost_usd    NUMERIC(10,6) NOT NULL DEFAULT 0,
+  latency_ms  INTEGER NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_tenant ON ai_usage_logs(tenant_id, created_at DESC);
+
 -- ============================================================
 -- 3. INDEXES
 -- ============================================================
@@ -166,6 +183,7 @@ ALTER TABLE checklists ENABLE ROW LEVEL SECURITY;
 ALTER TABLE files      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE embeddings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE screen_configs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_usage_logs ENABLE ROW LEVEL SECURITY;
 
 -- One policy per table: tenant_id must equal the session's app.tenant_id.
 CREATE POLICY tenant_isolation ON records    FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
@@ -177,6 +195,7 @@ CREATE POLICY tenant_isolation ON checklists FOR ALL USING (tenant_id = app.curr
 CREATE POLICY tenant_isolation ON files      FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
 CREATE POLICY tenant_isolation ON embeddings FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
 CREATE POLICY tenant_isolation ON screen_configs FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
+CREATE POLICY tenant_isolation ON ai_usage_logs FOR ALL USING (tenant_id = app.current_tenant()) WITH CHECK (tenant_id = app.current_tenant());
 
 -- ============================================================
 -- 5. SEED TENANTS + DEMO DATA
@@ -280,4 +299,5 @@ ALTER TABLE checklists FORCE ROW LEVEL SECURITY;
 ALTER TABLE files      FORCE ROW LEVEL SECURITY;
 ALTER TABLE embeddings FORCE ROW LEVEL SECURITY;
 ALTER TABLE screen_configs FORCE ROW LEVEL SECURITY;
+ALTER TABLE ai_usage_logs FORCE ROW LEVEL SECURITY;
 
