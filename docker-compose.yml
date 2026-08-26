@@ -17,7 +17,7 @@ services:
   bff:
     build: {context: ./apps/bff}
     ports: ["4000:4000"]
-    environment: {BFF_PORT: "4000", DIRECTUS_URL: http://directus:8055, AI_SERVICE_URL: http://ai-service:5000, PG_HOST: postgres, PG_DATABASE: rubbertrack, PG_USER: app_role, PG_PASSWORD: apppass}
+    environment: {BFF_PORT: "4000", DIRECTUS_URL: http://directus:8055, AI_SERVICE_URL: http://ai-service:5000, PG_HOST: postgres, PG_DATABASE: rubbertrack, PG_USER: app_role, PG_PASSWORD: apppass, PG_ADMIN_USER: postgres, PG_ADMIN_PASSWORD: postgres}
     volumes: [./preview:/app/preview:ro]
     depends_on: [directus, ai-service]
 

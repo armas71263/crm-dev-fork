@@ -61,3 +61,24 @@ fi
 
 echo "✓ Tenant '$TENANT_ID' onboarded. RLS policies auto-apply — set app.tenant_id='$TENANT_ID' to seed/use."
 echo "  Next: seed data via Directus or INSERTs scoped to this tenant."
+
+# 4. Clone template data (optional) — copy the template tenant's rows into the
+#    new tenant so it starts with a working dataset. Re-tenant each row.
+if [ "${CLONE_TEMPLATE:-0}" = "1" ] && [ "$TEMPLATE" != "$TENANT_ID" ]; then
+  echo "→ Cloning template '$TEMPLATE' data into '$TENANT_ID' (CLONE_TEMPLATE=1)..."
+  TABLES="records parties tickets feed_items checklists screen_configs"
+  for T in $TABLES; do
+    # Build a column list excluding tenant_id (portable across PG versions).
+    COLS=$(DOCKER exec -i rubbertrack-platform-postgres-1 psql "$PG_DSN" -tAc \
+      "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='${T}' AND column_name<>'tenant_id';")
+    DOCKER exec -i rubbertrack-platform-postgres-1 psql "$PG_DSN" -v ON_ERROR_STOP=1 <<SQL
+INSERT INTO public.${T} (tenant_id, ${COLS})
+  SELECT '$TENANT_ID', ${COLS} FROM public.${T} WHERE tenant_id='$TEMPLATE' ON CONFLICT DO NOTHING;
+SQL
+    N=$(DOCKER exec -i rubbertrack-platform-postgres-1 psql "$PG_DSN" -tAc \
+      "SELECT count(*) FROM public.${T} WHERE tenant_id='$TENANT_ID';")
+    echo "  ✓ $T: $N rows cloned"
+  done
+fi
+

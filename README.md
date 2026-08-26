@@ -52,8 +52,8 @@ docker exec -i rubbertrack-platform-postgres-1 psql -U postgres -d rubbertrack \
 | 1 | Template engine: schema + RLS + seed + BFF data endpoints + live preview wiring | ✅ done |
 | 2 | Dashboard KPI engine + hybrid search (vector+ts+trgm) | ✅ done |
 | 3 | AI platform (Insights, doc pipeline, agentic assistant) | ✅ done |
-| 4 | Ops + tenancy escalation (tier B/C) | ⬜ next |
-| 5 | White-label + release | ⬜ |
+| 4 | Ops + tenancy escalation (tier B/C) | ✅ done |
+| 5 | White-label + release | ⬜ next |
 
 ### Layout resilience
 

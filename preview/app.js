@@ -15,6 +15,7 @@ const NAV = [
   { id: 'checklists', label: 'Checklists', ico: '✓' },
   { id: 'ai',        label: 'AI Assistant', ico: '✦' },
   { id: 'insights',  label: 'Insights', ico: '✧' },
+  { id: 'tenants',   label: 'Tenants', ico: '⧉' },
   { id: 'config',    label: 'Screen Config', ico: '⚙' },
 ];
 
@@ -250,6 +251,20 @@ Incoterms: DAP Mundra</textarea></div>
       <div id="aiUsagePanel" style="margin-top:18px"></div>
       <button class="btn" style="margin-top:10px" onclick="loadUsage()">View AI usage</button>
     </div>`,
+  tenants: () => `
+    <div class="card span-12">
+      <h3>Tenant Management <span class="tag teal" style="font-size:10px">admin · tier escalation · backups</span></h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:14px">
+        <label style="font-size:12px;color:var(--muted)">ID<input id="ntId" placeholder="acme" style="display:block;margin-top:2px"></label>
+        <label style="font-size:12px;color:var(--muted)">Label<input id="ntLabel" placeholder="Acme Trading" style="display:block;margin-top:2px"></label>
+        <label style="font-size:12px;color:var(--muted)">Template<select id="ntTemplate" style="display:block;margin-top:2px"><option>rubbertrack</option></select></label>
+        <label style="font-size:12px;color:var(--muted)">Tier<select id="ntTier" style="display:block;margin-top:2px"><option>A</option><option>B</option><option>C</option></select></label>
+        <label style="font-size:12px"><input type="checkbox" id="ntClone" style="margin-right:4px">Clone template data</label>
+        <button class="btn primary" onclick="onboardTenant()">Onboard</button>
+      </div>
+      <button class="btn" onclick="loadTenants()">Refresh list</button>
+      <div id="tenantsList" style="margin-top:14px"></div>
+    </div>`,
   config: () => `
     <div class="card span-12"><h3>Screen Configuration <span style="color:var(--muted);font-size:11px;font-weight:400">— re-arrange dashboard panels (saved per tenant)</span></h3>
       <div id="cfgPanels" class="cfg-panels"></div>
@@ -383,6 +398,39 @@ window.loadUsage = async function(){
     html += d.recent.length ? `<table class="tbl"><thead><tr><th>Provider</th><th>Tool</th><th>Tokens out</th><th>Latency</th><th>When</th></tr></thead><tbody>${d.recent.map(r=>`<tr><td>${esc(r.provider)}</td><td>${esc(r.tool)}</td><td>${r.tokens_out}</td><td>${r.latency_ms}ms</td><td style="color:var(--muted)">${new Date(r.created_at).toLocaleTimeString()}</td></tr>`).join('')}</tbody></table>` : '<span style="color:var(--muted)">No calls yet.</span>';
     panel.innerHTML = html;
   }catch(e){ panel.innerHTML = '<span style="color:var(--red)">Failed.</span>'; }
+};
+
+// ---------- Tenant Management (admin) ----------
+window.loadTenants = async function(){
+  const el = document.getElementById('tenantsList');
+  el.innerHTML = '<span style="color:var(--muted)">Loading…</span>';
+  try{
+    const res = await fetch('/tenants');
+    const d = await res.json();
+    el.innerHTML = d.tenants.length ? `<table class="tbl"><thead><tr><th>ID</th><th>Label</th><th>Template</th><th>Tier</th><th>Status</th><th>Actions</th></tr></thead><tbody>${d.tenants.map(t=>`<tr><td><b>${esc(t.id)}</b></td><td>${esc(t.label)}</td><td>${esc(t.template)}</td><td><span class="tag ${t.tier==='C'?'amber':t.tier==='B'?'teal':''}">${t.tier}</span></td><td>${esc(t.status)}</td><td><button class="btn" style="font-size:11px;padding:3px 8px" onclick="escalateTenant('${t.id}','${t.tier}')">Escalate</button> <a class="btn" style="font-size:11px;padding:3px 8px" href="/tenants/${t.id}/backup" download>Backup</a></td></tr>`).join('')}</tbody></table>` : '<span style="color:var(--muted)">No tenants.</span>';
+  }catch(e){ el.innerHTML = '<span style="color:var(--red)">Failed.</span>'; }
+};
+window.onboardTenant = async function(){
+  const id = document.getElementById('ntId').value.trim();
+  const label = document.getElementById('ntLabel').value.trim();
+  if (!id || !label){ alert('ID and Label required'); return; }
+  const body = { id, label, template: document.getElementById('ntTemplate').value, tier: document.getElementById('ntTier').value, cloneTemplate: document.getElementById('ntClone').checked };
+  try{
+    const res = await fetch('/tenants', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
+    const d = await res.json();
+    if (d.onboarded){ alert(`Onboarded ${d.id} (${d.tier})` + (d.cloned && d.cloned.records ? ` — cloned ${d.cloned.records} records` : '')); document.getElementById('ntId').value=''; document.getElementById('ntLabel').value=''; loadTenants(); }
+    else { alert('Error: ' + (d.error||JSON.stringify(d))); }
+  }catch(e){ alert('Onboard failed'); }
+};
+window.escalateTenant = async function(id, fromTier){
+  const toTier = fromTier === 'A' ? 'B' : 'C';
+  if (!confirm(`Escalate ${id} from tier ${fromTier} → ${toTier}?`)) return;
+  try{
+    const res = await fetch(`/tenants/${id}/escalate`, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({toTier})});
+    const d = await res.json();
+    alert(d.escalated ? `Escalated ${id} → ${toTier} (${d.isolation})` : `No change: ${d.note||JSON.stringify(d)}`);
+    loadTenants();
+  }catch(e){ alert('Escalation failed'); }
 };
 
 // ---------- Global Search ----------

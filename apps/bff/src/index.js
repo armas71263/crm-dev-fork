@@ -251,6 +251,103 @@ fastify.put('/data/screen-config', async (req) => {
   return { id: r.rows[0]?.id, screen, saved: true }
 })
 
+// ---- Tenant admin (Phase 4e) — list / onboard / escalate / backup tenants ----
+// NB: privileged admin endpoints. They connect as the postgres superuser (NOT
+// app_role) so they can read/write the app.tenants registry and create schemas.
+const adminPool = new pg.Pool({
+  host: process.env.PG_HOST || 'postgres',
+  port: 5432,
+  database: process.env.PG_DATABASE || 'rubbertrack',
+  user: process.env.PG_ADMIN_USER || 'postgres',
+  password: process.env.PG_ADMIN_PASSWORD || 'postgres',
+})
+
+// List tenants (admin only — no RLS on the registry table).
+fastify.get('/tenants', async () => {
+  const r = await adminPool.query(
+    'SELECT id, label, template, tier, status, created_at FROM app.tenants ORDER BY created_at')
+  return { tenants: r.rows }
+})
+
+// Onboard a tenant: create registry row + clone template data (Phase 4a).
+fastify.post('/tenants', async (req, reply) => {
+  const { id, label, template = 'rubbertrack', tier = 'A', cloneTemplate = false } = req.body || {}
+  if (!id || !label) return reply.code(400).send({ error: 'id and label required' })
+  if (!/^[a-z0-9_-]+$/i.test(id)) return reply.code(400).send({ error: 'id must be alphanumeric/dash/underscore' })
+  await adminPool.query(
+    `INSERT INTO app.tenants (id, label, template, tier, status) VALUES ($1,$2,$3,$4,'active')
+     ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, template=EXCLUDED.template, tier=EXCLUDED.tier`,
+    [id, label, template, tier])
+  let cloned = {}
+  if (cloneTemplate && template !== id) {
+    for (const t of ['records','parties','tickets','feed_items','checklists','screen_configs']) {
+      // Exclude the `id` PK (bigserial) so clones get fresh ids, not conflicts.
+      const cols = await adminPool.query(
+        `SELECT string_agg(column_name, ',' ORDER BY ordinal_position) AS c FROM information_schema.columns
+         WHERE table_schema='public' AND table_name=$1 AND column_name NOT IN ('tenant_id','id')`, [t])
+      const colList = cols.rows[0].c
+      await adminPool.query(`INSERT INTO public.${t} (tenant_id, ${colList}) SELECT $1, ${colList} FROM public.${t} WHERE tenant_id=$2`, [id, template])
+      cloned[t] = (await adminPool.query(`SELECT count(*)::int AS n FROM public.${t} WHERE tenant_id=$1`, [id])).rows[0].n
+    }
+  }
+  return { onboarded: true, id, label, template, tier, cloned }
+})
+
+// Escalate a tenant's tier (A→B schema-per-tenant, B→C db-per-tenant).
+fastify.post('/tenants/:id/escalate', async (req, reply) => {
+  const { id } = req.params
+  const { toTier } = req.body || {}
+  if (!['B','C'].includes(toTier)) return reply.code(400).send({ error: 'toTier must be B or C' })
+  const cur = await adminPool.query('SELECT tier FROM app.tenants WHERE id=$1', [id])
+  if (!cur.rows.length) return reply.code(404).send({ error: 'tenant not found' })
+  const fromTier = cur.rows[0].tier
+  if (fromTier === toTier) return { escalated: false, id, fromTier, toTier, note: 'already at target' }
+  const TABLES = ['records','parties','tickets','feed_items','checklists','files','hr_events','screen_configs','embeddings','ai_usage_logs']
+  if (toTier === 'B') {
+    const schema = `tenant_${id}`
+    await adminPool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`)
+    for (const t of TABLES) {
+      await adminPool.query(`CREATE TABLE IF NOT EXISTS ${schema}.${t} (LIKE public.${t} INCLUDING DEFAULTS INCLUDING CONSTRAINTS)`)
+      await adminPool.query(`INSERT INTO ${schema}.${t} SELECT * FROM public.${t} WHERE tenant_id=$1 ON CONFLICT DO NOTHING`, [id])
+    }
+  } else {
+    const db = `tenant_${id}`
+    await adminPool.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, [db]).catch(() => {})
+    await adminPool.query(`CREATE DATABASE ${db}`).catch(() => {})
+    const tmpPool = new pg.Pool({ host: process.env.PG_HOST || 'postgres', port: 5432, database: db, user: process.env.PG_ADMIN_USER || 'postgres', password: process.env.PG_ADMIN_PASSWORD || 'postgres' })
+    try {
+      await tmpPool.query('CREATE EXTENSION IF NOT EXISTS vector')
+      await tmpPool.query('CREATE EXTENSION IF NOT EXISTS pg_trgm')
+      for (const t of TABLES) {
+        await tmpPool.query(`CREATE TABLE IF NOT EXISTS ${t} (LIKE public.${t} INCLUDING DEFAULTS INCLUDING CONSTRAINTS)`)
+        const rows = await adminPool.query(`SELECT * FROM public.${t} WHERE tenant_id=$1`, [id])
+        for (const r of rows.rows) {
+          const cols = Object.keys(r), vals = Object.values(r)
+          const ph = cols.map((_, i) => `$${i+1}`).join(',')
+          await tmpPool.query(`INSERT INTO ${t} (${cols.join(',')}) VALUES (${ph}) ON CONFLICT DO NOTHING`, vals)
+        }
+      }
+    } finally { await tmpPool.end() }
+  }
+  await adminPool.query('UPDATE app.tenants SET tier=$1 WHERE id=$2', [toTier, id])
+  return { escalated: true, id, fromTier, toTier, isolation: toTier === 'B' ? `tenant_${id} schema` : `tenant_${id} database` }
+})
+
+// Per-tenant logical backup (JSON dump of the tenant's rows across all tables).
+fastify.get('/tenants/:id/backup', async (req, reply) => {
+  const { id } = req.params
+  const exists = await adminPool.query('SELECT 1 FROM app.tenants WHERE id=$1', [id])
+  if (!exists.rows.length) return reply.code(404).send({ error: 'tenant not found' })
+  const TABLES = ['records','parties','tickets','feed_items','checklists','files','hr_events','screen_configs','embeddings','ai_usage_logs']
+  const dump = { tenant: id, backed_up_at: new Date().toISOString(), tables: {} }
+  for (const t of TABLES) {
+    const r = await adminPool.query(`SELECT row_to_json(x) FROM (SELECT * FROM public.${t} WHERE tenant_id=$1) x`, [id])
+    dump.tables[t] = r.rows.map((row) => row.row_to_json)
+  }
+  reply.header('content-disposition', `attachment; filename="${id}-backup.json"`)
+  return dump
+})
+
 // Proxy to AI service (approve the AI contexts)
 fastify.post('/ai/chat', async (req, reply) => {
   const res = await fetch(`${AI_SERVICE_URL}/chat`, {

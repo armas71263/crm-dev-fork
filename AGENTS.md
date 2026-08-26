@@ -39,7 +39,7 @@ Sellable multi-tenant CRM + analytics dashboard + CMS. RubberTrack (rubber tradi
 - Phase 1 (template engine): DONE ā€” screen_configs table+RLS, Directus 12 roles/policies (7 roles, idempotent), Excel import/export (date-serial fix), screen-config editor endpoint (GET/PUT), 3 new preview screens (Doc Checker, AI Assistant, Screen Config), isolation Test F pass, Excel round-trip verified.
 - Phase 2 (dashboard + hybrid search): DONE ā€” KPI engine (/data/kpi/trend|grades|issues|chart), hybrid /search (tsvector+trgm+optional pgvector), real AI RAG (deterministic 768-dim hash embeddings, /index + /chat, RLS-scoped), global Search screen, dashboard charts wired to live KPI endpoints
 - Phase 3 (AI platform): DONE — ai_usage_logs table+RLS, provider router (local/openrouter/nim/openai/ollama w/ key-gated fallback), agentic planner→tools→synthesize (search_records/get_kpi/get_issues/get_party), SSE streaming /chat/stream, insights generator (/insights), Doc Checker field-extraction+mismatch flags, usage dashboard (/ai/usage)
-- Phase 4 (ops/escalation): TODO
+- Phase 4 (ops/escalation): DONE — tenant onboarding + template cloning (BFF /tenants POST), tier escalation A→B schema-per-tenant + B→C db-per-tenant (escalate-tenant.sh + /tenants/:id/escalate), per-tenant logical backup (backup-tenant.sh + /tenants/:id/backup), Tenants admin screen, GitHub Actions CI for isolation tests
 - Phase 5 (white-label + release): TODO
 
 ## Repo
