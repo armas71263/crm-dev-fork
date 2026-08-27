@@ -24,7 +24,15 @@ services:
   ai-service:
     build: {context: ./apps/ai}
     ports: ["5000:5000"]
-    environment: {AI_PORT: "5000", AI_PROVIDER: openrouter, OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}, OPENROUTER_MODEL: "google/gemma-4-26b-a4b-it:free", PG_HOST: postgres, PG_DATABASE: rubbertrack, PG_USER: app_role, PG_PASSWORD: apppass}
+    environment:
+      AI_PORT: "5000"
+      AI_PROVIDER: openrouter
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL: "google/gemma-4-26b-a4b-it:free"
+      PG_HOST: postgres
+      PG_DATABASE: rubbertrack
+      PG_USER: app_role
+      PG_PASSWORD: apppass
     depends_on: [postgres]
 
   web:
