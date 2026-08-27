@@ -131,6 +131,53 @@ const TOOLS = {
     const r = await tenantQuery(tenantId, `SELECT name, type, contact FROM parties WHERE name ILIKE $1 LIMIT 5`, [`%${q}%`])
     return r.rows
   },
+  // suggest_chart: aggregates the data and returns a chart spec the UI renders inline.
+  suggest_chart: async (tenantId, { dimension, metric = 'count', title, filter }) => {
+    const DIMS = { grade: 'grade', customer: 'customer', supplier: 'supplier', status: 'status', category: 'category', type: 'type', month: "to_char(date_trunc('month', date), 'YYYY-MM')" }
+    const METRICS = { mt: 'sum(mt)', fcl: 'sum(fcl)', count: 'count(*)', revenue: 'sum(mt*price_usd)', avg_price: 'avg(price_usd)' }
+    const dim = DIMS[dimension] || DIMS.customer
+    const met = METRICS[metric] || METRICS.count
+    let where = '', params = []
+    if (filter) { where = 'WHERE grade ILIKE $1 OR customer ILIKE $1 OR supplier ILIKE $1'; params = [`%${filter}%`] }
+    const r = await tenantQuery(tenantId,
+      `SELECT ${dim} AS label, ${met}::float AS value FROM records ${where} GROUP BY 1 ORDER BY ${dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 20`, params)
+    return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) } }
+  },
+}
+
+// Multi-turn session store (in-memory, keyed by tenant+session id).
+// Keeps the last few turns so follow-ups ("now just TSR-20") can refine.
+const sessions = new Map()
+function getSession(tenantId, sessionId) {
+  const key = `${tenantId}:${sessionId || 'default'}`
+  if (!sessions.has(key)) sessions.set(key, { turns: [], lastChart: null })
+  return sessions.get(key)
+}
+
+// Chart intent detection — keywords that signal a visualization request.
+// Multi-turn: if the message has a filter ("now just TSR-20") but no chart
+// keywords, and the session has a previous chart, treat it as a refinement.
+function detectChartIntent(message, session = null) {
+  const m = message.toLowerCase()
+  const hasIntent = /(chart|graph|plot|visuali[sz]e|trend|over time|by \w+|compare|breakdown|top \d+|rank|show me.*(by|per|over))/i.test(m)
+  // Extract filter first — a bare filter with a prior chart = refine the prior chart.
+  const fm = m.match(/(?:for|only|just|just the|show only|now just|now only|filter to)\s+([a-z0-9 -]{2,30})/i)
+  const filter = fm ? fm[1].trim() : null
+  if (!hasIntent) {
+    if (filter && session?.lastChart) return { ...session.lastChart, filter }
+    return null
+  }
+  let dimension = null, metric = 'count'
+  if (/by grade|grade.*(breakdown|chart)|per grade/i.test(m)) dimension = 'grade'
+  else if (/by supplier|per supplier|supplier.*(breakdown|chart)/i.test(m)) dimension = 'supplier'
+  else if (/by status|per status|status.*(breakdown|chart)/i.test(m)) dimension = 'status'
+  else if (/by category|per category|category.*(breakdown|chart)/i.test(m)) dimension = 'category'
+  else if (/over time|by month|per month|monthly|trend/i.test(m)) dimension = 'month'
+  else if (/by type|per type|type.*(breakdown|chart)/i.test(m)) dimension = 'type'
+  if (/mt|volume|tonnage/i.test(m)) metric = 'mt'
+  else if (/revenue|value|sales|money|\$/i.test(m)) metric = 'revenue'
+  else if (/fcl|container/i.test(m)) metric = 'fcl'
+  return { dimension: dimension || session?.lastChart?.dimension || 'customer', metric, filter }
 }
 
 // Planner: keyword route the message to the right tool(s) — works with the local
@@ -182,7 +229,7 @@ fastify.post('/index', async (req) => {
 
 // Agentic RAG chat (Phase 3c): plan → tools → retrieve → synthesize, logged.
 fastify.post('/chat', async (req, reply) => {
-  const { message } = req.body || {}
+  const { message, session_id } = req.body || {}
   const tenantId = req.headers['x-tenant-id']
   if (!tenantId) return reply.code(400).send({ error: 'x-tenant-id required' })
   if (!message) return reply.code(400).send({ error: 'message required' })
@@ -190,8 +237,9 @@ fastify.post('/chat', async (req, reply) => {
   const t0 = Date.now()
   const requestId = crypto.randomUUID()
   const provider = pickProvider(tenantId)
+  const session = getSession(tenantId, session_id)
 
-  // 1) Plan which tools to run.
+  // 1) Plan which tools to run. Multi-turn: prepend recent history to context.
   const toolCalls = plan(message)
   const observations = []
   for (const tc of toolCalls) {
@@ -199,14 +247,27 @@ fastify.post('/chat', async (req, reply) => {
     observations.push({ tool: tc.name, result: obs })
   }
 
-  // 2) Semantic retrieval from the knowledge base.
+  // 2) Chart intent — detect visualization requests and build a chart spec.
+  const chartIntent = detectChartIntent(message, session)
+  let chart = null
+  if (chartIntent) {
+    // Multi-turn: if no explicit filter but a previous chart had one, carry it over.
+    if (!chartIntent.filter && session.lastChart?.filter) chartIntent.filter = session.lastChart.filter
+    if (!chartIntent.dimension && session.lastChart?.dimension) chartIntent.dimension = session.lastChart.dimension
+    const res = await TOOLS.suggest_chart(tenantId, chartIntent)
+    chart = res.chart
+    session.lastChart = { ...chartIntent, spec: chart }
+    observations.push({ tool: 'suggest_chart', result: chart })
+  }
+
+  // 3) Semantic retrieval from the knowledge base.
   const vec = embed(message)
   const hits = await tenantQuery(tenantId,
     `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
      FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
   const semantic = hits.rows.filter((r) => r.score > 0)
 
-  // 3) Synthesize. Real provider calls OpenRouter with the gathered context;
+  // 4) Synthesize. Real provider calls OpenRouter with the gathered context;
   //    local provider = extractive grounded answer.
   let replyText, tokensIn = message.length, tokensOut = 0, costUsd = 0
   const toolNames = observations.map((o) => o.tool)
@@ -220,15 +281,20 @@ fastify.post('/chat', async (req, reply) => {
       lines.push(...o.result.map((i) => `• ${i.ticket_id} [${i.category}] ${i.description} (${i.status})`))
     } else if (o.tool === 'get_party' && o.result.length) {
       lines.push(...o.result.map((p) => `• ${p.name} (${p.type})`))
+    } else if (o.tool === 'suggest_chart' && o.result.labels?.length) {
+      lines.push(`• Chart ready: ${o.result.title} (${o.result.labels.length} bars) — rendered below.`)
     }
   }
   for (const s of semantic) lines.push(`• [${s.source_type} ${s.source_id}] ${s.text}`)
   const context = lines.join('\n')
 
+  // 5) Multi-turn: include recent turns in the LLM prompt.
+  const history = session.turns.slice(-4).map((t) => `${t.role}: ${t.text}`).join('\n')
+
   if (provider.name !== 'local') {
     try {
       const sys = `You are a B2B operations assistant for tenant "${tenantId}". Answer the user's question using ONLY the context below. Be concise and specific. If the context doesn't contain the answer, say so.`
-      const result = await llmGenerate(provider, sys, `Context:\n${context}\n\nQuestion: ${message}`)
+      const result = await llmGenerate(provider, sys, `Recent conversation:\n${history}\n\nContext:\n${context}\n\nQuestion: ${message}`)
       replyText = result.text
       tokensIn = result.tokensIn; tokensOut = result.tokensOut
     } catch (e) {
@@ -245,8 +311,13 @@ fastify.post('/chat', async (req, reply) => {
   const latency = Date.now() - t0
   await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn, tokensOut, costUsd, latencyMs: latency })
 
+  // 6) Record this turn in the session (multi-turn).
+  session.turns.push({ role: 'user', text: message }, { role: 'assistant', text: replyText })
+  if (session.turns.length > 12) session.turns = session.turns.slice(-12)
+
   reply.send({
     reply: replyText,
+    chart,
     tools: toolNames,
     sources: semantic.map((r) => ({ type: r.source_type, id: r.source_id, score: +r.score.toFixed(3) })),
     usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId, tokens_in: tokensIn, tokens_out: tokensOut },
@@ -255,7 +326,7 @@ fastify.post('/chat', async (req, reply) => {
 
 // ---- Streaming chat (Phase 3e) — SSE ----
 fastify.post('/chat/stream', async (req, reply) => {
-  const { message } = req.body || {}
+  const { message, session_id } = req.body || {}
   const tenantId = req.headers['x-tenant-id']
   if (!tenantId || !message) return reply.code(400).send({ error: 'x-tenant-id and message required' })
 
@@ -268,6 +339,7 @@ fastify.post('/chat/stream', async (req, reply) => {
   const t0 = Date.now()
   const requestId = crypto.randomUUID()
   const provider = pickProvider(tenantId)
+  const session = getSession(tenantId, session_id)
 
   send('start', { request_id: requestId, provider: provider.name })
 
@@ -279,6 +351,19 @@ fastify.post('/chat/stream', async (req, reply) => {
     const obs = await TOOLS[tc.name](tenantId, tc.args)
     observations.push({ tool: tc.name, result: obs })
     send('observation', { tool: tc.name, count: Array.isArray(obs) ? obs.length : 1 })
+  }
+
+  // Chart intent — detect and stream a chart spec inline.
+  const chartIntent = detectChartIntent(message, session)
+  let chart = null
+  if (chartIntent) {
+    if (!chartIntent.filter && session.lastChart?.filter) chartIntent.filter = session.lastChart.filter
+    if (!chartIntent.dimension && session.lastChart?.dimension) chartIntent.dimension = session.lastChart.dimension
+    send('tool', { name: 'suggest_chart' })
+    const res = await TOOLS.suggest_chart(tenantId, chartIntent)
+    chart = res.chart
+    session.lastChart = { ...chartIntent, spec: chart }
+    send('chart', chart)
   }
 
   // Semantic retrieval.
@@ -297,15 +382,17 @@ fastify.post('/chat/stream', async (req, reply) => {
     else if (o.tool === 'get_issues' && o.result.length) lines.push(...o.result.map((i) => `${i.ticket_id} [${i.category}] ${i.description}`))
     else if (o.tool === 'get_party' && o.result.length) lines.push(...o.result.map((p) => `${p.name} (${p.type})`))
   }
+  if (chart) lines.push(`Chart ready: ${chart.title} — rendered below.`)
   for (const s of semantic) lines.push(`[${s.source_type} ${s.source_id}] ${s.text}`)
   const context = lines.join('\n')
 
   let tokensOut = 0, tokensIn = 0
+  const history = session.turns.slice(-4).map((t) => `${t.role}: ${t.text}`).join('\n')
   if (provider.name !== 'local') {
     // Real LLM: call OpenRouter, then stream the response in word chunks.
     try {
       const sys = `You are a B2B operations assistant for tenant "${tenantId}". Answer using ONLY the context below. Be concise.`
-      const result = await llmGenerate(provider, sys, `Context:\n${context}\n\nQuestion: ${message}`)
+      const result = await llmGenerate(provider, sys, `Recent conversation:\n${history}\n\nContext:\n${context}\n\nQuestion: ${message}`)
       tokensIn = result.tokensIn; tokensOut = result.tokensOut
       const words = result.text.split(/(\s+)/)
       for (const w of words) {
@@ -326,19 +413,15 @@ fastify.post('/chat/stream', async (req, reply) => {
     }
   }
   const latency = Date.now() - t0
+  session.turns.push({ role: 'user', text: message }, { role: 'assistant', text: context || 'ok' })
+  if (session.turns.length > 12) session.turns = session.turns.slice(-12)
   await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn, tokensOut, costUsd: 0, latencyMs: latency })
-  send('done', { tools: toolNames, usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId, tokens_in: tokensIn, tokens_out: tokensOut } })
+  send('done', { tools: toolNames, chart, usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId, tokens_in: tokensIn, tokens_out: tokensOut } })
   reply.raw.end()
 })
 
-// ---- Insights generator (Phase 3d) ----
-fastify.post('/insights', async (req) => {
-  const tenantId = req.headers['x-tenant-id']
-  if (!tenantId) return { error: 'x-tenant-id required' }
-  const t0 = Date.now()
-  const requestId = crypto.randomUUID()
-  const provider = pickProvider(tenantId)
-
+// ---- Insights generator (Phase 3d) — computes and stores a snapshot ----
+async function computeInsights(tenantId) {
   const [topCust, topGrade, issueMix, trend, totals] = await Promise.all([
     tenantQuery(tenantId, `SELECT customer, sum(mt)::float AS mt FROM records GROUP BY customer ORDER BY mt DESC LIMIT 3`),
     tenantQuery(tenantId, `SELECT grade, sum(mt)::float AS mt FROM records GROUP BY grade ORDER BY mt DESC LIMIT 3`),
@@ -346,16 +429,64 @@ fastify.post('/insights', async (req) => {
     tenantQuery(tenantId, `SELECT to_char(date_trunc('month', date),'YYYY-MM') AS m, sum(mt)::float AS mt FROM records GROUP BY 1 ORDER BY 1`),
     tenantQuery(tenantId, `SELECT count(*)::int AS orders, coalesce(sum(mt),0)::float AS mt, coalesce(sum(mt*price_usd),0)::float AS revenue FROM records`),
   ])
-  const insights = [
+  return [
     `Top customer by volume: ${topCust.rows[0]?.customer || 'n/a'} (${topCust.rows[0]?.mt || 0} MT).`,
     `Top grade: ${topGrade.rows[0]?.grade || 'n/a'} (${topGrade.rows[0]?.mt || 0} MT).`,
     `Open issues by category: ${issueMix.rows.map((r) => `${r.category}=${r.n}`).join(', ') || 'none'}.`,
     `Monthly volume trend: ${trend.rows.map((r) => `${r.m}=${r.mt}MT`).join(' → ') || 'n/a'}.`,
     `Totals: ${totals.rows[0].orders} orders, ${totals.rows[0].mt} MT, $${(totals.rows[0].revenue / 1e6).toFixed(2)}M revenue.`,
   ]
+}
+
+async function storeSnapshot(tenantId, provider) {
+  const insights = await computeInsights(tenantId)
+  await tenantQuery(tenantId,
+    `INSERT INTO insights_snapshots (tenant_id, insights, provider) VALUES (app.current_tenant(), $1::jsonb, $2)`,
+    [JSON.stringify(insights), provider])
+  return insights
+}
+
+fastify.post('/insights', async (req) => {
+  const tenantId = req.headers['x-tenant-id']
+  if (!tenantId) return { error: 'x-tenant-id required' }
+  const t0 = Date.now()
+  const requestId = crypto.randomUUID()
+  const provider = pickProvider(tenantId)
+  const insights = await storeSnapshot(tenantId, provider.name)
   await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: 'insights', tokensIn: 0, tokensOut: insights.join(' ').length, costUsd: 0, latencyMs: Date.now() - t0 })
   return { tenant: tenantId, insights, generated_at: new Date().toISOString(), usage: { provider: provider.name, request_id: requestId } }
 })
+
+// Latest stored snapshot (loaded automatically by the Insights screen).
+fastify.get('/insights/latest', async (req) => {
+  const tenantId = req.headers['x-tenant-id']
+  if (!tenantId) return { error: 'x-tenant-id required' }
+  const r = await tenantQuery(tenantId,
+    `SELECT insights, provider, created_at FROM insights_snapshots ORDER BY created_at DESC LIMIT 1`)
+  if (!r.rows.length) return { tenant: tenantId, insights: [], note: 'no snapshot yet — call POST /insights' }
+  return { tenant: tenantId, insights: r.rows[0].insights, generated_at: r.rows[0].created_at, provider: r.rows[0].provider }
+})
+
+// ---- Nightly insights snapshots (cron) ----
+// Compute a snapshot for every active tenant so the Insights screen auto-loads.
+async function snapshotAllTenants() {
+  try {
+    const client = await pool.connect()
+    let tenants = []
+    try {
+      const r = await client.query('SELECT id FROM app.tenants WHERE status=$1', ['active'])
+      tenants = r.rows.map((t) => t.id)
+    } finally { client.release() }
+    for (const t of tenants) {
+      try { await storeSnapshot(t, 'cron') } catch (e) { fastify.log.warn({ msg: `snapshot failed for ${t}`, err: e.message }) }
+    }
+    fastify.log.info(`insights snapshots computed for ${tenants.length} tenants`)
+  } catch (e) { fastify.log.error('snapshotAllTenants failed', e) }
+}
+// Run on start + on a schedule (default every 30 min; INSIGHTS_INTERVAL_MS overrides).
+const SNAPSHOT_INTERVAL = parseInt(process.env.INSIGHTS_INTERVAL_MS || '1800000', 10)
+setTimeout(snapshotAllTenants, 5000)
+setInterval(snapshotAllTenants, SNAPSHOT_INTERVAL)
 
 const start = async () => {
   try {

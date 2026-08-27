@@ -126,14 +126,47 @@ fastify.get('/data/kpi/issues', async (req) => {
 })
 
 // Generic chart endpoint for the config-driven chart builder: any {dimension, metric}
-// against records, so screen_configs charts need no new code.
+// against records (or any other table), so screen_configs charts need no new code.
+// ?dimension=grade&metric=mt&table=records&group_by=month&time_range=6
 fastify.get('/data/kpi/chart', async (req, reply) => {
-  const DIMS = { grade: 'grade', customer: 'customer', supplier: 'supplier', status: 'status' }
-  const METRICS = { mt: 'sum(mt)', fcl: 'sum(fcl)', count: 'count(*)', revenue: 'sum(mt*price_usd)' }
+  const TABLES = { records: 'records', tickets: 'tickets', parties: 'parties', feed_items: 'feed_items' }
+  const DIMS = { grade: 'grade', customer: 'customer', supplier: 'supplier', status: 'status', category: 'category', type: 'type', month: "to_char(date_trunc('month', date), 'YYYY-MM')" }
+  const METRICS = { mt: 'sum(mt)', fcl: 'sum(fcl)', count: 'count(*)', revenue: 'sum(mt*price_usd)', avg_price: 'avg(price_usd)' }
+  const table = TABLES[req.query.table] || 'records'
   const dim = DIMS[req.query.dimension]; const met = METRICS[req.query.metric]
-  if (!dim || !met) return reply.code(400).send({ error: 'bad dimension/metric', dims: Object.keys(DIMS), metrics: Object.keys(METRICS) })
-  const r = await tenantQuery(req, `SELECT ${dim} AS label, ${met}::float AS value FROM records GROUP BY 1 ORDER BY 2 DESC LIMIT 20`)
-  return { dimension: req.query.dimension, metric: req.query.metric, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) }
+  if (!dim || !met) return reply.code(400).send({ error: 'bad dimension/metric', tables: Object.keys(TABLES), dims: Object.keys(DIMS), metrics: Object.keys(METRICS) })
+  let where = '', params = []
+  const months = Math.min(parseInt(req.query.time_range || '0', 10), 36)
+  if (months > 0 && table === 'records') { where = `WHERE date >= date_trunc('month', current_date) - $1::interval`; params = [`${months} months`] }
+  const r = await tenantQuery(req, `SELECT ${dim} AS label, ${met}::float AS value FROM ${table} ${where} GROUP BY 1 ORDER BY ${req.query.dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 30`, params)
+  return { table, dimension: req.query.dimension, metric: req.query.metric, group_by: req.query.group_by || null, time_range: months || null, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) }
+})
+
+// ---- Real-time KPI stream (SSE) — pushes fresh KPI snapshots every N seconds ----
+fastify.get('/data/stream', async (req, reply) => {
+  const interval = Math.min(Math.max(parseInt(req.query.interval || '5', 10), 2), 60) * 1000
+  reply.raw.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  })
+  const send = (data) => reply.raw.write(`data: ${JSON.stringify(data)}\n\n`)
+  const tick = async () => {
+    try {
+      const r = await tenantQuery(req, `SELECT
+        (SELECT count(*) FROM records) AS open_orders,
+        (SELECT coalesce(sum(mt),0) FROM records) AS active_mt,
+        (SELECT count(*) FROM tickets WHERE status<>'Resolved') AS open_issues,
+        (SELECT count(*) FROM parties WHERE type='supplier') AS suppliers,
+        (SELECT count(*) FROM parties WHERE type='customer') AS customers,
+        now() AS ts`)
+      send({ kpi: r.rows[0] })
+    } catch (e) { /* swallow — keep the stream alive */ }
+  }
+  await tick()
+  const t = setInterval(tick, interval)
+  req.raw.on('close', () => clearInterval(t))
+  req.raw.on('end', () => clearInterval(t))
 })
 
 // ---- Hybrid search (Phase 2b) — tsvector keyword + pg_trgm fuzzy + pgvector semantic ----
@@ -271,7 +304,7 @@ fastify.get('/tenants', async () => {
 
 // Onboard a tenant: create registry row + clone template data (Phase 4a).
 fastify.post('/tenants', async (req, reply) => {
-  const { id, label, template = 'rubbertrack', tier = 'A', cloneTemplate = false } = req.body || {}
+  const { id, label, template = 'rubbertrack', tier = 'A', cloneTemplate = true } = req.body || {}
   if (!id || !label) return reply.code(400).send({ error: 'id and label required' })
   if (!/^[a-z0-9_-]+$/i.test(id)) return reply.code(400).send({ error: 'id must be alphanumeric/dash/underscore' })
   await adminPool.query(
@@ -403,6 +436,14 @@ fastify.post('/ai/insights', async (req, reply) => {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
     body: '{}'
+  })
+  reply.send(await res.text())
+})
+
+// Latest stored insights snapshot (auto-loaded by the Insights screen).
+fastify.get('/ai/insights/latest', async (req, reply) => {
+  const res = await fetch(`${AI_SERVICE_URL}/insights/latest`, {
+    headers: { 'x-tenant-id': req.tenantId }
   })
   reply.send(await res.text())
 })

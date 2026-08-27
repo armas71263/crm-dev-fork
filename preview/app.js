@@ -378,11 +378,13 @@ window.sendAI = async function(){
   if (toolsEl) toolsEl.innerHTML = '';
   if (usageEl) usageEl.textContent = '';
   let text = '';
+  const sessionId = 'web:' + (DATA.tenant || 'default');
   try{
-    const res = await fetch('/ai/chat/stream', {method:'POST', headers:{'content-type':'application/json','x-tenant-id':currentTenant}, body: JSON.stringify({message:q})});
+    const res = await fetch('/ai/chat/stream', {method:'POST', headers:{'content-type':'application/json','x-tenant-id':currentTenant}, body: JSON.stringify({message:q, session_id:sessionId})});
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
+    let chartSpec = null;
     while (true){
       const { done, value } = await reader.read();
       if (done) break;
@@ -395,16 +397,37 @@ window.sendAI = async function(){
         if (evt === 'tool' && toolsEl) toolsEl.insertAdjacentHTML('beforeend', `<span class="tag teal" style="margin-right:6px">🔧 ${esc(data.name)}</span>`);
         else if (evt === 'observation' && toolsEl) toolsEl.insertAdjacentHTML('beforeend', `<span class="tag" style="margin-right:6px">${data.count} rows</span>`);
         else if (evt === 'token'){ text += data.text; bubble.classList.remove('thinking'); bubble.textContent = text; }
-        else if (evt === 'done' && usageEl) usageEl.textContent = `provider: ${data.usage.provider} · tools: ${(data.tools||[]).join(', ')} · ${data.usage.latency_ms}ms · req ${data.usage.request_id.slice(0,8)}`;
+        else if (evt === 'chart'){ chartSpec = data; }
+        else if (evt === 'done' && usageEl){ usageEl.textContent = `provider: ${data.usage.provider} · tools: ${(data.tools||[]).join(', ')} · ${data.usage.latency_ms}ms · req ${data.usage.request_id.slice(0,8)}`; if (data.chart) chartSpec = data.chart; }
         else if (evt === 'start' && usageEl) usageEl.textContent = `provider: ${data.provider}…`;
       }
       log.scrollTop = log.scrollHeight;
     }
     if (!text){ bubble.classList.remove('thinking'); bubble.textContent = '(empty response)'; }
+    if (chartSpec) renderChatChart(chartSpec, log);
   }catch(e){ bubble.classList.remove('thinking'); bubble.textContent = 'AI service unavailable.'; }
   log.scrollTop = log.scrollHeight;
 };
 document.addEventListener('keydown', e => { if (e.key==='Enter' && e.target?.id==='aiText'){ window.sendAI(); }});
+
+// Render an inline chart inside the AI Assistant from a chart spec.
+function renderChatChart(spec, log){
+  if (!window.echarts) return;
+  log.insertAdjacentHTML('beforeend', `<div class="ai-msg bot" style="width:min(100%,520px);align-self:stretch"><div class="chart-title" style="font-size:11px;color:var(--muted);margin-bottom:6px">${esc(spec.title||'chart')}</div><div class="chart chart-inline" style="height:180px"></div></div>`);
+  const el = log.lastChild.querySelector('.chart-inline');
+  if (!el) return;
+  const c = echarts.init(el, null, {renderer:'canvas'});
+  const colors = ['#2dd4bf','#f5a524','#a78bfa','#f87171','#3b82f6'];
+  c.setOption({
+    textStyle:{fontFamily:'IBM Plex Mono',color:css('--muted')},
+    grid:{left:4,right:10,top:16,bottom:4,containLabel:true},
+    tooltip:{trigger:'axis'},
+    xAxis:{type:'category',data:spec.labels,axisLabel:{color:css('--muted')},axisLine:{lineStyle:{color:css('--line')}}},
+    yAxis:{type:'value',axisLine:{show:false},splitLine:{lineStyle:{color:css('--line')}}},
+    series:[{type:spec.type==='line'?'line':'bar',data:spec.values,...(spec.type==='line'?{smooth:true,symbol:'circle',symbolSize:6}:{barWidth:14}),itemStyle:{color:spec.type==='line'?css('--amber'):colors[0]},areaStyle:spec.type==='line'?{color:'rgba(45,212,191,.15)'}:undefined}],
+  });
+  window.addEventListener('resize', () => c.resize(), { once:true });
+}
 
 // ---------- Insights generator ----------
 window.genInsights = async function(){
@@ -418,6 +441,23 @@ window.genInsights = async function(){
         + `<div style="margin-top:8px;color:var(--muted);font-size:11px">generated ${new Date(d.generated_at).toLocaleString()} · ${d.usage.provider}</div>`;
     } else { out.innerHTML = '<span style="color:var(--red)">Error: ' + esc(d.error||'unknown') + '</span>'; }
   }catch(e){ out.innerHTML = '<span style="color:var(--red)">Insights failed.</span>'; }
+};
+
+// Auto-load the latest stored snapshot when the Insights screen opens.
+window.loadLatestInsights = async function(){
+  const out = document.getElementById('insightsOut');
+  if (!out) return;
+  out.innerHTML = '<span style="color:var(--muted)">Loading latest insights…</span>';
+  try{
+    const res = await fetch('/ai/insights/latest', { headers: { 'x-tenant-id': currentTenant } });
+    const d = await res.json();
+    if (d.insights && d.insights.length){
+      out.innerHTML = d.insights.map((s,i)=>`<div style="padding:8px 0;border-bottom:1px solid var(--line)"><b>${i+1}.</b> ${esc(s)}</div>`).join('')
+        + `<div style="margin-top:8px;color:var(--muted);font-size:11px">latest snapshot: ${new Date(d.generated_at).toLocaleString()} · ${d.provider||'cron'}</div>`;
+    } else {
+      out.innerHTML = '<span style="color:var(--muted)">No snapshot yet — click Generate to compute one. A cron job will populate this automatically every 30 min.</span>';
+    }
+  }catch(e){ out.innerHTML = '<span style="color:var(--muted)">Loading snapshot failed. Click Generate.</span>'; }
 };
 window.loadUsage = async function(){
   const panel = document.getElementById('aiUsagePanel');
@@ -590,7 +630,7 @@ async function loadConfig(){
 }
 // Hook: when config screen renders, load + render panels.
 const _render = render;
-render = function(id){ _render(id); if (id==='config') loadConfig(); if (id==='branding') loadBranding(); };
+render = function(id){ _render(id); if (id==='config') loadConfig(); if (id==='branding') loadBranding(); if (id==='insights') loadLatestInsights(); };
 
 // ---------- Import / Export ----------
 window.exportData = function(){
@@ -734,3 +774,15 @@ function timeAgo(iso){
 
 // Initial load — called last so all functions/vars are defined (TDZ-safe).
 loadLiveData().then(()=>route()).catch(()=>route());
+
+// Auto-refresh: poll live data every 30s and re-render the current view if the
+// data changed. Keeps KPIs/charts fresh without a manual refresh. Skipped when
+// the tab is hidden (Page Visibility API) to avoid wasted fetches.
+setInterval(() => {
+  if (document.hidden) return;
+  loadLiveData().then(() => {
+    const id = (location.hash.split('/')[1] || 'dashboard');
+    // Only re-render data-driven views; editing views (config) manage their own state.
+    if (['dashboard','orders','issues','suppliers','customers','agenda'].includes(id)) render(id);
+  }).catch(() => {});
+}, 30000);
