@@ -40,7 +40,7 @@ Sellable multi-tenant CRM + analytics dashboard + CMS. RubberTrack (rubber tradi
 - Phase 2 (dashboard + hybrid search): DONE ā€” KPI engine (/data/kpi/trend|grades|issues|chart), hybrid /search (tsvector+trgm+optional pgvector), real AI RAG (deterministic 768-dim hash embeddings, /index + /chat, RLS-scoped), global Search screen, dashboard charts wired to live KPI endpoints
 - Phase 3 (AI platform): DONE — ai_usage_logs table+RLS, provider router (local/openrouter/nim/openai/ollama w/ key-gated fallback), agentic planner→tools→synthesize (search_records/get_kpi/get_issues/get_party), SSE streaming /chat/stream, insights generator (/insights), Doc Checker field-extraction+mismatch flags, usage dashboard (/ai/usage)
 - Phase 4 (ops/escalation): DONE — tenant onboarding + template cloning (BFF /tenants POST), tier escalation A→B schema-per-tenant + B→C db-per-tenant (escalate-tenant.sh + /tenants/:id/escalate), per-tenant logical backup (backup-tenant.sh + /tenants/:id/backup), Tenants admin screen, GitHub Actions CI for isolation tests
-- Phase 5 (white-label + release): TODO
+- Phase 5 (white-label + release): DONE — per-tenant branding (theme.json in app.tenants.theme, BFF GET/PUT /tenants/:id/theme, preview applies CSS vars live), external customer portal (BFF /portal/overview customer-scoped, preview Portal screen), deployment runbook (DEPLOYMENT.md), demo-reset script
 
 ## Repo
 Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). No remote configured. Commits: ac957ce ā†’ c1e2cb6 ā†’ 187d0ad ā†’ 8843782 ā†’ c24637a (phase0/1 gap closure).

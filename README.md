@@ -53,7 +53,7 @@ docker exec -i rubbertrack-platform-postgres-1 psql -U postgres -d rubbertrack \
 | 2 | Dashboard KPI engine + hybrid search (vector+ts+trgm) | ✅ done |
 | 3 | AI platform (Insights, doc pipeline, agentic assistant) | ✅ done |
 | 4 | Ops + tenancy escalation (tier B/C) | ✅ done |
-| 5 | White-label + release | ⬜ next |
+| 5 | White-label + release | ✅ done |
 
 ### Layout resilience
 

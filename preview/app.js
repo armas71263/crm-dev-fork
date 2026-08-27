@@ -16,6 +16,8 @@ const NAV = [
   { id: 'ai',        label: 'AI Assistant', ico: '✦' },
   { id: 'insights',  label: 'Insights', ico: '✧' },
   { id: 'tenants',   label: 'Tenants', ico: '⧉' },
+  { id: 'branding',  label: 'Branding', ico: '◈' },
+  { id: 'portal',    label: 'Customer Portal', ico: '⊕' },
   { id: 'config',    label: 'Screen Config', ico: '⚙' },
 ];
 
@@ -265,6 +267,30 @@ Incoterms: DAP Mundra</textarea></div>
       <button class="btn" onclick="loadTenants()">Refresh list</button>
       <div id="tenantsList" style="margin-top:14px"></div>
     </div>`,
+  branding: () => `
+    <div class="card span-12">
+      <h3>White-Label Branding <span class="tag teal" style="font-size:10px">per-tenant theme.json · live preview</span></h3>
+      <p style="color:var(--muted);font-family:var(--font-m);font-size:12px">Customize colors + logo text for the current tenant. Saved to DB, applied on load.</p>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
+        <label style="font-size:12px;color:var(--muted)">Logo text<input id="brLogo" placeholder="RubberTrack" style="display:block;margin-top:2px"></label>
+        <label style="font-size:12px;color:var(--muted)">Primary<input id="brPrimary" type="color" value="#2dd4bf" style="display:block;margin-top:2px;width:60px;height:34px"></label>
+        <label style="font-size:12px;color:var(--muted)">Accent<input id="brAccent" type="color" value="#f5a524" style="display:block;margin-top:2px;width:60px;height:34px"></label>
+        <label style="font-size:12px;color:var(--muted)">Background<input id="brBg" type="color" value="#0b0f0e" style="display:block;margin-top:2px;width:60px;height:34px"></label>
+        <label style="font-size:12px;color:var(--muted)">Panel<input id="brPanel" type="color" value="#121a18" style="display:block;margin-top:2px;width:60px;height:34px"></label>
+        <label style="font-size:12px;color:var(--muted)">Text<input id="brText" type="color" value="#e8efe9" style="display:block;margin-top:2px;width:60px;height:34px"></label>
+        <button class="btn primary" onclick="saveBranding()">Save theme</button>
+        <button class="btn" onclick="resetBranding()">Reset</button>
+      </div>
+      <div id="brandingMsg" style="margin-top:10px;color:var(--muted);font-family:var(--font-m);font-size:12px">Loading current theme…</div>
+    </div>`,
+  portal: () => `
+    <div class="card span-12">
+      <h3>Customer Portal <span class="tag teal" style="font-size:10px">external login · scoped to one customer · RLS</span></h3>
+      <p style="color:var(--muted);font-family:var(--font-m);font-size:12px">A customer logs in and sees only their own orders + issues. In production this is JWT-gated; here pick a customer to preview.</p>
+      <div class="ai-input" style="margin-bottom:12px"><input id="portalCustomer" placeholder="e.g. JK Tyre" autocomplete="off" value="JK Tyre">
+        <button class="btn primary" onclick="loadPortal()">View my orders</button></div>
+      <div id="portalOut" style="color:var(--muted);font-family:var(--font-m);font-size:12px">Enter a customer name to preview their portal.</div>
+    </div>`,
   config: () => `
     <div class="card span-12"><h3>Screen Configuration <span style="color:var(--muted);font-size:11px;font-weight:400">— re-arrange dashboard panels (saved per tenant)</span></h3>
       <div id="cfgPanels" class="cfg-panels"></div>
@@ -433,6 +459,70 @@ window.escalateTenant = async function(id, fromTier){
   }catch(e){ alert('Escalation failed'); }
 };
 
+// ---------- White-label branding (Phase 5a) ----------
+window.loadBranding = async function(){
+  const msg = document.getElementById('brandingMsg');
+  try{
+    const res = await fetch(`/tenants/${currentTenant}/theme`);
+    const d = await res.json();
+    const t = d.theme || {};
+    if (t.logoText) document.getElementById('brLogo').value = t.logoText;
+    if (t.primary) document.getElementById('brPrimary').value = t.primary;
+    if (t.accent) document.getElementById('brAccent').value = t.accent;
+    if (t.bg) document.getElementById('brBg').value = t.bg;
+    if (t.panel) document.getElementById('brPanel').value = t.panel;
+    if (t.text) document.getElementById('brText').value = t.text;
+    msg.textContent = `Current theme for ${d.label} loaded.` + (Object.keys(t).length ? ' (custom)' : ' (default)');
+  }catch(e){ msg.textContent = 'Failed to load theme.'; }
+};
+window.saveBranding = async function(){
+  const theme = {
+    logoText: document.getElementById('brLogo').value.trim(),
+    primary: document.getElementById('brPrimary').value,
+    accent: document.getElementById('brAccent').value,
+    bg: document.getElementById('brBg').value,
+    panel: document.getElementById('brPanel').value,
+    text: document.getElementById('brText').value,
+  };
+  try{
+    const res = await fetch(`/tenants/${currentTenant}/theme`, {method:'PUT', headers:{'content-type':'application/json'}, body: JSON.stringify({theme})});
+    const d = await res.json();
+    applyTheme(d.theme);
+    document.getElementById('brandingMsg').textContent = '✓ Theme saved + applied.';
+  }catch(e){ document.getElementById('brandingMsg').textContent = '✗ Save failed.'; }
+};
+window.resetBranding = async function(){
+  if (!confirm('Reset theme to default?')) return;
+  try{
+    await fetch(`/tenants/${currentTenant}/theme`, {method:'PUT', headers:{'content-type':'application/json'}, body: JSON.stringify({theme:{}})});
+    applyTheme({});
+    document.getElementById('brLogo').value = '';
+    document.getElementById('brandingMsg').textContent = '✓ Reset to default.';
+  }catch(e){ document.getElementById('brandingMsg').textContent = '✗ Reset failed.'; }
+};
+
+// ---------- Customer portal (Phase 5b) ----------
+window.loadPortal = async function(){
+  const customer = document.getElementById('portalCustomer').value.trim();
+  const out = document.getElementById('portalOut');
+  if (!customer){ out.innerHTML = '<span style="color:var(--amber)">Enter a customer name.</span>'; return; }
+  out.innerHTML = '<span style="color:var(--muted)">Loading…</span>';
+  try{
+    const res = await fetch('/portal/overview', { headers: { 'x-tenant-id': currentTenant, 'x-customer': customer } });
+    const d = await res.json();
+    if (d.error){ out.innerHTML = '<span style="color:var(--red)">' + esc(d.error) + '</span>'; return; }
+    const k = d.kpi || {};
+    let html = `<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px">
+      <div class="kpi" style="--c:var(--teal)"><div class="lbl">My Orders</div><div class="val">${k.orders||0}</div></div>
+      <div class="kpi" style="--c:var(--amber)"><div class="lbl">Total MT</div><div class="val">${(k.mt||0).toFixed(1)}</div></div>
+      <div class="kpi" style="--c:var(--green)"><div class="lbl">Revenue</div><div class="val">$${((k.revenue||0)/1e6).toFixed(2)}M</div></div>
+      <div class="kpi" style="--c:var(--red)"><div class="lbl">Open Issues</div><div class="val">${d.issues.length}</div></div></div>`;
+    html += d.orders.length ? `<table class="tbl"><thead><tr><th>Order</th><th>Grade</th><th>MT</th><th>FCL</th><th>Price</th><th>Status</th><th>Date</th></tr></thead><tbody>${d.orders.map(o=>`<tr><td>${esc(o.order_id)}</td><td>${esc(o.grade)}</td><td>${o.mt}</td><td>${o.fcl}</td><td>$${o.price_usd}</td><td><span class="tag">${esc(o.status)}</span></td><td style="color:var(--muted)">${o.date||''}</td></tr>`).join('')}</tbody></table>` : '<span style="color:var(--muted)">No orders found for this customer.</span>';
+    if (d.issues.length) html += `<h4 style="margin:14px 0 6px">My Issues</h4><table class="tbl"><thead><tr><th>ID</th><th>Category</th><th>Status</th><th>Description</th></tr></thead><tbody>${d.issues.map(i=>`<tr><td>${esc(i.ticket_id)}</td><td>${esc(i.category)}</td><td><span class="tag">${esc(i.status)}</span></td><td>${esc(i.description)}</td></tr>`).join('')}</tbody></table>`;
+    out.innerHTML = html;
+  }catch(e){ out.innerHTML = '<span style="color:var(--red)">Portal failed.</span>'; }
+};
+
 // ---------- Global Search ----------
 window.runSearch = async function(){
   const inp = document.getElementById('searchQ');
@@ -493,7 +583,7 @@ async function loadConfig(){
 }
 // Hook: when config screen renders, load + render panels.
 const _render = render;
-render = function(id){ _render(id); if (id==='config') loadConfig(); };
+render = function(id){ _render(id); if (id==='config') loadConfig(); if (id==='branding') loadBranding(); };
 
 // ---------- Import / Export ----------
 window.exportData = function(){
@@ -532,6 +622,28 @@ document.getElementById('themeBtn').addEventListener('click', () => {
   charts.forEach(c => c.dispose()); charts.length = 0;
   initCharts();
 });
+
+// ---------- Per-tenant white-label branding (Phase 5a) ----------
+// theme = {primary, accent, bg, panel, text, logoText} — overrides CSS vars live.
+function applyTheme(theme){
+  const root = document.documentElement;
+  const vars = { primary:'--teal', accent:'--amber', bg:'--bg', bg2:'--bg2', panel:'--panel', panel2:'--panel2', text:'--text' };
+  // Clear any prior branding overrides so toggling tenants reverts cleanly.
+  Object.values(vars).forEach(v => root.style.removeProperty(v));
+  if (theme.primary) root.style.setProperty('--teal', theme.primary);
+  if (theme.accent) root.style.setProperty('--amber', theme.accent);
+  if (theme.bg) { root.style.setProperty('--bg', theme.bg); root.style.setProperty('--bg2', theme.bg); }
+  if (theme.panel) { root.style.setProperty('--panel', theme.panel); root.style.setProperty('--panel2', theme.panel); }
+  if (theme.text) root.style.setProperty('--text', theme.text);
+  if (theme.logoText){
+    const name = document.querySelector('.brand-name');
+    const mark = document.querySelector('.brand-mark');
+    if (name) name.textContent = theme.logoText;
+    if (mark) mark.textContent = theme.logoText.slice(0,2).toUpperCase();
+  }
+  // Re-render charts with new colors.
+  if (charts.length){ charts.forEach(c => c.dispose()); charts.length = 0; initCharts(); }
+}
 
 // ---------- Mobile menu ----------
 const sidebar = document.getElementById('sidebar');
@@ -587,6 +699,9 @@ async function loadLiveData(){
     }
     if (parts.suppliers) DATA.suppliers = parts.suppliers;
     if (parts.customers) DATA.customers = parts.customers;
+    // Phase 5a: apply per-tenant white-label branding (theme.json from DB).
+    const themeRes = await fetch(`${BFF}/tenants/${currentTenant}/theme`).then(r=>r.json()).catch(()=>null);
+    applyTheme(themeRes?.theme || {});
     // KPI charts (Phase 2a): trend + grades + issue mix from the KPI engine.
     const [trend, grades, issueKpi] = await Promise.all([
       fetch(`${BFF}/data/kpi/trend`, {headers:hdr}).then(r=>r.json()).catch(()=>null),

@@ -333,6 +333,35 @@ fastify.post('/tenants/:id/escalate', async (req, reply) => {
   return { escalated: true, id, fromTier, toTier, isolation: toTier === 'B' ? `tenant_${id} schema` : `tenant_${id} database` }
 })
 
+// Per-tenant branding (Phase 5a) — read/update the theme JSON stored in app.tenants.
+fastify.get('/tenants/:id/theme', async (req, reply) => {
+  const { id } = req.params
+  const r = await adminPool.query('SELECT theme, label FROM app.tenants WHERE id=$1', [id])
+  if (!r.rows.length) return reply.code(404).send({ error: 'tenant not found' })
+  return { tenant: id, label: r.rows[0].label, theme: r.rows[0].theme || {} }
+})
+fastify.put('/tenants/:id/theme', async (req, reply) => {
+  const { id } = req.params
+  const { theme } = req.body || {}
+  if (!theme || typeof theme !== 'object') return reply.code(400).send({ error: 'theme object required' })
+  const r = await adminPool.query('UPDATE app.tenants SET theme=$1 WHERE id=$2 RETURNING theme', [JSON.stringify(theme), id])
+  if (!r.rows.length) return reply.code(404).send({ error: 'tenant not found' })
+  return { tenant: id, theme: r.rows[0].theme }
+})
+
+// ---- External customer portal (Phase 5b) ----
+// A customer logs in (here: x-customer header for dev) and sees ONLY their own
+// orders + issues within the tenant. Uses app_role + RLS (tenant) + a customer
+// filter (row-level scoping beyond RLS).
+fastify.get('/portal/overview', async (req) => {
+  const customer = req.headers['x-customer']
+  if (!customer) return { error: 'x-customer header required' }
+  const orders = await tenantQuery(req, 'SELECT order_id, grade, mt, fcl, price_usd, status, date FROM records WHERE customer=$1 ORDER BY date DESC', [customer])
+  const issues = await tenantQuery(req, 'SELECT ticket_id, category, status, description FROM tickets WHERE customer=$1 ORDER BY created_at DESC', [customer])
+  const kpi = await tenantQuery(req, `SELECT count(*)::int AS orders, coalesce(sum(mt),0)::float AS mt, coalesce(sum(mt*price_usd),0)::float AS revenue FROM records WHERE customer=$1`, [customer])
+  return { customer, tenant: req.tenantId, orders: orders.rows, issues: issues.rows, kpi: kpi.rows[0] }
+})
+
 // Per-tenant logical backup (JSON dump of the tenant's rows across all tables).
 fastify.get('/tenants/:id/backup', async (req, reply) => {
   const { id } = req.params
