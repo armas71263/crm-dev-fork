@@ -186,6 +186,13 @@ const VIEWS = {
         <div class="val">${k.val}</div>
         <div class="sub"><span class="delta ${k.dir}">${k.dir==='down'?'▼':'▲'}</span> ${k.sub}</div>
       </div>`).join('')}</section>
+    <div class="card span-12"><h3>Data Channels <span class="tag teal" style="font-size:10px">multi-source · live</span></h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">${[
+        ['Orders','/data/orders','teal'],['KPIs','/data/dashboard','amber'],['Issues','/data/issues','red'],
+        ['Parties','/data/parties','green'],['Search','/search','teal'],['AI','/ai/chat','amber'],
+        ['Insights','/ai/insights','green'],['Screen Config','/data/screen-config','teal']
+      ].map(([n,u,c])=>`<span class="tag ${c}" style="cursor:pointer" onclick="location.hash='#/${n.toLowerCase().replace(/\\s/g,'')}'">${n}</span>`).join('')}</div>
+      <p style="color:var(--muted);font-family:var(--font-m);font-size:11px;margin-top:8px">Company template: <b>${DATA.tenant}</b> — switchable via tenant selector. Each channel fetches from a dedicated BFF endpoint, RLS-scoped per tenant.</p></div>
     <section class="grid">
       <div class="card span-8"><h3>Volume &amp; Revenue — 6 months</h3><div class="chart" data-chart="trend"></div></div>
       <div class="card span-4"><h3>Active grades</h3><div class="chart" data-chart="grades"></div></div>

@@ -35,6 +35,34 @@ function pickProvider(tenantId) {
   return { ...p, tenantId }
 }
 
+// ---- Real LLM call via OpenRouter (Chat Completions API) ----
+// Replaces the local extractive stub with a grounded generateText call when an
+// API key is present. Context = tool observations + semantic retrieval.
+async function llmGenerate(provider, systemPrompt, userPrompt) {
+  const key = process.env[provider.keyEnv]
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model: provider.model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+    }),
+  })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`OpenRouter ${res.status}: ${err.slice(0, 200)}`)
+  }
+  const data = await res.json()
+  return {
+    text: data.choices?.[0]?.message?.content || '(no response)',
+    tokensIn: data.usage?.prompt_tokens || 0,
+    tokensOut: data.usage?.completion_tokens || 0,
+  }
+}
+
 // ---- Deterministic local embedding (hashing trick, L2-normalized) ----
 function embed(text) {
   const v = new Float64Array(DIM)
@@ -178,9 +206,9 @@ fastify.post('/chat', async (req, reply) => {
      FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
   const semantic = hits.rows.filter((r) => r.score > 0)
 
-  // 3) Synthesize. Local provider = extractive grounded answer; real provider
-  //    would call generateText({ prompt: context+observations+question }).
-  let replyText
+  // 3) Synthesize. Real provider calls OpenRouter with the gathered context;
+  //    local provider = extractive grounded answer.
+  let replyText, tokensIn = message.length, tokensOut = 0, costUsd = 0
   const toolNames = observations.map((o) => o.tool)
   const lines = []
   for (const o of observations) {
@@ -195,19 +223,33 @@ fastify.post('/chat', async (req, reply) => {
     }
   }
   for (const s of semantic) lines.push(`• [${s.source_type} ${s.source_id}] ${s.text}`)
-  replyText = lines.length
-    ? `Based on ${tenantId}'s data (tools: ${toolNames.join(', ')}):\n${lines.join('\n')}`
-    : `I couldn't find anything relevant for "${message}". Try asking about orders, issues, or suppliers.`
+  const context = lines.join('\n')
+
+  if (provider.name !== 'local') {
+    try {
+      const sys = `You are a B2B operations assistant for tenant "${tenantId}". Answer the user's question using ONLY the context below. Be concise and specific. If the context doesn't contain the answer, say so.`
+      const result = await llmGenerate(provider, sys, `Context:\n${context}\n\nQuestion: ${message}`)
+      replyText = result.text
+      tokensIn = result.tokensIn; tokensOut = result.tokensOut
+    } catch (e) {
+      fastify.log.warn({ msg: 'LLM call failed, falling back', err: e.message })
+      replyText = context ? `Based on ${tenantId}'s data (tools: ${toolNames.join(', ')}):\n${context}` : `I couldn't find anything relevant for "${message}".`
+    }
+  } else {
+    replyText = context
+      ? `Based on ${tenantId}'s data (tools: ${toolNames.join(', ')}):\n${context}`
+      : `I couldn't find anything relevant for "${message}". Try asking about orders, issues, or suppliers.`
+    tokensOut = replyText.length
+  }
 
   const latency = Date.now() - t0
-  // 4) Log usage (local provider = free, zero tokens).
-  await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn: message.length, tokensOut: replyText.length, costUsd: 0, latencyMs: latency })
+  await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn, tokensOut, costUsd, latencyMs: latency })
 
   reply.send({
     reply: replyText,
     tools: toolNames,
     sources: semantic.map((r) => ({ type: r.source_type, id: r.source_id, score: +r.score.toFixed(3) })),
-    usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId },
+    usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId, tokens_in: tokensIn, tokens_out: tokensOut },
   })
 })
 
@@ -256,19 +298,36 @@ fastify.post('/chat/stream', async (req, reply) => {
     else if (o.tool === 'get_party' && o.result.length) lines.push(...o.result.map((p) => `${p.name} (${p.type})`))
   }
   for (const s of semantic) lines.push(`[${s.source_type} ${s.source_id}] ${s.text}`)
-  const full = lines.length ? `Based on ${tenantId}'s data:\n${lines.join('\n')}` : `Nothing found for "${message}".`
+  const context = lines.join('\n')
 
-  const words = full.split(/(\s+)/)
-  let tokensOut = 0
-  for (const w of words) {
-    send('token', { text: w })
-    tokensOut++
-    // Small delay so the streaming is visible; a real provider streams from the API.
-    await new Promise((r) => setTimeout(r, 8))
+  let tokensOut = 0, tokensIn = 0
+  if (provider.name !== 'local') {
+    // Real LLM: call OpenRouter, then stream the response in word chunks.
+    try {
+      const sys = `You are a B2B operations assistant for tenant "${tenantId}". Answer using ONLY the context below. Be concise.`
+      const result = await llmGenerate(provider, sys, `Context:\n${context}\n\nQuestion: ${message}`)
+      tokensIn = result.tokensIn; tokensOut = result.tokensOut
+      const words = result.text.split(/(\s+)/)
+      for (const w of words) {
+        send('token', { text: w })
+        await new Promise((r) => setTimeout(r, 12))
+      }
+    } catch (e) {
+      send('token', { text: `(LLM unavailable: ${e.message.slice(0,80)}) Falling back to data:\n` })
+      const fallback = context ? `Based on ${tenantId}'s data:\n${context}` : `Nothing found for "${message}".`
+      for (const w of fallback.split(/(\s+)/)) { send('token', { text: w }); await new Promise((r) => setTimeout(r, 8)) }
+    }
+  } else {
+    const full = context ? `Based on ${tenantId}'s data:\n${context}` : `Nothing found for "${message}".`
+    for (const w of full.split(/(\s+)/)) {
+      send('token', { text: w })
+      tokensOut++
+      await new Promise((r) => setTimeout(r, 8))
+    }
   }
   const latency = Date.now() - t0
-  await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn: message.length, tokensOut, costUsd: 0, latencyMs: latency })
-  send('done', { tools: toolNames, usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId } })
+  await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn, tokensOut, costUsd: 0, latencyMs: latency })
+  send('done', { tools: toolNames, usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId, tokens_in: tokensIn, tokens_out: tokensOut } })
   reply.raw.end()
 })
 
