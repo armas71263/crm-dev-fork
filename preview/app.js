@@ -103,7 +103,7 @@ bottomnav.innerHTML = primary5.map(id => {
 }).join('');
 
 function route(){
-  const id = (location.hash.split('/')[1] || 'dashboard');
+  const id = decodeURIComponent(location.hash.split('/')[1] || 'dashboard');
   const n = NAV.find(x => x.id === id) || {label:'Dashboard'};
   document.title = 'RubberTrack — ' + n.label;
   const title = document.getElementById('pageTitle');
@@ -188,10 +188,10 @@ const VIEWS = {
       </div>`).join('')}</section>
     <div class="card span-12"><h3>Data Channels <span class="tag teal" style="font-size:10px">multi-source · live</span></h3>
       <div style="display:flex;gap:8px;flex-wrap:wrap">${[
-        ['Orders','/data/orders','teal'],['KPIs','/data/dashboard','amber'],['Issues','/data/issues','red'],
-        ['Parties','/data/parties','green'],['Search','/search','teal'],['AI','/ai/chat','amber'],
-        ['Insights','/ai/insights','green'],['Screen Config','/data/screen-config','teal']
-      ].map(([n,u,c])=>`<span class="tag ${c}" style="cursor:pointer" onclick="location.hash='#/${n.toLowerCase().replace(/\\s/g,'')}'">${n}</span>`).join('')}</div>
+        ['Orders','orders','teal'],['KPIs','dashboard','amber'],['Issues','issues','red'],
+        ['Parties','suppliers','green'],['Search','search','teal'],['AI','ai','amber'],
+        ['Insights','insights','green'],['Screen Config','config','teal']
+      ].map(([n,rid,c])=>`<span class="tag ${c}" style="cursor:pointer" onclick="location.hash='#/${rid}'">${n}</span>`).join('')}</div>
       <p style="color:var(--muted);font-family:var(--font-m);font-size:11px;margin-top:8px">Company template: <b>${DATA.tenant}</b> — switchable via tenant selector. Each channel fetches from a dedicated BFF endpoint, RLS-scoped per tenant.</p></div>
     <section class="grid">
       <div class="card span-8"><h3>Volume &amp; Revenue — 6 months</h3><div class="chart" data-chart="trend"></div></div>
@@ -211,7 +211,7 @@ const VIEWS = {
   attendance: () => `
     <div class="card span-12"><h3>Attendance — Week 34</h3>${attTable(DATA.employees)}</div>`,
   news: () => `
-    <div class="card span-12"><h3>News Feed</h3>${feedList(DATA.feed.concat(DATA.feed.slice(0,4)))}</div>`,
+    <div class="card span-12"><h3>News Feed</h3>${feedList(DATA.feed)}</div>`,
   docs: () => `
     <div class="card span-12"><h3>Document Tools</h3>
       <p style="color:var(--muted);font-family:var(--font-m);font-size:12px">PI · PO · Invoice · B/L · COO · Packing List — attach, sign, version.</p>
@@ -311,20 +311,28 @@ Incoterms: DAP Mundra</textarea></div>
     </div>`,
 };
 
-const ordersTable = rows => `<table class="tbl">
-  <thead><tr><th>Order</th><th>Customer</th><th>Supplier</th><th>Grade</th><th>MT</th><th>FCL</th><th>Price (USD)</th><th>Status</th></tr></thead>
-  <tbody>${rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td>${r[3]}</td><td>${r[4]}</td><td>${r[5]}</td><td>${r[6]}</td><td><span class="tag ${r[8]}">${r[7]}</span></td></tr>`).join('')}</tbody></table>`;
+// Status badge colors keyed by status string (works for both static demo
+// rows and live BFF rows, which don't carry a color column).
+const STATUS_COLOR = {
+  'In Production':'teal','Docs Pending':'amber','Shipped':'green','Delivered':'green','Quality Issue':'red',
+  'Open':'red','Monitoring':'amber','Resolved':'green',
+};
+const tblWrap = inner => `<div class="table-wrap">${inner}</div>`;
 
-const issuesTable = rows => `<table class="tbl">
+const ordersTable = rows => tblWrap(`<table class="tbl">
+  <thead><tr><th>Order</th><th>Customer</th><th>Supplier</th><th>Grade</th><th>MT</th><th>FCL</th><th>Price (USD)</th><th>Status</th></tr></thead>
+  <tbody>${rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td>${r[3]}</td><td>${r[4]}</td><td>${r[5]}</td><td>${r[6]}</td><td><span class="tag ${STATUS_COLOR[r[7]]||'gray'}">${r[7]}</span></td></tr>`).join('')}</tbody></table>`);
+
+const issuesTable = rows => tblWrap(`<table class="tbl">
   <thead><tr><th>ID</th><th>Type</th><th>Summary</th><th>Status</th></tr></thead>
-  <tbody>${rows.map(r=>`<tr><td>${r[0]}</td><td><span class="tag ${r[4]}">${r[1]}</span></td><td style="font-family:var(--font-b)">${r[2]}</td><td>${r[3]}</td></tr>`).join('')}</tbody></table>`;
+  <tbody>${rows.map(r=>`<tr><td>${r[0]}</td><td><span class="tag ${STATUS_COLOR[r[3]]||'gray'}">${r[1]}</span></td><td style="font-family:var(--font-b)">${r[2]}</td><td>${r[3]}</td></tr>`).join('')}</tbody></table>`);
 
 const feedList = items => `<div class="feed">${items.map(f=>`
   <div class="feed-item"><div class="ic">${f[0]}</div><div><div class="t">${f[1]}</div><div class="m">${f[2]}</div></div></div>`).join('')}</div>`;
 
-const attTable = rows => `<table class="tbl">
+const attTable = rows => tblWrap(`<table class="tbl">
   <thead><tr><th>Employee</th><th>Mon</th><th>Tue</th><th>Wed</th><th>Thu</th><th>Fri</th></tr></thead>
-  <tbody>${rows.map(r=>`<tr><td style="font-family:var(--font-b)">${r[0]}</td>${r.slice(1).map(d=>`<td><span class="tag ${d==='IN'?'green':'red'}">${d}</span></td>`).join('')}</tr>`).join('')}</tbody></table>`;
+  <tbody>${rows.map(r=>`<tr><td style="font-family:var(--font-b)">${r[0]}</td>${r.slice(1).map(d=>`<td><span class="tag ${d==='IN'?'green':'red'}">${d}</span></td>`).join('')}</tr>`).join('')}</tbody></table>`);
 
 const pillList = items => `<div style="display:flex;flex-wrap:wrap;gap:8px">${items.map(s=>`<span class="tag teal">${s}</span>`).join('')}</div>`;
 
@@ -408,7 +416,8 @@ window.sendAI = async function(){
   }catch(e){ bubble.classList.remove('thinking'); bubble.textContent = 'AI service unavailable.'; }
   log.scrollTop = log.scrollHeight;
 };
-document.addEventListener('keydown', e => { if (e.key==='Enter' && e.target?.id==='aiText'){ window.sendAI(); }});
+document.addEventListener('keydown', e => { if (e.key==='Enter' && e.target?.id==='aiText'){ window.sendAI(); } });
+document.addEventListener('keydown', e => { if (e.key==='Enter' && e.target?.id==='portalCustomer'){ window.loadPortal(); } });
 
 // Render an inline chart inside the AI Assistant from a chart spec.
 function renderChatChart(spec, log){
@@ -564,8 +573,8 @@ window.loadPortal = async function(){
       <div class="kpi" style="--c:var(--amber)"><div class="lbl">Total MT</div><div class="val">${(k.mt||0).toFixed(1)}</div></div>
       <div class="kpi" style="--c:var(--green)"><div class="lbl">Revenue</div><div class="val">$${((k.revenue||0)/1e6).toFixed(2)}M</div></div>
       <div class="kpi" style="--c:var(--red)"><div class="lbl">Open Issues</div><div class="val">${d.issues.length}</div></div></div>`;
-    html += d.orders.length ? `<table class="tbl"><thead><tr><th>Order</th><th>Grade</th><th>MT</th><th>FCL</th><th>Price</th><th>Status</th><th>Date</th></tr></thead><tbody>${d.orders.map(o=>`<tr><td>${esc(o.order_id)}</td><td>${esc(o.grade)}</td><td>${o.mt}</td><td>${o.fcl}</td><td>$${o.price_usd}</td><td><span class="tag">${esc(o.status)}</span></td><td style="color:var(--muted)">${o.date||''}</td></tr>`).join('')}</tbody></table>` : '<span style="color:var(--muted)">No orders found for this customer.</span>';
-    if (d.issues.length) html += `<h4 style="margin:14px 0 6px">My Issues</h4><table class="tbl"><thead><tr><th>ID</th><th>Category</th><th>Status</th><th>Description</th></tr></thead><tbody>${d.issues.map(i=>`<tr><td>${esc(i.ticket_id)}</td><td>${esc(i.category)}</td><td><span class="tag">${esc(i.status)}</span></td><td>${esc(i.description)}</td></tr>`).join('')}</tbody></table>`;
+    html += d.orders.length ? `<table class="tbl"><thead><tr><th>Order</th><th>Grade</th><th>MT</th><th>FCL</th><th>Price</th><th>Status</th><th>Date</th></tr></thead><tbody>${d.orders.map(o=>`<tr><td>${esc(o.order_id)}</td><td>${esc(o.grade)}</td><td>${o.mt}</td><td>${o.fcl}</td><td>${o.price_usd}</td><td><span class="tag ${STATUS_COLOR[o.status]||'gray'}">${esc(o.status)}</span></td><td style="color:var(--muted)">${o.date||''}</td></tr>`).join('')}</tbody></table>` : '<span style="color:var(--muted)">No orders found for this customer.</span>';
+    if (d.issues.length) html += `<h4 style="margin:14px 0 6px">My Issues</h4><table class="tbl"><thead><tr><th>ID</th><th>Category</th><th>Status</th><th>Description</th></tr></thead><tbody>${d.issues.map(i=>`<tr><td>${esc(i.ticket_id)}</td><td>${esc(i.category)}</td><td><span class="tag ${STATUS_COLOR[i.status]||'gray'}">${esc(i.status)}</span></td><td>${esc(i.description)}</td></tr>`).join('')}</tbody></table>`;
     out.innerHTML = html;
   }catch(e){ out.innerHTML = '<span style="color:var(--red)">Portal failed.</span>'; }
 };
@@ -630,7 +639,7 @@ async function loadConfig(){
 }
 // Hook: when config screen renders, load + render panels.
 const _render = render;
-render = function(id){ _render(id); if (id==='config') loadConfig(); if (id==='branding') loadBranding(); if (id==='insights') loadLatestInsights(); };
+render = function(id){ _render(id); if (id==='config') loadConfig(); if (id==='branding') loadBranding(); if (id==='insights') loadLatestInsights(); if (id==='search' && window.__pendingSearch){ const inp = document.getElementById('searchQ'); if (inp){ inp.value = window.__pendingSearch; window.__pendingSearch = null; runSearch(); } } };
 
 // ---------- Import / Export ----------
 window.exportData = function(){
@@ -701,12 +710,27 @@ document.getElementById('menuBtn').addEventListener('click', () => {
 scrim.addEventListener('click', () => { sidebar.classList.remove('open'); scrim.classList.remove('on'); });
 window.addEventListener('hashchange', () => { sidebar.classList.remove('open'); scrim.classList.remove('on'); });
 
-// ---------- Search (demo) ----------
+// Checklists: reflect a toggle immediately instead of waiting for a re-render.
+document.addEventListener('change', e => {
+  const label = e.target.closest?.('.check label');
+  if (e.target.matches?.('.check input') && label) label.classList.toggle('done', e.target.checked);
+});
+
+// ---------- Search (global) ----------
 document.getElementById('globalSearch').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && e.target.value.trim()){
-    content.innerHTML = `<div class="card span-12"><h3>Search: “${e.target.value}”</h3>
-      <p style="color:var(--muted);font-family:var(--font-m);font-size:12px">Hybrid search (keyword + semantic) lands in Phase 2 — powered by pgvector + tsvector + trigram.</p></div>`;
+  if (e.key !== 'Enter') return;
+  const q = e.target.value.trim();
+  if (!q) return;
+  const onSearch = (location.hash.split('/')[1] || '') === 'search';
+  if (onSearch){
+    // Already on the Search screen — run directly (same-hash nav fires no event).
+    const inp = document.getElementById('searchQ');
+    if (inp){ inp.value = q; runSearch(); }
+    return;
   }
+  // Route to the Search screen; the render hook below picks the query up.
+  window.__pendingSearch = q;
+  location.hash = '#/search';
 });
 
 // ---------- Tenant select (live switch) ----------
@@ -775,14 +799,30 @@ function timeAgo(iso){
 // Initial load — called last so all functions/vars are defined (TDZ-safe).
 loadLiveData().then(()=>route()).catch(()=>route());
 
-// Auto-refresh: poll live data every 30s and re-render the current view if the
-// data changed. Keeps KPIs/charts fresh without a manual refresh. Skipped when
-// the tab is hidden (Page Visibility API) to avoid wasted fetches.
+// Auto-refresh: poll live data every 30s. Only re-render when the underlying
+// data changed — a blind re-render resets scroll position, kills chart hover,
+// and replays the entrance animation. Skipped when the tab is hidden.
+const dataSig = () => JSON.stringify([
+  DATA.kpis, DATA.orders, DATA.issues, DATA.suppliers, DATA.customers,
+  DATA.feed.map(f => f[0] + f[1]), // icon+title — not the relative-time suffix
+]);
+let lastSig = dataSig();
 setInterval(() => {
   if (document.hidden) return;
   loadLiveData().then(() => {
     const id = (location.hash.split('/')[1] || 'dashboard');
     // Only re-render data-driven views; editing views (config) manage their own state.
-    if (['dashboard','orders','issues','suppliers','customers','agenda'].includes(id)) render(id);
+    if (!['dashboard','orders','issues','suppliers','customers'].includes(id)) return;
+    const sig = dataSig();
+    if (sig === lastSig){
+      // Data identical — just refresh the relative feed timestamps in place.
+      document.querySelectorAll('#content .feed-item .m').forEach((el, i) => {
+        const t = DATA.feed[i] && DATA.feed[i][2];
+        if (t) el.textContent = t;
+      });
+      return;
+    }
+    lastSig = sig;
+    render(id);
   }).catch(() => {});
 }, 30000);
