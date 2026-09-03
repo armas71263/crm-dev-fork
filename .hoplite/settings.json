@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "ports": {"preview": 3000, "additional": {}},
+  "scripts": {
+    "setup": {
+      "enabled": true,
+      "command": "cd apps/bff && npm install --no-audit --no-fund && cd ../ai && npm install --no-audit --no-fund"
+    },
+    "run": {"enabled": true, "command": null},
+    "archive": {"enabled": true, "command": null},
+    "check": {
+      "enabled": true,
+      "command": "npm --prefix apps/bff test && npm --prefix apps/ai test"
+    }
+  },
+  "mcpServers": []
+}
