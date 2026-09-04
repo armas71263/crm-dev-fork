@@ -42,7 +42,7 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
 
   // ---- Data endpoints (RLS-enforced) ----
   fastify.get('/data/dashboard', async (req) => {
-    const records = await tenantQuery(req, 'SELECT order_id, customer, supplier, grade, mt, fcl, price_usd, status FROM records ORDER BY created_at DESC LIMIT 4')
+    const records = await tenantQuery(req, 'SELECT order_id, customer, supplier, grade, mt, fcl, price_usd, status FROM records ORDER BY created_at DESC')
     const kpi = await tenantQuery(req, `SELECT
       (SELECT count(*) FROM records) AS open_orders,
       (SELECT coalesce(sum(mt),0) FROM records) AS active_mt,
