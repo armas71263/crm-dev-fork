@@ -8,13 +8,21 @@ import { buildApp, createAuthVerifier } from './app.js'
 const PORT = parseInt(process.env.BFF_PORT || '4000', 10)
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000'
 
+// Supabase poolers REQUIRE TLS; node-pg does not enable it by default and a
+// plaintext connection to the pooler stalls forever (psql works only because
+// libpq negotiates TLS automatically). Local dev Postgres has no TLS, so gate
+// on the DSN host. rejectUnauthorized:false per Supabase's own node examples
+// (their pooler cert does not cover the hostname; the channel is still encrypted).
+const supabaseSsl = (dsn) =>
+  /supabase\.(com|co)/.test(dsn || '') ? { rejectUnauthorized: false } : undefined
+
 // Staff pool: connects as the app_role LOGIN role so RLS applies. On Supabase
 // use the SESSION pooler with the app_role.<ref> username — never the postgres
 // admin DSN, never the transaction pooler (port 6543, breaks session-level
 // set_config). Small max: free-tier connection limits.
 const DB_SESSION_POOLER = process.env.SUPABASE_DB_SESSION_POOLER_URL
 const pool = DB_SESSION_POOLER
-  ? new pg.Pool({ connectionString: DB_SESSION_POOLER, max: 5 })
+  ? new pg.Pool({ connectionString: DB_SESSION_POOLER, max: 5, ssl: supabaseSsl(DB_SESSION_POOLER) })
   : new pg.Pool({
       host: process.env.PG_HOST || 'postgres',
       port: 5432,
@@ -26,7 +34,7 @@ const pool = DB_SESSION_POOLER
 // Admin pool: postgres.<ref> (table owner / control plane) for /tenants endpoints.
 const DB_ADMIN_POOLER = process.env.SUPABASE_DB_ADMIN_POOLER_URL
 const adminPool = DB_ADMIN_POOLER
-  ? new pg.Pool({ connectionString: DB_ADMIN_POOLER, max: 5 })
+  ? new pg.Pool({ connectionString: DB_ADMIN_POOLER, max: 5, ssl: supabaseSsl(DB_ADMIN_POOLER) })
   : new pg.Pool({
       host: process.env.PG_HOST || 'postgres',
       port: 5432,
@@ -40,7 +48,7 @@ const adminPool = DB_ADMIN_POOLER
 // membership cannot be used). Same connection shape as the staff pool.
 const CUSTOMER_DSN = process.env.SUPABASE_DB_CUSTOMER_POOLER_URL
 const customerPool = CUSTOMER_DSN
-  ? new pg.Pool({ connectionString: CUSTOMER_DSN, max: 5 })
+  ? new pg.Pool({ connectionString: CUSTOMER_DSN, max: 5, ssl: supabaseSsl(CUSTOMER_DSN) })
   : new pg.Pool({
       host: process.env.PG_HOST || 'postgres',
       port: 5432,
