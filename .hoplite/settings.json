@@ -13,5 +13,12 @@
       "command": "npm --prefix apps/bff test && npm --prefix apps/ai test"
     }
   },
-  "mcpServers": []
+  "mcpServers": [
+    {
+      "name": "context-mode",
+      "command": "npx",
+      "args": ["-y", "context-mode"],
+      "env": {}
+    }
+  ]
 }

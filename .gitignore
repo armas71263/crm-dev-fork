@@ -20,3 +20,9 @@ Thumbs.db
 .vscode/
 *.swp
 backups/
+
+# agent skills CLI output (skills are provided natively by the platform)
+.agents/
+.claude/
+agent/
+skills-lock.json

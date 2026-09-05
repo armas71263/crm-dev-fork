@@ -4,12 +4,19 @@ import helmet from '@fastify/helmet'
 import multipart from '@fastify/multipart'
 import pg from 'pg'
 import * as XLSX from 'xlsx'
+import { createAuthVerifier } from './auth.js'
+
+export { createAuthVerifier }
 
 // Build the BFF application with injected dependencies so it is testable
 // without a real Postgres or a listening socket. `pool` is the tenant-scoped
-// app_role pool; `adminPool` is the superuser pool used by the /tenants admin
-// endpoints; `aiServiceUrl` is where the AI service lives.
-export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } = {}) {
+// app_role pool; `customerPool` is the app_customer login-role pool for
+// customer-role requests (isolation boundary — see migration 003);
+// `adminPool` is the superuser pool used by the /tenants admin endpoints;
+// `aiServiceUrl` is where the AI service lives; `auth` is a Supabase
+// JWT verifier — when absent the BFF runs in explicit dev mode (x-tenant-id
+// header), which production boots never do (see src/index.js).
+export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, auth, logger = true } = {}) {
   const fastify = Fastify({ logger })
   const AI_SERVICE_URL = aiServiceUrl || 'http://localhost:5000'
 
@@ -30,15 +37,45 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
   })
   await fastify.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } })
 
-  fastify.get('/health', async () => ({ ok: true, service: 'bff' }))
-
-  // Tenant-detection middleware.
-  // TODO: parse Directus JWT for real auth. For dev, x-tenant-id header selects the tenant.
-  fastify.addHook('preHandler', async (req) => {
-    req.tenantId = req.headers['x-tenant-id'] || 'rubbertrack'
+  // Auth hook — registered before any route so it covers every endpoint.
+  // JWT mode: tenant identity comes from the verified token only; the
+  // x-tenant-id header is ignored entirely. Dev mode (no verifier injected)
+  // keeps the legacy header behavior for local compose/preview runs.
+  const PUBLIC_PATHS = new Set(['/health'])
+  fastify.addHook('preHandler', async (req, reply) => {
+    if (PUBLIC_PATHS.has(req.url.split('?')[0])) return
+    if (!auth) {
+      req.tenantId = req.headers['x-tenant-id'] || 'rubbertrack'
+      return
+    }
+    const m = /^Bearer (.+)$/.exec(req.headers.authorization || '')
+    if (!m) return reply.code(401).send({ error: 'unauthorized' })
+    try {
+      req.auth = await auth.verify(m[1])
+      req.tenantId = req.auth.tenantId
+    } catch {
+      return reply.code(401).send({ error: 'unauthorized' })
+    }
   })
 
-  const tenantQuery = makeTenantQuery(pool)
+  fastify.get('/health', async () => ({ ok: true, service: 'bff' }))
+
+  const staffQuery = makeTenantQuery(pool)
+  const customerQuery = customerPool ? makeTenantQuery(customerPool) : null
+  // Customer requests run on the app_customer pool. Fail closed: a customer
+  // token without a configured customer pool is a config error (503), never a
+  // silent fallback to staff-level tenant scope.
+  const tenantQuery = (req, text, params = []) => {
+    if (req.auth?.role === 'customer') {
+      if (!customerQuery) {
+        const err = new Error('customer pool not configured')
+        err.statusCode = 503
+        throw err
+      }
+      return customerQuery(req, text, params)
+    }
+    return staffQuery(req, text, params)
+  }
 
   // ---- Data endpoints (RLS-enforced) ----
   fastify.get('/data/dashboard', async (req) => {
@@ -459,19 +496,29 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
 }
 
 // Helper: run a query scoped to the request's tenant via RLS.
+// Customer-role requests must arrive on the app_customer POOL (a separate login
+// role — see infra/migrations/003_auth_roles.sql for why SET ROLE/membership is
+// forbidden here). The company GUC drives the restrictive company policy.
 // Exported separately so tests can pin the connection-cleanup contract.
 export function makeTenantQuery(pool) {
   return async function tenantQuery(req, text, params = []) {
     const client = await pool.connect()
+    const isCustomer = req.auth?.role === 'customer'
     try {
       // is_local=false → session-level (persists across this connection's queries)
       await client.query("SELECT set_config('app.tenant_id', $1, false)", [req.tenantId])
+      if (isCustomer) {
+        await client.query("SELECT set_config('app.company_id', $1, false)", [req.auth.companyId])
+      }
       return await client.query(text, params)
     } finally {
       // Clear so a pooled connection can't leak a tenant into the next request.
       // RESET failures mean the connection itself is gone; still release so the
       // pool can discard it instead of leaking the client.
-      try { await client.query("RESET app.tenant_id") } catch { /* connection lost */ }
+      try {
+        if (isCustomer) await client.query('RESET app.company_id')
+        await client.query('RESET app.tenant_id')
+      } catch { /* connection lost */ }
       client.release()
     }
   }
