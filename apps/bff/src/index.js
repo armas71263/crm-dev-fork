@@ -1,5 +1,6 @@
 import pg from 'pg'
 import fastifyStatic from '@fastify/static'
+import fs from 'fs'
 import { fileURLToPath } from 'url'
 import path from 'path'
 import { buildApp, createAuthVerifier } from './app.js'
@@ -7,9 +8,10 @@ import { buildApp, createAuthVerifier } from './app.js'
 const PORT = parseInt(process.env.BFF_PORT || '4000', 10)
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000'
 
-// Postgres pool as the non-superuser app_role so RLS applies.
-// Supabase: use the SESSION pooler URL (never the transaction pooler — it breaks
-// the session-level set_config RLS pattern). Small max: free-tier connection limits.
+// Staff pool: connects as the app_role LOGIN role so RLS applies. On Supabase
+// use the SESSION pooler with the app_role.<ref> username — never the postgres
+// admin DSN, never the transaction pooler (port 6543, breaks session-level
+// set_config). Small max: free-tier connection limits.
 const DB_SESSION_POOLER = process.env.SUPABASE_DB_SESSION_POOLER_URL
 const pool = DB_SESSION_POOLER
   ? new pg.Pool({ connectionString: DB_SESSION_POOLER, max: 5 })
@@ -21,9 +23,10 @@ const pool = DB_SESSION_POOLER
       password: process.env.PG_PASSWORD || 'apppass',
     })
 
-// Privileged admin pool (postgres superuser) for the /tenants control plane.
-const adminPool = DB_SESSION_POOLER
-  ? new pg.Pool({ connectionString: DB_SESSION_POOLER, max: 5 })
+// Admin pool: postgres.<ref> (table owner / control plane) for /tenants endpoints.
+const DB_ADMIN_POOLER = process.env.SUPABASE_DB_ADMIN_POOLER_URL
+const adminPool = DB_ADMIN_POOLER
+  ? new pg.Pool({ connectionString: DB_ADMIN_POOLER, max: 5 })
   : new pg.Pool({
       host: process.env.PG_HOST || 'postgres',
       port: 5432,
@@ -63,9 +66,20 @@ const fastify = await buildApp({ pool, customerPool, adminPool, aiServiceUrl: AI
 
 const start = async () => {
   try {
-    // Serve the static preview/ UI from the BFF so a single tunnel exposes both.
-    const dir = path.resolve(fileURLToPath(import.meta.url), '../../preview')
-    await fastify.register(fastifyStatic, { root: dir, prefix: '/' })
+    // Serve the static preview/ UI so a single tunnel exposes UI + /data/* API.
+    // The dir sits beside the app dir in the Docker image (/app/preview) and at
+    // the repo root for host runs — resolve whichever exists.
+    const here = path.dirname(fileURLToPath(import.meta.url))
+    const previewDir = [
+      process.env.PREVIEW_DIR,
+      path.resolve(here, '../../preview'),
+      path.resolve(here, '../../../preview'),
+    ].filter(Boolean).find((d) => fs.existsSync(d))
+    if (previewDir) {
+      await fastify.register(fastifyStatic, { root: previewDir, prefix: '/' })
+    } else {
+      fastify.log.warn('preview/ not found — serving API only')
+    }
     await fastify.listen({ port: PORT, host: '0.0.0.0' })
   } catch (err) {
     fastify.log.error(err)
