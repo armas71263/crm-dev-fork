@@ -5,6 +5,7 @@ import multipart from '@fastify/multipart'
 import pg from 'pg'
 import * as XLSX from 'xlsx'
 import { createAuthVerifier } from './auth.js'
+import { registerCrmRoutes } from './crm.js'
 
 export { createAuthVerifier }
 
@@ -76,6 +77,21 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
     }
     return staffQuery(req, text, params)
   }
+
+  // Audit trail: fire-and-forget on every CRM mutation; an audit failure must
+  // never fail the user's request.
+  const writeAudit = async (req, action, entity, entityId, detail = {}) => {
+    try {
+      await tenantQuery(req,
+        `INSERT INTO audit_logs (tenant_id, user_id, action, entity, entity_id, detail)
+         VALUES (app.current_tenant(), $1, $2, $3, $4, $5::jsonb)`,
+        [req.auth?.userId ?? null, action, entity, entityId, JSON.stringify(detail)])
+    } catch (e) {
+      fastify.log.warn({ err: e.message }, 'audit write failed')
+    }
+  }
+
+  registerCrmRoutes(fastify, { tenantQuery, writeAudit })
 
   // ---- Data endpoints (RLS-enforced) ----
   fastify.get('/data/dashboard', async (req) => {

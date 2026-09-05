@@ -18,6 +18,7 @@ MIGRATIONS=(
   "001_helper|infra/tenancy/helper.sql"
   "002_schema|infra/tenancy/schema.sql"
   "003_auth_roles|infra/migrations/003_auth_roles.sql"
+  "004_crm|infra/migrations/004_crm.sql"
 )
 
 psql "$DSN" -v ON_ERROR_STOP=1 <<SQL
