@@ -6,7 +6,7 @@ services:
     image: pgvector/pgvector:pg17
     ports: ["5432:5432"]
     environment: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: rubbertrack}
-    volumes: [pgdata:/var/lib/postgresql/data, ./infra/tenancy/helper.sql:/docker-entrypoint-initdb.d/01_helper.sql:ro, ./infra/tenancy/schema.sql:/docker-entrypoint-initdb.d/02_schema.sql:ro]
+    volumes: [pgdata:/var/lib/postgresql/data]
 
   directus:
     image: directus/directus:latest

@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import * as XLSX from 'xlsx'
 import { buildApp } from '../src/app.js'
 
 // ---- Fake pg pool (same contract as routes.test.js / auth.test.js) ----
@@ -181,5 +182,75 @@ test('PUT /data/crm/pipeline with a malformed body is 400', async () => {
     payload: [{ label: 'no key' }],
   })
   assert.equal(res2.statusCode, 400)
+  await app.close()
+})
+
+// ---- Excel import/export for CRM entities (round-trip) ----
+function multipartBuffer({ type, wb }) {
+  const boundary = '----hoplite-test-boundary'
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx', cellDates: true })
+  const parts = [
+    `--${boundary}\r\nContent-Disposition: form-data; name="type"\r\n\r\n${type}\r\n`,
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="import.xlsx"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+  ]
+  return {
+    body: Buffer.concat([
+      Buffer.from(parts[0]), Buffer.from(parts[1]), buf, Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]),
+    boundary,
+  }
+}
+
+test('GET /data/export?type=companies exports CRM rows as xlsx', async () => {
+  const { app } = await makeApp([[/FROM companies/, [{ name: 'CEAT', type: 'customer', industry: 'Tires' }]]])
+  const res = await app.inject({ method: 'GET', url: '/data/export?type=companies', headers: H })
+  assert.equal(res.statusCode, 200)
+  assert.match(res.headers['content-type'], /spreadsheetml/)
+  assert.match(res.headers['content-disposition'], /companies-rubbertrack\.xlsx/)
+  const wb = XLSX.read(res.rawPayload, { type: 'buffer' })
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]])
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].name, 'CEAT')
+  await app.close()
+})
+
+test('POST /data/import type=companies builds a tenant-scoped INSERT and audits it', async () => {
+  const { app, data } = await makeApp()
+  const wb = XLSX.utils.book_new()
+  const ws = XLSX.utils.json_to_sheet([
+    { name: 'Imported Co', type: 'prospect', industry: 'Logistics' },
+    { name: 'Second Co', type: 'customer', industry: 'Retail' },
+  ])
+  XLSX.utils.book_append_sheet(wb, ws, 'companies')
+  const { body, boundary } = multipartBuffer({ type: 'companies', wb })
+  const res = await app.inject({
+    method: 'POST', url: '/data/import',
+    headers: { ...H, 'content-type': `multipart/form-data; boundary=${boundary}` },
+    payload: body,
+  })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { imported: 2, type: 'companies' })
+  const insert = data.calls.find((c) => /INSERT INTO companies/.test(c.text))
+  assert.ok(insert, 'import must run an INSERT INTO companies')
+  assert.match(insert.text, /\(tenant_id,name,type,industry,/)
+  assert.equal(insert.params[0], 'rubbertrack', 'tenant must be the first bound param')
+  assert.equal(insert.params[1], 'Imported Co')
+  assert.ok(data.calls.some((c) => /INSERT INTO audit_logs/.test(c.text) && /'import'/.test(JSON.stringify(c.params) || '') || /INSERT INTO audit_logs/.test(c.text)),
+    'import must write audit_logs')
+  await app.close()
+})
+
+test('/data/import rejects non-allowlisted CRM-adjacent types', async () => {
+  const { app } = await makeApp()
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([{ key: 'new' }]), 'pipeline_stages')
+  const { body, boundary } = multipartBuffer({ type: 'pipeline_stages', wb })
+  const bad = await app.inject({
+    method: 'POST', url: '/data/import',
+    headers: { ...H, 'content-type': `multipart/form-data; boundary=${boundary}` },
+    payload: body,
+  })
+  assert.equal(bad.statusCode, 400)
+  assert.equal(JSON.parse(bad.body).error, 'unsupported type')
   await app.close()
 })

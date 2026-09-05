@@ -250,15 +250,21 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   })
 
   // ---- Excel/CSV import & export (tenant-scoped via RLS) ----
-  const IMPORTABLE = ['records', 'parties', 'tickets', 'feed_items']
+  const IMPORTABLE = ['records', 'parties', 'tickets', 'feed_items',
+    'companies', 'contacts', 'leads', 'deals', 'activities']
   const EXPORT_FIELDS = {
     records: ['order_id', 'date', 'customer', 'supplier', 'grade', 'mt', 'fcl', 'price_usd', 'status'],
     parties: ['name', 'type', 'contact', 'tags'],
     tickets: ['ticket_id', 'customer', 'supplier', 'category', 'status', 'description'],
     feed_items: ['category', 'title', 'description', 'priority', 'published_at'],
+    companies: ['name', 'type', 'industry', 'website', 'phone', 'email', 'address', 'notes', 'status'],
+    contacts: ['company_id', 'full_name', 'first_name', 'last_name', 'title', 'email', 'phone', 'mobile', 'linkedin', 'status'],
+    leads: ['name', 'company_name', 'contact_name', 'email', 'phone', 'source', 'value', 'status'],
+    deals: ['name', 'company_id', 'contact_id', 'lead_id', 'stage', 'value', 'currency', 'expected_close_date', 'probability', 'status'],
+    activities: ['type', 'subject', 'detail', 'entity', 'entity_id', 'due_at', 'completed', 'user_id'],
   }
 
-  // Export a collection to xlsx. ?type=records|parties|tickets|feed_items
+  // Export a collection to xlsx. ?type=records|parties|tickets|feed_items|companies|contacts|leads|deals|activities
   fastify.get('/data/export', async (req, reply) => {
     const type = (req.query.type || 'records')
     if (!IMPORTABLE.includes(type)) return reply.code(400).send({ error: 'unsupported type' })
@@ -301,6 +307,7 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   }).join(',')
     const sql = `INSERT INTO ${type} (${cols.join(',')}) VALUES ${placeholders}`
     await tenantQuery(req, sql, values)
+    await writeAudit(req, 'import', type, null, { count: rows.length })
     return { imported: rows.length, type }
   })
 

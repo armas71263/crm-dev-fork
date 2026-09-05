@@ -66,7 +66,7 @@ echo "  Next: seed data via Directus or INSERTs scoped to this tenant."
 #    new tenant so it starts with a working dataset. Re-tenant each row.
 if [ "${CLONE_TEMPLATE:-0}" = "1" ] && [ "$TEMPLATE" != "$TENANT_ID" ]; then
   echo "→ Cloning template '$TEMPLATE' data into '$TENANT_ID' (CLONE_TEMPLATE=1)..."
-  TABLES="records parties tickets feed_items checklists screen_configs"
+  TABLES="records parties tickets feed_items checklists screen_configs companies contacts leads deals activities pipeline_stages"
   for T in $TABLES; do
     # Build a column list excluding tenant_id (portable across PG versions).
     COLS=$(DOCKER exec -i rubbertrack-platform-postgres-1 psql "$PG_DSN" -tAc \
