@@ -8,7 +8,10 @@ import { spawn } from 'child_process'
 //   staff.lex@test.dev (lexley, tenant-admin)        password: LIVE_E2E_PASSWORD
 //   cust.ceat@test.dev (rubbertrack, CEAT, customer) password: LIVE_E2E_PASSWORD
 // Exits non-zero on any failure. Verifies: real JWT verification, cross-tenant
-// isolation, customer company isolation, and 401 fail-closed paths.
+// isolation, customer company isolation, CRM endpoints, and 401 fail-closed paths.
+// With E2E_EXTERNAL_BFF=1 it tests an already-running BFF on :4000 instead of
+// spawning one (sandbox child-process reaping can kill spawned servers — run
+// the BFF in the foreground and this script in the background instead).
 
 const env = { ...process.env }
 for (const line of fs.readFileSync('../../.env', 'utf8').split('\n')) {
@@ -33,10 +36,13 @@ async function login(email) {
   return d.access_token
 }
 
-const bff = spawn('node', ['src/index.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] })
+const EXTERNAL = !!process.env.E2E_EXTERNAL_BFF
+const bff = EXTERNAL ? null : spawn('node', ['src/index.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] })
 const bfflog = []
-bff.stdout.on('data', (d) => bfflog.push(d.toString()))
-bff.stderr.on('data', (d) => bfflog.push(d.toString()))
+if (bff) {
+  bff.stdout.on('data', (d) => bfflog.push(d.toString()))
+  bff.stderr.on('data', (d) => bfflog.push(d.toString()))
+}
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 
 try {
@@ -73,8 +79,19 @@ try {
   check('tampered token is 401', r6.status === 401)
   const spoof = await fetch(base + '/data/orders', { headers: { 'x-tenant-id': 'rubbertrack' } })
   check('spoofed x-tenant-id header is 401', spoof.status === 401)
+
+  // CRM endpoints through real tokens (Phase 2)
+  const c1 = await get('/data/crm/companies', rt)
+  check('staff sees 3 CRM companies via token', c1.status === 200 && c1.body.companies?.length === 3, `got ${c1.body?.companies?.length}`)
+  const c2 = await get('/data/crm/deals?stage=won', rt)
+  check('deals stage filter works via token', c2.status === 200 && c2.body.deals?.length === 1 && c2.body.deals[0].name === 'CEAT pilot shipment', `got ${c2.body?.deals?.map((d) => d.name).join(',')}`)
+  const c3 = await get('/data/crm/companies', cust)
+  const custCompaniesOk = c3.status === 200 && c3.body.companies?.length === 1 && c3.body.companies[0].name === 'CEAT'
+  check('CEAT customer sees only own company via CRM endpoint', custCompaniesOk, `got ${c3.body?.companies?.map((x) => x.name).join(',')}`)
+  const c4 = await get('/data/crm/pipeline', rt)
+  check('pipeline stages load via token', c4.status === 200 && c4.body.stages?.length === 6, `got ${c4.body?.stages?.length}`)
 } finally {
-  bff.kill('SIGTERM')
+  if (bff) bff.kill('SIGTERM')
   await wait(300)
 }
 console.log(failed === 0 ? 'ALL LIVE E2E CHECKS PASSED' : failed + ' CHECK(S) FAILED')

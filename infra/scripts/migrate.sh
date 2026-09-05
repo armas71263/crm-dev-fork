@@ -20,6 +20,7 @@ MIGRATIONS=(
   "003_auth_roles|infra/migrations/003_auth_roles.sql"
   "004_crm|infra/migrations/004_crm.sql"
   "005_services_seed|infra/migrations/005_services_seed.sql"
+  "006_directus|infra/migrations/006_directus.sql"
 )
 
 psql "$DSN" -v ON_ERROR_STOP=1 <<SQL

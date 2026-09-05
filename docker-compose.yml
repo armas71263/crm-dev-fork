@@ -11,7 +11,23 @@ services:
   directus:
     image: directus/directus:latest
     ports: ["8055:8055"]
-    environment: {KEY: k, SECRET: s, ADMIN_EMAIL: admin@example.com, ADMIN_PASSWORD: admin1234, DB_CLIENT: pg, DB_HOST: postgres, DB_PORT: 5432, DB_DATABASE: rubbertrack, DB_USER: postgres, DB_PASSWORD: postgres, PUBLIC_URL: http://localhost:8055}
+    # Env-driven: with DIRECTUS_DB_* set in .env (Supabase pooler + the
+    # dedicated directus_admin role from migration 006) the control plane runs
+    # against the live project; unset, it falls back to the local dev stack.
+    environment:
+      KEY: ${DIRECTUS_KEY:-k}
+      SECRET: ${DIRECTUS_SECRET:-s}
+      ADMIN_EMAIL: ${DIRECTUS_ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${DIRECTUS_ADMIN_PASSWORD:-admin1234}
+      DB_CLIENT: pg
+      DB_HOST: ${DIRECTUS_DB_HOST:-postgres}
+      DB_PORT: ${DIRECTUS_DB_PORT:-5432}
+      DB_DATABASE: ${DIRECTUS_DB_DATABASE:-rubbertrack}
+      DB_USER: ${DIRECTUS_DB_USER:-directus_admin}
+      DB_PASSWORD: ${DIRECTUS_DB_PASSWORD:-directusdev}
+      DB_SSL: ${DIRECTUS_DB_SSL:-false}
+      DB_SSL_REJECT_UNAUTHORIZED: ${DIRECTUS_DB_SSL_REJECT_UNAUTHORIZED:-false}
+      PUBLIC_URL: ${DIRECTUS_PUBLIC_URL:-http://localhost:8055}
     depends_on: [postgres]
 
   bff:

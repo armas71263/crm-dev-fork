@@ -35,29 +35,10 @@ echo "→ Verifying RLS isolation for new tenant (expect 0 rows)..."
 DOCKER exec -i rubbertrack-platform-postgres-1 psql "postgresql://app_role:apppass@localhost:5432/rubbertrack" \
   -v ON_ERROR_STOP=1 -c "SET app.tenant_id='$TENANT_ID'; SELECT count(*) AS isolated_rows FROM records;"
 
-# 3. Create a tenant-admin user in Directus (if email provided) and assign the role.
-#    The user's app.tenant_id is bound at login time by the BFF (Phase 1+).
-if [ -n "$ADMIN_EMAIL" ]; then
-  echo "→ Creating tenant-admin user ($ADMIN_EMAIL) for $TENANT_ID..."
-  TOKEN=$(curl -s -X POST "$DIRECTUS_URL/auth/login" \
-    -H "Content-Type: application/json" \
-    -d "{\"email\":\"admin@example.com\",\"password\":\"admin1234\"}" \
-    | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['access_token'])")
-  ROLE_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
-    "$DIRECTUS_URL/roles?fields=id,name&limit=-1" \
-    | python3 -c "import sys,json;d=json.load(sys.stdin)['data'];print(next((r['id'] for r in d if r['name']=='tenant-admin'),''))")
-  if [ -n "$ROLE_ID" ]; then
-    # Store the tenant binding in the user's tenant_id field (Directus users table).
-    FIRST_PASS="${TENANT_ID}1234"
-    curl -s -o /dev/null -X POST "$DIRECTUS_URL/users" \
-      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-      -d "{\"first_name\":\"$LABEL\",\"email\":\"$ADMIN_EMAIL\",\"password\":\"$FIRST_PASS\",\"role\":\"$ROLE_ID\",\"tenant_id\":\"$TENANT_ID\",\"status\":\"active\"}" \
-      || echo "  (user may already exist — skipping)"
-    echo "  ✓ tenant-admin user created: $ADMIN_EMAIL (temp password: $FIRST_PASS)"
-  else
-    echo "  ! tenant-admin role not found — run setup-directus.sh first"
-  fi
-fi
+# 3. Tenant-admin users are NOT created here anymore: Directus is vendor-only
+#    (product decision), and product users come from Supabase Auth with
+#    app_metadata claims written via the service-role key from the BFF —
+#    never predictable local passwords.
 
 echo "✓ Tenant '$TENANT_ID' onboarded. RLS policies auto-apply — set app.tenant_id='$TENANT_ID' to seed/use."
 echo "  Next: seed data via Directus or INSERTs scoped to this tenant."
