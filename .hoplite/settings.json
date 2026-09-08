@@ -4,9 +4,9 @@
   "scripts": {
     "setup": {
       "enabled": true,
-      "command": "cd apps/bff && npm install --no-audit --no-fund && cd ../ai && npm install --no-audit --no-fund"
+      "command": "cd apps/bff && npm install --no-audit --no-fund && cd ../ai && npm install --no-audit --no-fund && cd ../web && npm install --no-audit --no-fund"
     },
-    "run": {"enabled": true, "command": null},
+    "run": {"enabled": true, "command": "./scripts/dev.sh"},
     "archive": {"enabled": true, "command": null},
     "check": {
       "enabled": true,
