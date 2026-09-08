@@ -57,6 +57,23 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
     } catch {
       return reply.code(401).send({ error: 'unauthorized' })
     }
+    // Customer tokens are portal-scoped: reads on the tables granted to
+    // app_customer (records/tickets/parties/companies/contacts/leads/deals/
+    // activities — each behind a RESTRICTIVE company policy, see migrations
+    // 003/004) plus the portal overview. Everything else (AI proxy, tenant
+    // registry, search, KPI, import/export, config, mutations) is staff
+    // territory — 403, never a silent pool fallback. The AI proxy especially:
+    // the AI service queries at tenant scope and knows nothing about company
+    // isolation.
+    if (req.auth.role === 'customer') {
+      const p = req.url.split('?')[0]
+      const allowed = p === '/portal/overview'
+        || (req.method === 'GET' && (
+          /^\/data\/(orders|issues|parties)$/.test(p)
+          || /^\/data\/crm\/(companies|contacts|leads|deals|activities)(\/.*)?$/.test(p)
+        ))
+      if (!allowed) return reply.code(403).send({ error: 'forbidden: customer role is portal-scoped' })
+    }
   })
 
   fastify.get('/health', async () => ({ ok: true, service: 'bff' }))
@@ -162,17 +179,28 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   // against records (or any other table), so screen_configs charts need no new code.
   // ?dimension=grade&metric=mt&table=records&group_by=month&time_range=6
   fastify.get('/data/kpi/chart', async (req, reply) => {
-    const TABLES = { records: 'records', tickets: 'tickets', parties: 'parties', feed_items: 'feed_items' }
-    const DIMS = { grade: 'grade', customer: 'customer', supplier: 'supplier', status: 'status', category: 'category', type: 'type', month: "to_char(date_trunc('month', date), 'YYYY-MM')" }
-    const METRICS = { mt: 'sum(mt)', fcl: 'sum(fcl)', count: 'count(*)', revenue: 'sum(mt*price_usd)', avg_price: 'avg(price_usd)' }
-    const table = TABLES[req.query.table] || 'records'
-    const dim = DIMS[req.query.dimension]; const met = METRICS[req.query.metric]
-    if (!dim || !met) return reply.code(400).send({ error: 'bad dimension/metric', tables: Object.keys(TABLES), dims: Object.keys(DIMS), metrics: Object.keys(METRICS) })
+    // Allowlisted dims/metrics per table (the 400 response echoes them so the
+    // chart builder is self-documenting). CRM tables ship alongside the
+    // rubber-vertical ones so config-driven charts cover the generic CRM.
+    const TABLES = {
+      records: { time: "date", dims: { grade: "grade", customer: "customer", supplier: "supplier", status: "status", month: "to_char(date_trunc('month', date), 'YYYY-MM')" }, metrics: { mt: "sum(mt)", fcl: "sum(fcl)", count: "count(*)", revenue: "sum(mt*price_usd)", avg_price: "avg(price_usd)" } },
+      tickets: { time: null, dims: { category: "category", status: "status" }, metrics: { count: "count(*)" } },
+      parties: { time: null, dims: { type: "type" }, metrics: { count: "count(*)" } },
+      feed_items: { time: null, dims: { category: "category" }, metrics: { count: "count(*)" } },
+      companies: { time: null, dims: { type: "type", industry: "industry", status: "status" }, metrics: { count: "count(*)" } },
+      contacts: { time: null, dims: { status: "status" }, metrics: { count: "count(*)" } },
+      leads: { time: null, dims: { status: "status", source: "source" }, metrics: { count: "count(*)", value: "sum(value)" } },
+      deals: { time: null, dims: { stage: "stage", status: "status", company: "coalesce((SELECT c.name FROM companies c WHERE c.id = deals.company_id), 'n/a')", month: "to_char(date_trunc('month', coalesce(deals.expected_close_date, deals.created_at)), 'YYYY-MM')" }, metrics: { count: 'count(*)', value: 'sum(value)', avg_value: 'avg(value)' } },
+      activities: { time: null, dims: { type: "type", entity: "entity" }, metrics: { count: "count(*)" } },
+    }
+    const spec = TABLES[req.query.table] || TABLES.records
+    const dim = spec.dims[req.query.dimension]; const met = spec.metrics[req.query.metric]
+    if (!dim || !met) return reply.code(400).send({ error: 'bad dimension/metric', tables: Object.keys(TABLES), dims: Object.keys(spec.dims), metrics: Object.keys(spec.metrics) })
     let where = '', params = []
     const months = Math.min(parseInt(req.query.time_range || '0', 10), 36)
-    if (months > 0 && table === 'records') { where = `WHERE date >= date_trunc('month', current_date) - $1::interval`; params = [`${months} months`] }
-    const r = await tenantQuery(req, `SELECT ${dim} AS label, ${met}::float AS value FROM ${table} ${where} GROUP BY 1 ORDER BY ${req.query.dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 30`, params)
-    return { table, dimension: req.query.dimension, metric: req.query.metric, group_by: req.query.group_by || null, time_range: months || null, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) }
+    if (months > 0 && spec.time) { where = `WHERE ${spec.time} >= date_trunc('month', current_date) - $1::interval`; params = [`${months} months`] }
+    const r = await tenantQuery(req, `SELECT ${dim} AS label, ${met}::float AS value FROM ${req.query.table && TABLES[req.query.table] ? req.query.table : 'records'} ${where} GROUP BY 1 ORDER BY ${req.query.dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 30`, params)
+    return { table: req.query.table && TABLES[req.query.table] ? req.query.table : 'records', dimension: req.query.dimension, metric: req.query.metric, group_by: req.query.group_by || null, time_range: months || null, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) }
   })
 
   // ---- Real-time KPI stream (SSE) — pushes fresh KPI snapshots every N seconds ----
@@ -207,9 +235,9 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   // the caller passes ?embedding=[...] (ai-service supplies query vectors). All RLS-scoped.
   fastify.get('/search', async (req) => {
     const q = (req.query.q || '').trim()
-    if (!q) return { q, records: [], parties: [], tickets: [], feed: [], semantic: [] }
+    if (!q) return { q, records: [], parties: [], tickets: [], feed: [], crm: { companies: [], contacts: [], leads: [], deals: [], activities: [] }, semantic: [] }
     const like = `%${q}%`
-    const [records, parties, tickets, feed] = await Promise.all([
+    const [records, parties, tickets, feed, companies, contacts, leads, deals, activities] = await Promise.all([
       tenantQuery(req, `
         SELECT order_id, customer, supplier, grade, mt, status,
           ts_rank(to_tsvector('english', coalesce(order_id,'')||' '||coalesce(customer,'')||' '||coalesce(supplier,'')||' '||coalesce(grade,'')), plainto_tsquery('english', $1)) AS rank
@@ -232,6 +260,11 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
         FROM feed_items
         WHERE title ILIKE $1 OR description ILIKE $1 OR category ILIKE $1
         LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, name, type FROM companies WHERE name ILIKE $1 OR coalesce(industry,'') ILIKE $1 LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, full_name, title FROM contacts WHERE full_name ILIKE $1 OR coalesce(email,'') ILIKE $1 LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, name, coalesce(company_name,'') AS company_name, value, status FROM leads WHERE name ILIKE $1 OR coalesce(company_name,'') ILIKE $1 LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, name, stage, value, status FROM deals WHERE name ILIKE $1 LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, subject, type FROM activities WHERE subject ILIKE $1 OR coalesce(detail,'') ILIKE $1 LIMIT 10`, [like]),
     ])
     // Optional semantic leg: if the client supplies a query embedding, rank the
     // tenant's embeddings by cosine distance. (Empty table → empty result, safe.)
@@ -246,7 +279,8 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
         semantic = r.rows
       } catch { semantic = [] }
     }
-    return { q, records: records.rows, parties: parties.rows, tickets: tickets.rows, feed: feed.rows, semantic }
+    const crm = { companies: companies.rows, contacts: contacts.rows, leads: leads.rows, deals: deals.rows, activities: activities.rows }
+    return { q, records: records.rows, parties: parties.rows, tickets: tickets.rows, feed: feed.rows, crm, semantic }
   })
 
   // ---- Excel/CSV import & export (tenant-scoped via RLS) ----
@@ -424,7 +458,9 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   // orders + issues within the tenant. Uses app_role + RLS (tenant) + a customer
   // filter (row-level scoping beyond RLS).
   fastify.get('/portal/overview', async (req) => {
-    const customer = req.headers['x-customer']
+    // JWT mode: the verified token's company claim is the only accepted source.
+    // The x-customer header remains for explicit dev mode (compose/preview).
+    const customer = req.auth?.companyId || req.headers['x-customer']
     if (!customer) return { error: 'x-customer header required' }
     const orders = await tenantQuery(req, 'SELECT order_id, grade, mt, fcl, price_usd, status, date FROM records WHERE customer=$1 ORDER BY date DESC', [customer])
     const issues = await tenantQuery(req, 'SELECT ticket_id, category, status, description FROM tickets WHERE customer=$1 ORDER BY created_at DESC', [customer])

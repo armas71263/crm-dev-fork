@@ -136,6 +136,27 @@ export function registerCrmRoutes(fastify, { tenantQuery, writeAudit }) {
     })
   }
 
+  // Dashboard aggregate for the CRM home: one round-trip for KPIs, recent
+  // deals and upcoming tasks.
+  fastify.get('/data/crm/dashboard', async (req) => {
+    const [kpi, recentDeals, upcomingTasks] = await Promise.all([
+      tenantQuery(req, `SELECT
+        (SELECT count(*) FROM companies)::int AS companies,
+        (SELECT count(*) FROM contacts)::int AS contacts,
+        (SELECT count(*) FROM leads WHERE status NOT IN ('won','lost','converted','disqualified','closed'))::int AS open_leads,
+        (SELECT count(*) FROM deals WHERE status='open')::int AS open_deals,
+        (SELECT coalesce(sum(value),0) FROM deals WHERE status='open')::float AS pipeline_value,
+        (SELECT count(*) FROM activities WHERE type='task' AND NOT completed)::int AS open_tasks,
+        (SELECT count(*) FROM activities WHERE type='task' AND NOT completed AND due_at < now())::int AS overdue_tasks`),
+      tenantQuery(req, `SELECT d.id, d.name, d.stage, d.value, d.currency, d.expected_close_date,
+          c.name AS company FROM deals d LEFT JOIN companies c ON c.id = d.company_id
+        ORDER BY d.created_at DESC LIMIT 6`),
+      tenantQuery(req, `SELECT id, subject, type, entity, due_at FROM activities
+        WHERE type='task' AND NOT completed ORDER BY due_at ASC NULLS LAST LIMIT 6`),
+    ])
+    return { kpi: kpi.rows[0], recent_deals: recentDeals.rows, upcoming_tasks: upcomingTasks.rows }
+  })
+
   // ---- Pipeline stages (tenant config) ----
   fastify.get('/data/crm/pipeline', async (req) => {
     const r = await tenantQuery(req,

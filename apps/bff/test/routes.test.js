@@ -519,3 +519,67 @@ test('/ai/* proxies carry x-tenant-id to the AI service and stream SSE through',
     upstream.server.close()
   }
 })
+
+// ---- Customer-role gate (JWT mode): portal-scoped tokens ----
+test('customer-role tokens are 403 from staff/AI/admin routes; portal + company CRM reads stay open', async () => {
+  const auth = { mode: 'jwt', verify: async () => ({ userId: 'u1', tenantId: 'alpha', companyId: 'CEAT', role: 'customer' }) }
+  const data = tenantScoped([[/FROM companies/, [{ id: 1, name: 'CEAT' }]]])
+  const customerPool = tenantScoped([
+    [/FROM companies/, [{ id: 1, name: 'CEAT' }]],
+    [/count\(\*\)::int AS orders/, [{ orders: 1, mt: 10, revenue: 200 }]],
+    [/FROM records WHERE customer=/, [{ order_id: 'ORD-C' }]],
+  ])
+  const app = await buildApp({ pool: data.pool, customerPool: customerPool.pool, adminPool: makeFakePool().pool, aiServiceUrl: 'http://127.0.0.1:9', auth, logger: false })
+  const H = { authorization: 'Bearer x' }
+  assert.equal((await app.inject({ method: 'POST', url: '/ai/chat', headers: H, payload: {} })).statusCode, 403, 'AI proxy must never serve customers — it queries at tenant scope')
+  assert.equal((await app.inject({ method: 'GET', url: '/tenants', headers: H })).statusCode, 403, 'tenant registry is staff/vendor territory')
+  assert.equal((await app.inject({ method: 'GET', url: '/search?q=x', headers: H })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'GET', url: '/data/kpi/chart?dimension=grade&metric=mt', headers: H })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'POST', url: '/data/crm/companies', headers: H, payload: { name: 'X' } })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'GET', url: '/data/crm/pipeline', headers: H })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'GET', url: '/data/crm/companies', headers: H })).statusCode, 200)
+  const portal = await app.inject({ method: 'GET', url: '/portal/overview', headers: H })
+  assert.equal(portal.statusCode, 200)
+  assert.ok(customerPool.calls.some((c) => c.params.includes('CEAT')), 'portal scope must come from the verified token company claim, not a client header')
+  await app.close()
+
+  const staffAuth = { mode: 'jwt', verify: async () => ({ userId: 'u2', tenantId: 'alpha', companyId: null, role: 'staff' }) }
+  const staffApp = await buildApp({ pool: tenantScoped().pool, adminPool: makeFakePool().pool, aiServiceUrl: 'http://127.0.0.1:9', auth: staffAuth, logger: false })
+  assert.equal((await staffApp.inject({ method: 'GET', url: '/search?q=x', headers: { authorization: 'Bearer y' } })).statusCode, 200, 'staff keeps full access')
+  await staffApp.close()
+})
+
+// ---- Chart builder: CRM tables + per-table allowlists ----
+test('GET /data/kpi/chart covers the CRM tables with per-table allowlists', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT stage AS label/, [{ label: 'proposal', value: 120000 }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/kpi/chart?table=deals&dimension=stage&metric=value' })
+  assert.equal(res.statusCode, 200)
+  const body = JSON.parse(res.body)
+  assert.deepEqual(body.labels, ['proposal'])
+  assert.deepEqual(body.values, [120000])
+  const q = data.calls.find((c) => /SELECT stage AS label/.test(c.text))
+  assert.match(q.text, /sum\(value\)::float/)
+  assert.equal((await app.inject({ method: 'GET', url: '/data/kpi/chart?table=deals&dimension=grade&metric=count' })).statusCode, 400, 'grade is not a deals dimension')
+  await app.close()
+})
+
+// ---- Search: CRM sections ----
+test('GET /search includes the CRM collection legs', async () => {
+  const { app } = await makeApp([
+    [/FROM companies/, [{ id: 1, name: 'CEAT', type: 'customer' }]],
+    [/FROM contacts/, [{ id: 1, full_name: 'Priya Sharma' }]],
+    [/FROM leads/, [{ id: 1, name: 'Latex pilot' }]],
+    [/FROM deals/, [{ id: 1, name: 'CEAT Q4' }]],
+    [/FROM activities/, [{ id: 1, subject: 'Send spec sheet' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/search?q=CEAT' })
+  assert.equal(res.statusCode, 200)
+  const body = JSON.parse(res.body)
+  assert.deepEqual(body.crm.companies, [{ id: 1, name: 'CEAT', type: 'customer' }])
+  assert.deepEqual(body.crm.contacts, [{ id: 1, full_name: 'Priya Sharma' }])
+  assert.deepEqual(body.crm.deals, [{ id: 1, name: 'CEAT Q4' }])
+  await app.close()
+})
+

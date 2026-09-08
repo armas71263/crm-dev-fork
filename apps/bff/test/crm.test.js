@@ -254,3 +254,20 @@ test('/data/import rejects non-allowlisted CRM-adjacent types', async () => {
   assert.equal(JSON.parse(bad.body).error, 'unsupported type')
   await app.close()
 })
+
+test('GET /data/crm/dashboard aggregates KPIs, recent deals and upcoming tasks', async () => {
+  const { app } = await makeApp([
+    [/count\(\*\) FROM companies/, [{ companies: 3, contacts: 2, open_leads: 2, open_deals: 1, pipeline_value: 145000, open_tasks: 2, overdue_tasks: 1 }]],
+    [/ORDER BY d\.created_at DESC LIMIT 6/, [{ id: 1, name: 'CEAT Q4 contract', stage: 'proposal', value: 120000, currency: 'USD', expected_close_date: '2026-12-01', company: 'CEAT' }]],
+    [/ORDER BY due_at ASC NULLS LAST LIMIT 6/, [{ id: 1, subject: 'Send spec sheet', type: 'task', entity: 'deal', due_at: '2026-09-09' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/crm/dashboard', headers: H })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.kpi.companies, 3)
+  assert.equal(b.kpi.pipeline_value, 145000)
+  assert.deepEqual(b.recent_deals[0], { id: 1, name: 'CEAT Q4 contract', stage: 'proposal', value: 120000, currency: 'USD', expected_close_date: '2026-12-01', company: 'CEAT' })
+  assert.equal(b.upcoming_tasks.length, 1)
+  await app.close()
+})
+
