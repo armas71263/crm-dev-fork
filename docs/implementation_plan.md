@@ -65,6 +65,8 @@ was explicitly settled with the product owner.
 - **Verify:** isolation tests extended to new tables; Excel round-trip test; new tenant onboarding script end-to-end.
 
 ### Phase 3 — Real Next.js frontend (2–3 weeks)
+> Status (2026-09-08): item 1 done; item 2 partially done — Dashboard (CRM KPIs + pipeline chart), CRM modules incl. Tasks, global Search, AI Assistant (SSE through the same-origin `/api/ai/chat/stream` proxy), Insights, AI usage and the customer Portal are live-verified (`node apps/web/scripts/verify-session.js` ALL PASS vs live Supabase). Remaining: template module screens, Screen-config editor, Theme editor, Users & Invites, vendor Tenants screen, Refine provider, CSP tightening, preview parity + deletion.
+
 1. `apps/web`: supabase-js auth (PKCE, middleware), role-based routing.
 2. Screens: Dashboard (KPI), CRM modules (companies/contacts/leads/deals/activities/tasks), template modules (records/…), global Search, AI Assistant (SSE), Insights, Screen-config editor, Theme editor (tenant-admin), Users & Invites (tenant-admin), Tenants + usage (vendor).
 3. Refine REST data provider against BFF.

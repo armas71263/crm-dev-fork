@@ -21,20 +21,25 @@ export async function bffFetch(path) {
 }
 
 // Map BFF/user role to the nav sections this user should see. Customers get
-// the portal-facing subset; staff see the full CRM.
+// the portal-facing subset; staff see the full CRM + AI surfaces.
 export function sectionsForRole(role) {
   if (role === 'customer') {
     return [
-      { href: '/dashboard', label: 'Overview' },
+      { href: '/portal', label: 'Overview' },
       { href: '/companies', label: 'Our account' },
     ]
   }
   return [
     { href: '/dashboard', label: 'Dashboard' },
+    { href: '/assistant', label: 'Assistant' },
+    { href: '/insights', label: 'Insights' },
+    { href: '/search', label: 'Search' },
     { href: '/companies', label: 'Companies' },
     { href: '/contacts', label: 'Contacts' },
     { href: '/leads', label: 'Leads' },
     { href: '/deals', label: 'Deals' },
     { href: '/activities', label: 'Activities' },
+    { href: '/tasks', label: 'Tasks' },
+    { href: '/usage', label: 'AI usage' },
   ]
 }

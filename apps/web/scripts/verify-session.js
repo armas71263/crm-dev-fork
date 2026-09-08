@@ -2,8 +2,10 @@
 //   1. Real Supabase password login using the app's own @supabase/ssr client
 //      (custom cookie adapter captures exactly what the browser would set).
 //   2. Replay that cookie against the running Next.js server for every
-//      protected route and assert the SSR HTML contains live data.
-//   3. Assert the middleware redirect (no cookie -> /login).
+//      protected route and assert the SSR HTML renders live data.
+//   3. Stream one AI assistant turn through the same-origin SSE proxy and
+//      assert the full event protocol (start → tool → token → done).
+//   4. Assert the middleware redirect (no cookie -> /login).
 // Usage: node scripts/verify-session.js [email] [password]
 // Env: NEXT_PUBLIC_SUPABASE_URL/_ANON_KEY (read from .env.local if unset),
 //      APP_URL (default http://127.0.0.1:3000)
@@ -53,12 +55,22 @@ console.log(`PASS auth: signed in as ${data.user.email}`)
 const cookie = [...jar].map(([n, v]) => `${n}=${v}`).join('; ')
 
 const routes = [
-  '/dashboard', '/companies', '/contacts', '/leads', '/deals', '/activities',
+  { path: '/dashboard', marker: 'Dashboard' },
+  { path: '/companies', marker: 'Companies' },
+  { path: '/contacts', marker: 'Contacts' },
+  { path: '/leads', marker: 'Leads' },
+  { path: '/deals', marker: 'Deals' },
+  { path: '/activities', marker: 'Activities' },
+  { path: '/tasks', marker: 'Tasks' },
+  { path: '/search?q=CEAT', marker: 'CEAT' }, // CRM results must actually render
+  { path: '/assistant', marker: 'Assistant' },
+  { path: '/insights', marker: 'Insights' },
+  { path: '/usage', marker: 'AI usage' },
 ]
 
 let failed = 0
 for (const route of routes) {
-  const res = await fetch(`${appUrl}${route}`, {
+  const res = await fetch(`${appUrl}${route.path}`, {
     headers: { cookie },
     redirect: 'manual',
   })
@@ -66,11 +78,37 @@ for (const route of routes) {
   const body = html.replace(/<script[\s\S]*?<\/script>/g, '').replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
   const rows = (html.match(/<tr[\s>]/g) || []).length
-  const ok = res.status === 200 && rows > 0 && body.includes('Dashboard') === false ? false : true
-  const status = res.status === 200 && rows > 0 ? 'PASS' : 'FAIL'
-  if (status === 'FAIL') failed++
-  console.log(`${status} ${route}: HTTP ${res.status}, ${rows} table rows, ${body.length} chars text`)
+  const ok = res.status === 200 && body.includes(route.marker)
+  if (!ok) failed++
+  console.log(`${ok ? 'PASS' : 'FAIL'} ${route.path}: HTTP ${res.status}, ${rows} table rows, marker "${route.marker}" ${ok ? 'found' : 'MISSING'}`)
   console.log(`      sample: ${body.slice(0, 160)}`)
+}
+
+// One real AI assistant turn through the same-origin SSE proxy.
+{
+  const res = await fetch(`${appUrl}/api/ai/chat/stream`, {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ message: 'pipeline overview', session_id: 'verify-' + Date.now() }),
+    signal: AbortSignal.timeout(30000),
+  })
+  const ct = res.headers.get('content-type') || ''
+  let ok = res.status === 200 && /text\/event-stream/.test(ct)
+  let detail = `HTTP ${res.status}, ${ct}`
+  if (ok) {
+    const body = await res.text()
+    const need = ['event: start', '"name":"get_crm_kpi"', 'event: token', 'event: done']
+    const missing = need.filter((n) => !body.includes(n))
+    if (missing.length) {
+      ok = false
+      detail = `missing frames: ${missing.join(', ')}; got ${body.slice(0, 200)}`
+    } else {
+      const done = body.match(/event: done\ndata: (.+)/)
+      detail = `full SSE protocol OK — ${done ? done[1].slice(0, 140) : ''}`
+    }
+  }
+  if (!ok) failed++
+  console.log(`${ok ? 'PASS' : 'FAIL'} /api/ai/chat/stream: ${detail}`)
 }
 
 // Middleware: unauthenticated request must redirect to /login.

@@ -1,16 +1,25 @@
 import { bffFetch } from '../../../src/lib/bff.js'
 import StatusDot from '../../../components/StatusDot.jsx'
+import BarChart from '../../../components/BarChart.jsx'
 
-const ORDER_TONES = { Open: 'green', 'In Production': 'amber', Shipped: 'amber', Delivered: 'gray' }
+const usd = (n) => '$' + Math.round(Number(n) || 0).toLocaleString('en-US')
+const date = (d) => (d ? String(d).slice(0, 10) : '—')
+
+const STAGE_TONES = { won: 'green', lost: 'red' }
 
 export default async function DashboardPage() {
-  const data = await bffFetch('/data/dashboard')
+  const [data, pipeline] = await Promise.all([
+    bffFetch('/data/crm/dashboard'),
+    bffFetch('/data/kpi/chart?table=deals&dimension=stage&metric=value'),
+  ])
+  const k = data.kpi
   const kpis = [
-    ['Open orders', data.kpi.open_orders],
-    ['Active volume', `${data.kpi.active_mt} MT`],
-    ['Suppliers', data.kpi.suppliers],
-    ['Customers', data.kpi.customers],
-    ['Open issues', data.kpi.open_issues],
+    ['Companies', k.companies],
+    ['Contacts', k.contacts],
+    ['Open leads', k.open_leads],
+    ['Open deals', k.open_deals],
+    ['Pipeline value', usd(k.pipeline_value)],
+    ['Open tasks', `${k.open_tasks}${k.overdue_tasks ? ` (${k.overdue_tasks} overdue)` : ''}`],
   ]
 
   return (
@@ -20,7 +29,7 @@ export default async function DashboardPage() {
         <p className="text-[14px] text-steel mt-1">Live view of your workspace.</p>
       </header>
 
-      <div className="kpi-strip grid grid-cols-2 md:grid-cols-5">
+      <div className="kpi-strip grid grid-cols-2 md:grid-cols-6">
         {kpis.map(([label, value]) => (
           <div key={label} className="kpi-cell">
             <div className="text-[13px] text-steel">{label}</div>
@@ -30,57 +39,59 @@ export default async function DashboardPage() {
       </div>
 
       <section className="grid lg:grid-cols-3 gap-8">
-        <div className="lg:col-span-2">
-          <h2 className="text-[15px] font-semibold mb-3">Recent orders</h2>
-          <div className="border border-line bg-white overflow-x-auto">
-            <table className="w-full datatable border-collapse">
-              <thead>
-                <tr>
-                  <th>Order</th><th>Customer</th><th>Grade</th>
-                  <th className="text-right">MT</th><th className="text-right">USD/t</th><th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.orders.slice(0, 6).map((o) => (
-                  <tr key={o.order_id}>
-                    <td>{o.order_id}</td>
-                    <td>{o.customer}</td>
-                    <td>{o.grade}</td>
-                    <td className="text-right">{o.mt}</td>
-                    <td className="text-right">{o.price_usd}</td>
-                    <td><StatusDot status={o.status} tone={ORDER_TONES[o.status] || 'gray'} /></td>
+        <div className="lg:col-span-2 space-y-8">
+          <div className="border border-line bg-white p-5">
+            <h2 className="text-[15px] font-semibold mb-4">Open pipeline by stage</h2>
+            <BarChart labels={pipeline.labels} values={pipeline.values} unit="$" />
+          </div>
+          <div>
+            <h2 className="text-[15px] font-semibold mb-3">Recent deals</h2>
+            <div className="border border-line bg-white overflow-x-auto">
+              <table className="w-full datatable border-collapse">
+                <thead>
+                  <tr>
+                    <th>Deal</th><th>Company</th><th>Stage</th>
+                    <th className="text-right">Value</th><th>Expected close</th><th>Status</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {data.recent_deals.map((d) => (
+                    <tr key={d.id}>
+                      <td>{d.name}</td>
+                      <td>{d.company || '—'}</td>
+                      <td>{d.stage}</td>
+                      <td className="text-right">{d.value != null ? usd(d.value) : '—'} {d.currency || ''}</td>
+                      <td>{date(d.expected_close_date)}</td>
+                      <td><StatusDot status={d.status} tone={STAGE_TONES[d.stage] || 'gray'} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
 
         <div className="space-y-8">
           <div>
-            <h2 className="text-[15px] font-semibold mb-3">Open issues</h2>
+            <h2 className="text-[15px] font-semibold mb-3">Upcoming tasks</h2>
             <div className="border border-line bg-white divide-y divide-line">
-              {data.issues.length === 0 && (
-                <div className="px-4 py-3 text-[14px] text-steel">No open issues.</div>
+              {data.upcoming_tasks.length === 0 && (
+                <div className="px-4 py-3 text-[14px] text-steel">No open tasks.</div>
               )}
-              {data.issues.map((i) => (
-                <div key={i.ticket_id} className="px-4 py-3">
-                  <div className="text-[14px] font-medium">{i.category}</div>
-                  <div className="text-[13px] text-steel truncate">{i.description}</div>
+              {data.upcoming_tasks.map((t) => (
+                <div key={t.id} className="px-4 py-3">
+                  <div className="text-[14px] font-medium">{t.subject}</div>
+                  <div className="text-[13px] text-steel">{t.entity} · due {date(t.due_at)}</div>
                 </div>
               ))}
             </div>
           </div>
-          <div>
-            <h2 className="text-[15px] font-semibold mb-3">News</h2>
-            <div className="border border-line bg-white divide-y divide-line">
-              {data.feed.slice(0, 4).map((f, idx) => (
-                <div key={idx} className="px-4 py-3">
-                  <div className="text-[14px] font-medium">{f.title}</div>
-                  <div className="text-[13px] text-steel">{f.category}</div>
-                </div>
-              ))}
-            </div>
+          <div className="border border-line bg-white p-5">
+            <h2 className="text-[15px] font-semibold mb-2">Ask the assistant</h2>
+            <p className="text-[13px] text-steel">
+              Chat with your CRM data — pipeline, companies, tasks, charts.{' '}
+              <a href="/assistant" className="text-leaf font-medium hover:text-leaf-deep">Open assistant →</a>
+            </p>
           </div>
         </div>
       </section>
