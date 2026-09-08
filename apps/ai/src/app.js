@@ -113,6 +113,9 @@ export function detectChartIntent(message, session = null) {
   else if (/by category|per category|category.*(breakdown|chart)/i.test(m)) dimension = 'category'
   else if (/over time|by month|per month|monthly|trend/i.test(m)) dimension = 'month'
   else if (/by type|per type|type.*(breakdown|chart)/i.test(m)) dimension = 'type'
+  else if (/by stage|stage.*(breakdown|chart)|pipeline.*(breakdown|chart)|by pipeline/i.test(m)) dimension = 'stage'
+  else if (/by compan(y|ies)|per company|account.*(breakdown|chart)|by account/i.test(m)) dimension = 'company'
+  else if (/by source|per source|source.*(breakdown|chart)/i.test(m)) dimension = 'source'
   if (/mt|volume|tonnage/i.test(m)) metric = 'mt'
   else if (/revenue|value|sales|money|\$/i.test(m)) metric = 'revenue'
   else if (/fcl|container/i.test(m)) metric = 'fcl'
@@ -121,20 +124,49 @@ export function detectChartIntent(message, session = null) {
 
 // Planner: keyword route the message to the right tool(s) — works with the local
 // provider. With a real provider this is an LLM tool-call loop.
-export function plan(message) {
+// CRM tools cover the generic schema (companies/contacts/leads/deals/activities)
+// and always run; the rubber-vertical tools run only for tenants that actually
+// hold vertical rows (`vertical` flag, set by the routes via hasVerticalData).
+const CRM_WORDS = /(deal|pipeline|lead|compan(y|ies)|contact|account|task|activit|meeting|note|call|prospect)/
+const CRM_OVERVIEW = /(overview|summary|how many|count|kpi|status|total|metric|pipeline|dashboard)/
+export function plan(message, { crm = true, vertical = true } = {}) {
   const m = message.toLowerCase()
   const calls = []
-  if (/(issue|quality|problem|defect|moisture|spec|document|shipment)/.test(m)) calls.push({ name: 'get_issues', args: {} })
-  if (/(order|buy|sell|tsr|rss|latex|grade|mt|ton|ship|deliver|customer|supplier)/.test(m)) calls.push({ name: 'search_records', args: { q: message } })
-  if (/(party|supplier|customer|contact|who|name)/.test(m)) calls.push({ name: 'get_party', args: { q: message } })
-  if (/(overview|summary|how many|count|kpi|status|total|metric)/.test(m) || !calls.length) calls.push({ name: 'get_kpi', args: {} })
+  if (crm) {
+    if (CRM_WORDS.test(m)) calls.push({ name: 'search_crm', args: { q: message } })
+    if (CRM_OVERVIEW.test(m)) calls.push({ name: 'get_crm_kpi', args: {} })
+  }
+  if (vertical) {
+    if (/(issue|quality|problem|defect|moisture|spec|document|shipment)/.test(m)) calls.push({ name: 'get_issues', args: {} })
+    if (/(order|buy|sell|tsr|rss|latex|grade|mt|ton|ship|deliver|customer|supplier)/.test(m)) calls.push({ name: 'search_records', args: { q: message } })
+    if (/(party|supplier|customer|contact|who|name)/.test(m)) calls.push({ name: 'get_party', args: { q: message } })
+    if (CRM_OVERVIEW.test(m)) calls.push({ name: 'get_kpi', args: {} })
+  }
+  if (!calls.length) calls.push(crm ? { name: 'get_crm_kpi', args: {} } : { name: 'get_kpi', args: {} })
   return calls
 }
+
+// Dimensions only the CRM chart tool can answer; everything else falls to the
+// vertical suggest_chart. Used by the chat routes to pick the chart tool.
+export const CRM_CHART_DIMS = new Set(['stage', 'company', 'source'])
 
 export async function buildApp({ pool, logger = true }) {
   const fastify = Fastify({ logger })
   const tenantQuery = makeTenantQuery(pool)
   const getSession = makeSessions()
+
+  // Vertical (rubber-trading) data is template-specific; the CRM schema is
+  // universal. Vertical tools run only for tenants whose vertical tables
+  // actually hold rows — an RLS-scoped presence probe, cached briefly.
+  const VERTICAL_CACHE = new Map()
+  const hasVerticalData = async (tenantId) => {
+    const hit = VERTICAL_CACHE.get(tenantId)
+    if (hit && Date.now() - hit.ts < 60000) return hit.has
+    let has = false
+    try { has = (await tenantQuery(tenantId, 'SELECT 1 FROM records LIMIT 1')).rows.length > 0 } catch { has = false }
+    VERTICAL_CACHE.set(tenantId, { ts: Date.now(), has })
+    return has
+  }
 
   // Usage logging — every AI call is accounted per tenant. Failures are logged
   // and swallowed so an accounting hiccup never breaks a chat reply.
@@ -186,6 +218,49 @@ export async function buildApp({ pool, logger = true }) {
         `SELECT ${dim} AS label, ${met}::float AS value FROM records ${where} GROUP BY 1 ORDER BY ${dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 20`, params)
       return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) } }
     },
+
+    // ---- Generic CRM tools (companies/contacts/leads/deals/activities) ----
+    search_crm: async (tenantId, { q }) => {
+      const like = `%${q}%`
+      const r = await tenantQuery(tenantId, `
+        SELECT * FROM (
+          (SELECT 'company' AS kind, name::text AS label, coalesce(type,'') AS detail FROM companies WHERE name ILIKE $1 OR coalesce(industry,'') ILIKE $1 LIMIT 3)
+          UNION ALL (SELECT 'contact', full_name, coalesce(title,'') FROM contacts WHERE full_name ILIKE $1 OR coalesce(email,'') ILIKE $1 LIMIT 3)
+          UNION ALL (SELECT 'lead', name, coalesce(company_name,'') FROM leads WHERE name ILIKE $1 OR coalesce(company_name,'') ILIKE $1 LIMIT 3)
+          UNION ALL (SELECT 'deal', name, coalesce(stage,'') FROM deals WHERE name ILIKE $1 LIMIT 3)
+          UNION ALL (SELECT 'activity', subject, coalesce(type,'') FROM activities WHERE subject ILIKE $1 OR coalesce(detail,'') ILIKE $1 LIMIT 3)
+        ) sub LIMIT 9`, [like])
+      return r.rows
+    },
+    get_crm_kpi: async (tenantId) => {
+      const r = await tenantQuery(tenantId, `SELECT
+        (SELECT count(*) FROM companies)::int AS companies,
+        (SELECT count(*) FROM contacts)::int AS contacts,
+        (SELECT count(*) FROM leads WHERE status NOT IN ('won','lost','converted','disqualified','closed'))::int AS open_leads,
+        (SELECT count(*) FROM deals WHERE status='open')::int AS open_deals,
+        (SELECT coalesce(sum(value),0) FROM deals WHERE status='open')::float AS pipeline_value,
+        (SELECT count(*) FROM activities WHERE type='task' AND NOT completed)::int AS open_tasks,
+        (SELECT count(*) FROM activities WHERE type='task' AND NOT completed AND due_at < now())::int AS overdue_tasks`)
+      return r.rows[0]
+    },
+    // suggest_crm_chart: aggregates the generic CRM and returns a chart spec.
+    suggest_crm_chart: async (tenantId, { dimension, metric = 'count', title, filter }) => {
+      const SPECS = {
+        stage: { from: 'deals', dim: 'stage' },
+        company: { from: 'deals d JOIN companies c ON c.id = d.company_id', dim: 'c.name' },
+        source: { from: 'leads', dim: `coalesce(source,'n/a')` },
+        status: { from: 'leads', dim: 'status' },
+        type: { from: 'activities', dim: 'type' },
+        month: { from: 'deals', dim: "to_char(date_trunc('month', coalesce(expected_close_date, created_at)), 'YYYY-MM')" },
+      }
+      const spec = SPECS[dimension] || SPECS.stage
+      const met = metric === 'value' || metric === 'revenue' ? 'sum(value)' : metric === 'avg_value' || metric === 'avg_price' ? 'avg(value)' : 'count(*)'
+      let where = '', params = []
+      if (filter) { where = `WHERE ${spec.dim} ILIKE $1`; params = [`%${filter}%`] }
+      const r = await tenantQuery(tenantId,
+        `SELECT ${spec.dim} AS label, ${met}::float AS value FROM ${spec.from} ${where} GROUP BY 1 ORDER BY ${dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 20`, params)
+      return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) } }
+    },
   }
 
   // Reindex a tenant's knowledge base into the embeddings table.
@@ -208,6 +283,21 @@ export async function buildApp({ pool, logger = true }) {
               type||' '||name||' contact '||coalesce(contact->>'name', contact::text, 'n/a') AS text
        FROM parties`)
     sources.push(...parties.rows)
+
+    // Generic CRM entities — indexed for every tenant (the product's core data).
+    const crmSources = await Promise.all([
+      tenantQuery(tenantId, `SELECT name AS id, 'company' AS type,
+              'Company '||name||' ('||type||coalesce(', '||industry,'')||')' AS text FROM companies`),
+      tenantQuery(tenantId, `SELECT full_name AS id, 'contact' AS type,
+              'Contact '||full_name||coalesce(', '||title,'') AS text FROM contacts`),
+      tenantQuery(tenantId, `SELECT name AS id, 'lead' AS type,
+              'Lead '||name||' for '||coalesce(company_name,'n/a')||' worth $'||coalesce(value,0) AS text FROM leads`),
+      tenantQuery(tenantId, `SELECT name AS id, 'deal' AS type,
+              'Deal '||name||' at stage '||stage||' worth $'||coalesce(value,0) AS text FROM deals`),
+      tenantQuery(tenantId, `SELECT subject AS id, 'activity' AS type,
+              initcap(type)||': '||subject||coalesce(' — '||left(detail,120),'') AS text FROM activities`),
+    ])
+    for (const q of crmSources) sources.push(...q.rows)
 
     await tenantQuery(tenantId, 'DELETE FROM embeddings')
     let indexed = 0
@@ -234,8 +324,10 @@ export async function buildApp({ pool, logger = true }) {
     const provider = pickProvider(tenantId)
     const session = getSession(tenantId, session_id)
 
-    // 1) Plan which tools to run. Multi-turn: prepend recent history to context.
-    const toolCalls = plan(message)
+    // 1) Plan which tools to run. CRM tools always; vertical tools only when
+    // the tenant has vertical rows. Multi-turn: prepend recent history to context.
+    const vertical = await hasVerticalData(tenantId)
+    const toolCalls = plan(message, { vertical })
     const observations = []
     for (const tc of toolCalls) {
       const obs = await TOOLS[tc.name](tenantId, tc.args)
@@ -249,10 +341,11 @@ export async function buildApp({ pool, logger = true }) {
       // Multi-turn: if no explicit filter but a previous chart had one, carry it over.
       if (!chartIntent.filter && session.lastChart?.filter) chartIntent.filter = session.lastChart.filter
       if (!chartIntent.dimension && session.lastChart?.dimension) chartIntent.dimension = session.lastChart.dimension
-      const res = await TOOLS.suggest_chart(tenantId, chartIntent)
+      const chartTool = (CRM_CHART_DIMS.has(chartIntent.dimension) || !vertical) ? 'suggest_crm_chart' : 'suggest_chart'
+      const res = await TOOLS[chartTool](tenantId, chartIntent)
       chart = res.chart
       session.lastChart = { ...chartIntent, spec: chart }
-      observations.push({ tool: 'suggest_chart', result: chart })
+      observations.push({ tool: chartTool, result: chart })
     }
 
     // 3) Semantic retrieval from the knowledge base.
@@ -270,13 +363,17 @@ export async function buildApp({ pool, logger = true }) {
     for (const o of observations) {
       if (o.tool === 'search_records' && o.result.length) {
         lines.push(...o.result.map((r) => `• ${r.order_id}: ${r.customer} ${r.grade} ${r.mt}MT from ${r.supplier} (${r.status})`))
+      } else if (o.tool === 'search_crm' && o.result.length) {
+        lines.push(...o.result.map((r) => `• ${r.kind}: ${r.label}${r.detail ? ' — ' + r.detail : ''}`))
+      } else if (o.tool === 'get_crm_kpi' && o.result) {
+        lines.push(`• CRM: ${o.result.companies} companies, ${o.result.contacts} contacts, ${o.result.open_leads} open leads, ${o.result.open_deals} open deals ($${Math.round(o.result.pipeline_value).toLocaleString('en-US')} pipeline), ${o.result.open_tasks} open tasks (${o.result.overdue_tasks} overdue)`)
       } else if (o.tool === 'get_kpi' && o.result) {
         lines.push(`• KPIs: ${o.result.open_orders} open orders, ${o.result.active_mt} active MT, ${o.result.suppliers} suppliers, ${o.result.customers} customers`)
       } else if (o.tool === 'get_issues' && o.result.length) {
         lines.push(...o.result.map((i) => `• ${i.ticket_id} [${i.category}] ${i.description} (${i.status})`))
       } else if (o.tool === 'get_party' && o.result.length) {
         lines.push(...o.result.map((p) => `• ${p.name} (${p.type})`))
-      } else if (o.tool === 'suggest_chart' && o.result.labels?.length) {
+      } else if (o.tool.startsWith('suggest_') && o.result?.labels?.length) {
         lines.push(`• Chart ready: ${o.result.title} (${o.result.labels.length} bars) — rendered below.`)
       }
     }
@@ -339,7 +436,9 @@ export async function buildApp({ pool, logger = true }) {
     send('start', { request_id: requestId, provider: provider.name })
 
     // Plan + run tools, streaming each tool observation as it completes.
-    const toolCalls = plan(message)
+    // CRM tools always; vertical tools only when the tenant has vertical rows.
+    const vertical = await hasVerticalData(tenantId)
+    const toolCalls = plan(message, { vertical })
     const observations = []
     for (const tc of toolCalls) {
       send('tool', { name: tc.name })
@@ -354,8 +453,9 @@ export async function buildApp({ pool, logger = true }) {
     if (chartIntent) {
       if (!chartIntent.filter && session.lastChart?.filter) chartIntent.filter = session.lastChart.filter
       if (!chartIntent.dimension && session.lastChart?.dimension) chartIntent.dimension = session.lastChart.dimension
-      send('tool', { name: 'suggest_chart' })
-      const res = await TOOLS.suggest_chart(tenantId, chartIntent)
+      const chartTool = (CRM_CHART_DIMS.has(chartIntent.dimension) || !vertical) ? 'suggest_crm_chart' : 'suggest_chart'
+      send('tool', { name: chartTool })
+      const res = await TOOLS[chartTool](tenantId, chartIntent)
       chart = res.chart
       session.lastChart = { ...chartIntent, spec: chart }
       send('chart', chart)
@@ -373,6 +473,8 @@ export async function buildApp({ pool, logger = true }) {
     const lines = []
     for (const o of observations) {
       if (o.tool === 'search_records' && o.result.length) lines.push(...o.result.map((r) => `${r.order_id}: ${r.customer} ${r.grade} ${r.mt}MT (${r.status})`))
+      else if (o.tool === 'search_crm' && o.result.length) lines.push(...o.result.map((r) => `${r.kind}: ${r.label}${r.detail ? ' — ' + r.detail : ''}`))
+      else if (o.tool === 'get_crm_kpi' && o.result) lines.push(`CRM: ${o.result.companies} companies, ${o.result.contacts} contacts, ${o.result.open_leads} open leads, ${o.result.open_deals} open deals ($${Math.round(o.result.pipeline_value).toLocaleString('en-US')} pipeline), ${o.result.open_tasks} open tasks (${o.result.overdue_tasks} overdue)`)
       else if (o.tool === 'get_kpi' && o.result) lines.push(`KPIs: ${o.result.open_orders} orders, ${o.result.active_mt} MT, ${o.result.suppliers} suppliers`)
       else if (o.tool === 'get_issues' && o.result.length) lines.push(...o.result.map((i) => `${i.ticket_id} [${i.category}] ${i.description}`))
       else if (o.tool === 'get_party' && o.result.length) lines.push(...o.result.map((p) => `${p.name} (${p.type})`))
@@ -416,25 +518,57 @@ export async function buildApp({ pool, logger = true }) {
   })
 
   // ---- Insights generator — computes and stores a snapshot ----
-  async function computeInsights(tenantId) {
-    const [topCust, topGrade, issueMix, trend, totals] = await Promise.all([
+  // CRM insights cover every tenant (the core schema); the rubber-vertical
+  // lines are appended only when the tenant actually holds vertical rows.
+  async function computeInsights(tenantId, vertical) {
+    const [totals, topPipeline, byStage, bySource, tasks, months] = await Promise.all([
+      tenantQuery(tenantId, `SELECT
+        (SELECT count(*) FROM companies)::int AS companies, (SELECT count(*) FROM contacts)::int AS contacts,
+        (SELECT count(*) FROM leads)::int AS leads, (SELECT count(*) FROM deals)::int AS deals,
+        (SELECT coalesce(sum(value),0) FROM deals)::float AS pipeline`),
+      tenantQuery(tenantId, `SELECT c.name AS name, coalesce(sum(d.value),0)::float AS v
+        FROM deals d JOIN companies c ON c.id = d.company_id WHERE d.status='open'
+        GROUP BY 1 ORDER BY v DESC LIMIT 1`),
+      tenantQuery(tenantId, `SELECT stage, count(*)::int AS n, coalesce(sum(value),0)::float AS v
+        FROM deals WHERE status='open' GROUP BY stage ORDER BY v DESC LIMIT 5`),
+      tenantQuery(tenantId, `SELECT source, count(*)::int AS n FROM leads
+        GROUP BY source ORDER BY n DESC LIMIT 3`),
+      tenantQuery(tenantId, `SELECT count(*) FILTER (WHERE NOT completed)::int AS open_tasks,
+        count(*) FILTER (WHERE NOT completed AND due_at < now())::int AS overdue
+        FROM activities WHERE type='task'`),
+      tenantQuery(tenantId, `SELECT to_char(date_trunc('month', coalesce(expected_close_date, created_at)),'YYYY-MM') AS m,
+        coalesce(sum(value),0)::float AS v FROM deals GROUP BY 1 ORDER BY 1`),
+    ])
+    const usd = (x) => `$${Math.round(x).toLocaleString('en-US')}`
+    const crm = [
+      `CRM: ${totals.rows[0].companies} companies, ${totals.rows[0].contacts} contacts, ${totals.rows[0].leads} leads, ${totals.rows[0].deals} deals (${usd(totals.rows[0].pipeline)} total pipeline).`,
+      `Top open pipeline: ${topPipeline.rows[0]?.name || 'n/a'} (${usd(topPipeline.rows[0]?.v || 0)}).`,
+      `Open pipeline by stage: ${byStage.rows.map((r) => `${r.stage}=${usd(r.v)} (${r.n})`).join(', ') || 'none'}.`,
+      `Leads by source: ${bySource.rows.map((r) => `${r.source}=${r.n}`).join(', ') || 'none'}.`,
+      `Tasks: ${tasks.rows[0].open_tasks} open, ${tasks.rows[0].overdue} overdue.`,
+      `Expected deal value by month: ${months.rows.map((r) => `${r.m}=${usd(r.v)}`).join(' → ') || 'n/a'}.`,
+    ]
+    if (!vertical) return crm
+
+    const [topCust, topGrade, issueMix, trend, vTotals] = await Promise.all([
       tenantQuery(tenantId, `SELECT customer, sum(mt)::float AS mt FROM records GROUP BY customer ORDER BY mt DESC LIMIT 3`),
       tenantQuery(tenantId, `SELECT grade, sum(mt)::float AS mt FROM records GROUP BY grade ORDER BY mt DESC LIMIT 3`),
       tenantQuery(tenantId, `SELECT category, count(*)::int AS n FROM tickets GROUP BY category ORDER BY n DESC`),
       tenantQuery(tenantId, `SELECT to_char(date_trunc('month', date),'YYYY-MM') AS m, sum(mt)::float AS mt FROM records GROUP BY 1 ORDER BY 1`),
       tenantQuery(tenantId, `SELECT count(*)::int AS orders, coalesce(sum(mt),0)::float AS mt, coalesce(sum(mt*price_usd),0)::float AS revenue FROM records`),
     ])
-    return [
+    return [...crm,
       `Top customer by volume: ${topCust.rows[0]?.customer || 'n/a'} (${topCust.rows[0]?.mt || 0} MT).`,
       `Top grade: ${topGrade.rows[0]?.grade || 'n/a'} (${topGrade.rows[0]?.mt || 0} MT).`,
       `Open issues by category: ${issueMix.rows.map((r) => `${r.category}=${r.n}`).join(', ') || 'none'}.`,
       `Monthly volume trend: ${trend.rows.map((r) => `${r.m}=${r.mt}MT`).join(' → ') || 'n/a'}.`,
-      `Totals: ${totals.rows[0].orders} orders, ${totals.rows[0].mt} MT, $${(totals.rows[0].revenue / 1e6).toFixed(2)}M revenue.`,
+      `Totals: ${vTotals.rows[0].orders} orders, ${vTotals.rows[0].mt} MT, $${(vTotals.rows[0].revenue / 1e6).toFixed(2)}M revenue.`,
     ]
   }
 
   async function storeSnapshot(tenantId, provider) {
-    const insights = await computeInsights(tenantId)
+    const vertical = await hasVerticalData(tenantId)
+    const insights = await computeInsights(tenantId, vertical)
     await tenantQuery(tenantId,
       `INSERT INTO insights_snapshots (tenant_id, insights, provider) VALUES (app.current_tenant(), $1::jsonb, $2)`,
       [JSON.stringify(insights), provider])

@@ -107,8 +107,11 @@ test('embed is safe for empty and non-ASCII input', () => {
 test('plan routes messages to the right tools', () => {
   assert.deepEqual(plan('moisture issue on the order from a TSR-20 supplier').map((c) => c.name), ['get_issues', 'search_records', 'get_party'])
   assert.deepEqual(plan('who is our latex supplier').map((c) => c.name), ['search_records', 'get_party'])
-  assert.deepEqual(plan('show me the overview').map((c) => c.name), ['get_kpi'])
-  assert.deepEqual(plan('table tennis').map((c) => c.name), ['get_kpi'], 'unmatched text falls back to get_kpi')
+  assert.deepEqual(plan('show me the overview').map((c) => c.name), ['get_crm_kpi', 'get_kpi'])
+  assert.deepEqual(plan('table tennis').map((c) => c.name), ['get_crm_kpi'], 'unmatched text falls back to the CRM KPI tool')
+  assert.deepEqual(plan('how is the CEAT deal going', { vertical: false }).map((c) => c.name), ['search_crm'])
+  assert.deepEqual(plan('deals pipeline overview', { vertical: false }).map((c) => c.name), ['search_crm', 'get_crm_kpi'])
+  assert.deepEqual(plan('moisture issue on the order from a TSR-20 supplier', { vertical: false }).map((c) => c.name), ['get_crm_kpi'], 'vertical questions degrade to the CRM fallback without vertical data')
 })
 
 // ---- Chart intent detection ----
@@ -143,7 +146,8 @@ test('POST /chat rejects missing tenant or message', async () => {
 
 test('POST /chat answers from the local provider using tool observations and logs usage', async () => {
   const { app, fake } = await makeApp([
-    [/count\(\*\)::int AS open_orders/, [{ open_orders: 3, active_mt: 120.5, suppliers: 2, customers: 4 }]],
+    [/SELECT 1 FROM records LIMIT 1/, []],
+    [/count\(\*\) FROM companies/, [{ companies: 3, contacts: 5, open_leads: 2, open_deals: 1, pipeline_value: 145000, open_tasks: 2, overdue_tasks: 1 }]],
     [/FROM embeddings/, [{ source_type: 'record', source_id: 'ORD-1', text: 'Order ORD-1', score: 0.5 }]],
   ])
   const res = await app.inject({
@@ -154,8 +158,9 @@ test('POST /chat answers from the local provider using tool observations and log
   })
   assert.equal(res.statusCode, 200)
   const b = JSON.parse(res.body)
-  assert.match(b.reply, /3 open orders/)
-  assert.deepEqual(b.tools, ['get_kpi'])
+  assert.match(b.reply, /CRM: 3 companies, 5 contacts, 2 open leads, 1 open deals \(\$145,000 pipeline\), 2 open tasks \(1 overdue\)/)
+  assert.match(b.reply, /\[record ORD-1\] Order ORD-1/)
+  assert.deepEqual(b.tools, ['get_crm_kpi'])
   assert.equal(b.chart, null)
   assert.equal(b.usage.provider, 'local')
   assert.equal(b.usage.tokens_out, b.reply.length)
@@ -167,6 +172,7 @@ test('POST /chat answers from the local provider using tool observations and log
 
 test('POST /chat builds and refines charts across turns (multi-turn session)', async () => {
   const { app, fake } = await makeApp([
+    [/SELECT 1 FROM records LIMIT 1/, [{ one: 1 }]],
     [/SELECT grade AS label/, [
       { label: 'TSR-20', value: 10 },
       { label: 'SMR-20', value: 5 },
@@ -199,7 +205,8 @@ test('POST /chat builds and refines charts across turns (multi-turn session)', a
 
 test('POST /chat survives usage-log failures (accounting must not break replies)', async () => {
   const { app } = await makeApp([
-    [/count\(\*\)::int AS open_orders/, [{ open_orders: 1, active_mt: 1, suppliers: 1, customers: 1 }]],
+    [/SELECT 1 FROM records LIMIT 1/, []],
+    [/count\(\*\) FROM companies/, [{ companies: 1, contacts: 1, open_leads: 1, open_deals: 1, pipeline_value: 1, open_tasks: 1, overdue_tasks: 0 }]],
     [/INSERT INTO ai_usage_logs/, [], 'usage table down'],
   ])
   const res = await app.inject({
@@ -209,7 +216,7 @@ test('POST /chat survives usage-log failures (accounting must not break replies)
     payload: { message: 'overview please' },
   })
   assert.equal(res.statusCode, 200)
-  assert.match(JSON.parse(res.body).reply, /1 open orders/)
+  assert.match(JSON.parse(res.body).reply, /CRM: 1 companies/)
   await app.close()
 })
 
@@ -219,13 +226,15 @@ test('POST /index embeds every record/ticket/party row in the tenant', async () 
     [/FROM records/, [{ id: 'ORD-1', type: 'record', text: 'Order ORD-1' }, { id: 'ORD-2', type: 'record', text: 'Order ORD-2' }]],
     [/FROM tickets/, [{ id: 'T-1', type: 'ticket', text: 'Ticket T-1' }]],
     [/FROM parties/, [{ id: 'BKT', type: 'party', text: 'supplier BKT contact X' }]],
+    [/FROM companies/, [{ id: 'CEAT', type: 'company', text: 'Company CEAT (customer, Tire manufacturing)' }]],
   ])
   const res = await app.inject({ method: 'POST', url: '/index', headers: { 'x-tenant-id': 'alpha' } })
   assert.equal(res.statusCode, 200)
-  assert.deepEqual(JSON.parse(res.body), { tenant: 'alpha', indexed: 4 })
+  assert.deepEqual(JSON.parse(res.body), { tenant: 'alpha', indexed: 5 })
   assert.ok(fake.calls.some((c) => c.text === 'DELETE FROM embeddings'), 'reindex must clear the old tenant embeddings')
+  assert.ok(fake.calls.some((c) => /FROM companies/.test(c.text)), 'reindex must cover the CRM entities, not just the vertical tables')
   const inserts = fake.calls.filter((c) => /INSERT INTO embeddings/.test(c.text))
-  assert.equal(inserts.length, 4)
+  assert.equal(inserts.length, 5)
   const vec = inserts[0].params[3]
   assert.match(vec, /^\[-?[\d.e-]+,/)
   assert.equal(vec.split(',').length, 768, 'stored vector must be the full 768-dim embedding')
@@ -235,8 +244,15 @@ test('POST /index embeds every record/ticket/party row in the tenant', async () 
 })
 
 // ---- /insights + /insights/latest ----
-test('POST /insights computes and stores a 5-line snapshot per tenant', async () => {
+test('POST /insights computes CRM insights for every tenant and appends vertical lines when data exists', async () => {
   const { app, fake } = await makeApp([
+    [/SELECT 1 FROM records LIMIT 1/, [{ one: 1 }]],
+    [/count\(\*\) FROM companies/, [{ companies: 3, contacts: 2, leads: 2, deals: 2, pipeline: 145000 }]],
+    [/JOIN companies c ON c\.id = d\.company_id/, [{ name: 'CEAT', v: 120000 }]],
+    [/GROUP BY stage/, [{ stage: 'proposal', n: 1, v: 120000 }]],
+    [/GROUP BY source/, [{ source: 'referral', n: 1 }]],
+    [/FILTER \(WHERE NOT completed\)/, [{ open_tasks: 2, overdue: 1 }]],
+    [/expected_close_date/, [{ m: '2026-12', v: 120000 }]],
     [/GROUP BY customer/, [{ customer: 'CEAT', mt: 100 }]],
     [/GROUP BY grade/, [{ grade: 'TSR-20', mt: 100 }]],
     [/GROUP BY category/, [{ category: 'quality', n: 2 }]],
@@ -246,13 +262,38 @@ test('POST /insights computes and stores a 5-line snapshot per tenant', async ()
   const res = await app.inject({ method: 'POST', url: '/insights', headers: { 'x-tenant-id': 'alpha' } })
   assert.equal(res.statusCode, 200)
   const b = JSON.parse(res.body)
-  assert.equal(b.insights.length, 5)
-  assert.match(b.insights[0], /Top customer by volume: CEAT \(100 MT\)/)
-  assert.match(b.insights[4], /Totals: 5 orders, 100 MT, \$0\.20M revenue/)
+  assert.equal(b.insights.length, 11)
+  assert.match(b.insights[0], /CRM: 3 companies, 2 contacts, 2 leads, 2 deals \(\$145,000 total pipeline\)/)
+  assert.match(b.insights[1], /Top open pipeline: CEAT \(\$120,000\)/)
+  assert.match(b.insights[2], /Open pipeline by stage: proposal=\$120,000 \(1\)/)
+  assert.match(b.insights[3], /Leads by source: referral=1/)
+  assert.match(b.insights[4], /Tasks: 2 open, 1 overdue/)
+  assert.match(b.insights[5], /Expected deal value by month: 2026-12=\$120,000/)
+  assert.match(b.insights[6], /Top customer by volume: CEAT \(100 MT\)/)
+  assert.match(b.insights[10], /Totals: 5 orders, 100 MT, \$0\.20M revenue/)
   const snap = fake.calls.find((c) => /INSERT INTO insights_snapshots/.test(c.text))
   assert.ok(snap, 'insights must be persisted for the Insights screen')
-  assert.equal(JSON.parse(snap.params[0]).length, 5)
+  assert.equal(JSON.parse(snap.params[0]).length, 11)
   assert.equal(snap.params[1], 'local')
+  await app.close()
+})
+
+test('POST /insights stays CRM-only for tenants without vertical data', async () => {
+  const { app, fake } = await makeApp([
+    [/SELECT 1 FROM records LIMIT 1/, []],
+    [/count\(\*\) FROM companies/, [{ companies: 1, contacts: 1, leads: 1, deals: 1, pipeline: 1 }]],
+    [/JOIN companies c ON c\.id = d\.company_id/, []],
+    [/GROUP BY stage/, []],
+    [/GROUP BY source/, []],
+    [/FILTER \(WHERE NOT completed\)/, [{ open_tasks: 0, overdue: 0 }]],
+    [/expected_close_date/, []],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/insights', headers: { 'x-tenant-id': 'alpha' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.insights.length, 6)
+  assert.match(b.insights[0], /CRM: 1 companies, 1 contacts, 1 leads, 1 deals \(\$1 total pipeline\)/)
+  assert.ok(fake.calls.every((c) => !/FROM records GROUP BY customer/.test(c.text)), 'vertical queries must not run without vertical data')
   await app.close()
 })
 
@@ -272,10 +313,56 @@ test('GET /insights/latest returns the newest snapshot or an empty note pre-cron
   await app.close()
 })
 
+// ---- CRM routing and CRM charts ----
+test('POST /chat routes CRM questions to search_crm', async () => {
+  const { app } = await makeApp([
+    [/SELECT 1 FROM records LIMIT 1/, []],
+    [/UNION ALL/, [{ kind: 'deal', label: 'CEAT Q4 contract', detail: 'proposal' }]],
+    [/FROM embeddings/, []],
+  ])
+  const res = await app.inject({
+    method: 'POST',
+    url: '/chat',
+    headers: { 'x-tenant-id': 'alpha' },
+    payload: { message: 'tell me about the CEAT deal' },
+  })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.deepEqual(b.tools, ['search_crm'])
+  assert.match(b.reply, /deal: CEAT Q4 contract — proposal/)
+  await app.close()
+})
+
+test('POST /chat builds pipeline charts from the CRM for stage/company/source intents', async () => {
+  const { app, fake } = await makeApp([
+    [/SELECT 1 FROM records LIMIT 1/, []],
+    [/SELECT stage AS label/, [
+      { label: 'proposal', value: 120000 },
+      { label: 'new', value: 25000 },
+    ]],
+    [/FROM embeddings/, []],
+  ])
+  const res = await app.inject({
+    method: 'POST',
+    url: '/chat',
+    headers: { 'x-tenant-id': 'alpha' },
+    payload: { message: 'chart of pipeline value by stage' },
+  })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.chart.type, 'bar')
+  assert.deepEqual(b.chart.labels, ['proposal', 'new'])
+  assert.match(b.chart.title, /revenue by stage/)
+  const q = fake.calls.find((c) => /SELECT stage AS label/.test(c.text))
+  assert.match(q.text, /sum\(value\)/, 'the revenue metric maps to the CRM deal value')
+  await app.close()
+})
+
 // ---- /chat/stream: SSE surface (start/tool/done frames, local synthesis) ----
 test('POST /chat/stream emits SSE frames and closes cleanly', async () => {
   const { app } = await makeApp([
-    [/count\(\*\)::int AS open_orders/, [{ open_orders: 2, active_mt: 8, suppliers: 1, customers: 2 }]],
+    [/SELECT 1 FROM records LIMIT 1/, []],
+    [/count\(\*\) FROM companies/, [{ companies: 2, contacts: 3, open_leads: 1, open_deals: 1, pipeline_value: 25000, open_tasks: 1, overdue_tasks: 0 }]],
     [/FROM embeddings/, []],
   ])
   const res = await app.inject({
@@ -287,7 +374,8 @@ test('POST /chat/stream emits SSE frames and closes cleanly', async () => {
   assert.equal(res.statusCode, 200)
   assert.match(res.headers['content-type'], /text\/event-stream/)
   assert.match(res.body, /event: start/)
-  assert.match(res.body, /event: tool\ndata: \{"name":"get_kpi"\}/)
+  assert.match(res.body, /event: tool\ndata: \{"name":"get_crm_kpi"\}/)
+  assert.match(res.body, /event: observation\ndata: \{"tool":"get_crm_kpi","count":1\}/)
   assert.match(res.body, /event: done/)
   assert.match(res.body, /event: token/)
   const noTenant = await app.inject({ method: 'POST', url: '/chat/stream', payload: { message: 'x' } })
