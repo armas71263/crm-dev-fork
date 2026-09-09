@@ -78,9 +78,22 @@ const routes = [
   { path: '/screen-config', marker: 'Screen config' },
 ]
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// The dev sandbox kills servers intermittently; its watchdog brings them back
+// within seconds. Retry fetches across that window instead of failing the run.
+async function fetchWithRetry(url, opts, tries = 4) {
+  for (let i = 1; i <= tries; i++) {
+    try { return await fetch(url, opts) } catch (e) {
+      if (i === tries) throw e
+      await sleep(9000)
+    }
+  }
+}
+
 let failed = 0
 for (const route of routes) {
-  const res = await fetch(`${appUrl}${route.path}`, {
+  const res = await fetchWithRetry(`${appUrl}${route.path}`, {
     headers: { cookie },
     redirect: 'manual',
   })
@@ -96,7 +109,7 @@ for (const route of routes) {
 
 // One real AI assistant turn through the same-origin SSE proxy.
 {
-  const res = await fetch(`${appUrl}/api/ai/chat/stream`, {
+  const res = await fetchWithRetry(`${appUrl}/api/ai/chat/stream`, {
     method: 'POST',
     headers: { cookie, 'content-type': 'application/json' },
     body: JSON.stringify({ message: 'pipeline overview', session_id: 'verify-' + Date.now() }),
@@ -124,11 +137,11 @@ for (const route of routes) {
 // Vendor gate, both layers: the web page shows a vendor-only notice for staff;
 // the BFF — the real security boundary — 403s a staff JWT from /tenants.
 {
-  const page = await fetch(`${appUrl}/tenants`, { headers: { cookie }, redirect: 'manual' })
+  const page = await fetchWithRetry(`${appUrl}/tenants`, { headers: { cookie }, redirect: 'manual' })
   const text = (await page.text()).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ')
   const pageOk = page.status === 200 && /vendor-only/i.test(text)
   const { data: { session } } = await supabase.auth.getSession()
-  const api = await fetch(`${process.env.NEXT_PUBLIC_BFF_URL}/tenants`, {
+  const api = await fetchWithRetry(`${process.env.NEXT_PUBLIC_BFF_URL}/tenants`, {
     headers: { authorization: `Bearer ${session.access_token}` },
   })
   const ok = pageOk && api.status === 403
@@ -137,7 +150,7 @@ for (const route of routes) {
 }
 
 // Middleware: unauthenticated request must redirect to /login.
-const res = await fetch(`${appUrl}/dashboard`, { redirect: 'manual' })
+const res = await fetchWithRetry(`${appUrl}/dashboard`, { redirect: 'manual' })
 const loc = res.headers.get('location') || ''
 if (res.status === 307 && loc.includes('/login')) {
   console.log('PASS middleware: no-cookie /dashboard redirects to /login')
