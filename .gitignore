@@ -26,3 +26,4 @@ backups/
 .claude/
 agent/
 skills-lock.json
+.hoplite/

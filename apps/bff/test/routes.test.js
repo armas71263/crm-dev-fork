@@ -668,3 +668,15 @@ test('POST /users/invite validates input and fails closed without a service key'
   assert.equal(noKey.statusCode, 503, 'invites must fail closed without a configured service key')
   await app.close()
 })
+
+test('GET /data/attendance lists weekly hr_events through the tenant session', async () => {
+  const { app, data } = await makeApp([
+    [/FROM hr_events ORDER BY week DESC/, [{ id: 1, employee: 'Anil', department: 'Warehouse', week: '2026-W36', present: 5, absent: 0, late: 1, leave: 0, created_at: '2026-09-07' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/attendance' })
+  assert.equal(res.statusCode, 200)
+  assert.equal(JSON.parse(res.body).attendance[0].employee, 'Anil')
+  const q = data.calls.find((c) => /FROM hr_events/.test(c.text))
+  assert.match(q.text, /"leave"/, 'the reserved-word column must be quoted')
+  await app.close()
+})

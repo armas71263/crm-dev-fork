@@ -74,3 +74,9 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - **`/portal/overview` uses the verified token's `companyId` claim** (JWT mode); the `x-customer` header is dev-mode-only.
 - **AI service needs the Supabase pooler DSN + TLS** like the BFF (`SUPABASE_DB_SESSION_POOLER_URL`, `ssl: { rejectUnauthorized: false }`) — see `apps/ai/src/index.js`.
 - **`./scripts/dev.sh` now supervises the AI service too** (port 5000) alongside BFF (4000) and Next (3000); without it the Assistant/Insights screens are dead endpoints.
+
+## Phase 3 close (2026-09-09)
+- `preview/` DELETED — apps/web is the only UI. CSP tightened accordingly (script-src 'self', script-src-attr 'none'; jsdelivr/unsafe-inline gone). Unported legacy demo screens (Doc Tools, Doc Checker) keep their BFF/AI endpoints; port on demand.
+```- Attendance (hr_events — mind the reserved-word "leave" column) and Checklists (active checklist_json) screens added; /data/attendance is new, /data/checklists existed.
+- Demo users in live Supabase: staff.rt/staff.lex (staff), cust.ceat (customer, company CEAT), vendor@test.dev (vendor — created via admin API; the invite flow only grants staff/customer). All have profiles rows now.
+- psql "$SUPABASE_DB_SESSION_POOLER_URL" works from the sandbox; set app.tenant_id per session or RLS hides everything.

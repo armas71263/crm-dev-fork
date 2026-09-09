@@ -69,6 +69,8 @@ const routes = [
   { path: '/customers', marker: 'Customers' },
   { path: '/issues', marker: 'Issues' },
   { path: '/news', marker: 'News feed' },
+  { path: '/attendance', marker: 'Attendance' },
+  { path: '/checklists', marker: 'Checklists' },
   { path: '/search?q=CEAT', marker: 'CEAT' }, // CRM results must actually render
   { path: '/assistant', marker: 'Assistant' },
   { path: '/insights', marker: 'Insights' },

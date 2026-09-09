@@ -22,13 +22,13 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   const AI_SERVICE_URL = aiServiceUrl || 'http://localhost:5000'
 
   await fastify.register(cors, { origin: true })
-  // Preview SPA uses inline event handlers (onclick=...), so allow them in CSP.
+  // The preview SPA is gone: no inline event handlers and no CDN scripts are
+  // needed — the Next.js app is fully same-origin (BFF APIs only).
   await fastify.register(helmet, {
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", 'https://cdn.jsdelivr.net'],
-        scriptSrcAttr: ["'unsafe-inline'"],
+        scriptSrc: ["'self'"],
         styleSrc: ["'self'", 'https:', "'unsafe-inline'"],
         imgSrc: ["'self'", 'data:'],
         objectSrc: ["'none'"],
@@ -127,6 +127,11 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   fastify.get('/data/feed', async (req) => {
     const r = await tenantQuery(req, 'SELECT category, title, description, priority, published_at FROM feed_items ORDER BY published_at DESC LIMIT 100')
     return { feed: r.rows }
+  })
+
+  fastify.get('/data/attendance', async (req) => {
+    const r = await tenantQuery(req, 'SELECT id, employee, department, week, present, absent, late, "leave", created_at FROM hr_events ORDER BY week DESC, created_at DESC LIMIT 200')
+    return { attendance: r.rows }
   })
 
   fastify.get('/data/dashboard', async (req) => {

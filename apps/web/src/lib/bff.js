@@ -50,6 +50,8 @@ export function sectionsForRole(role, { vertical = false } = {}) {
       { href: '/customers', label: 'Customers' },
       { href: '/issues', label: 'Issues' },
       { href: '/news', label: 'News feed' },
+      { href: '/attendance', label: 'Attendance' },
+      { href: '/checklists', label: 'Checklists' },
     )
   }
   sections.push(
