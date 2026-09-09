@@ -4,7 +4,7 @@ import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import { createClient } from '../src/lib/supabase/browser.js'
 
-export default function NavRail({ sections, userEmail }) {
+export default function NavRail({ sections, userEmail, brand = 'RubberTrack', accent }) {
   const pathname = usePathname()
   const router = useRouter()
 
@@ -18,10 +18,10 @@ export default function NavRail({ sections, userEmail }) {
   return (
     <nav className="w-56 shrink-0 border-r border-line bg-white h-screen sticky top-0 flex flex-col">
       <div className="px-5 pt-6 pb-5">
-        <div className="w-7 h-7 bg-leaf mb-4" />
-        <div className="text-[15px] font-semibold tracking-tight">RubberTrack</div>
+        <div className="w-7 h-7 mb-4" style={{ background: accent || '#2E5E4E' }} />
+        <div className="text-[15px] font-semibold tracking-tight">{brand}</div>
       </div>
-      <div className="flex-1 px-3 space-y-0.5">
+      <div className="flex-1 overflow-y-auto px-3 space-y-0.5">
         {sections.map((s) => {
           const active = pathname === s.href
           return (

@@ -21,15 +21,17 @@ export async function bffFetch(path) {
 }
 
 // Map BFF/user role to the nav sections this user should see. Customers get
-// the portal-facing subset; staff see the full CRM + AI surfaces.
-export function sectionsForRole(role) {
+// the portal-facing subset; staff see the CRM + AI surfaces, plus the vertical
+// (template) screens when the tenant actually holds vertical rows. The tenant
+// registry is vendor-only.
+export function sectionsForRole(role, { vertical = false } = {}) {
   if (role === 'customer') {
     return [
       { href: '/portal', label: 'Overview' },
       { href: '/companies', label: 'Our account' },
     ]
   }
-  return [
+  const sections = [
     { href: '/dashboard', label: 'Dashboard' },
     { href: '/assistant', label: 'Assistant' },
     { href: '/insights', label: 'Insights' },
@@ -40,6 +42,22 @@ export function sectionsForRole(role) {
     { href: '/deals', label: 'Deals' },
     { href: '/activities', label: 'Activities' },
     { href: '/tasks', label: 'Tasks' },
-    { href: '/usage', label: 'AI usage' },
   ]
+  if (vertical) {
+    sections.push(
+      { href: '/records', label: 'Order records' },
+      { href: '/suppliers', label: 'Suppliers' },
+      { href: '/customers', label: 'Customers' },
+      { href: '/issues', label: 'Issues' },
+      { href: '/news', label: 'News feed' },
+    )
+  }
+  sections.push(
+    { href: '/screen-config', label: 'Screen config' },
+    { href: '/branding', label: 'Branding' },
+    { href: '/users', label: 'Users' },
+  )
+  if (role === 'vendor') sections.push({ href: '/tenants', label: 'Tenants' })
+  sections.push({ href: '/usage', label: 'AI usage' })
+  return sections
 }

@@ -5,7 +5,9 @@
 //      protected route and assert the SSR HTML renders live data.
 //   3. Stream one AI assistant turn through the same-origin SSE proxy and
 //      assert the full event protocol (start → tool → token → done).
-//   4. Assert the middleware redirect (no cookie -> /login).
+//   4. Assert role gates: the web /tenants page shows the vendor-only notice,
+//      and the BFF 403s a staff JWT from the tenant registry.
+//   5. Assert the middleware redirect (no cookie -> /login).
 // Usage: node scripts/verify-session.js [email] [password]
 // Env: NEXT_PUBLIC_SUPABASE_URL/_ANON_KEY (read from .env.local if unset),
 //      APP_URL (default http://127.0.0.1:3000)
@@ -62,10 +64,18 @@ const routes = [
   { path: '/deals', marker: 'Deals' },
   { path: '/activities', marker: 'Activities' },
   { path: '/tasks', marker: 'Tasks' },
+  { path: '/records', marker: 'Order records' },
+  { path: '/suppliers', marker: 'Suppliers' },
+  { path: '/customers', marker: 'Customers' },
+  { path: '/issues', marker: 'Issues' },
+  { path: '/news', marker: 'News feed' },
   { path: '/search?q=CEAT', marker: 'CEAT' }, // CRM results must actually render
   { path: '/assistant', marker: 'Assistant' },
   { path: '/insights', marker: 'Insights' },
   { path: '/usage', marker: 'AI usage' },
+  { path: '/users', marker: 'Users' },
+  { path: '/branding', marker: 'Branding' },
+  { path: '/screen-config', marker: 'Screen config' },
 ]
 
 let failed = 0
@@ -109,6 +119,21 @@ for (const route of routes) {
   }
   if (!ok) failed++
   console.log(`${ok ? 'PASS' : 'FAIL'} /api/ai/chat/stream: ${detail}`)
+}
+
+// Vendor gate, both layers: the web page shows a vendor-only notice for staff;
+// the BFF — the real security boundary — 403s a staff JWT from /tenants.
+{
+  const page = await fetch(`${appUrl}/tenants`, { headers: { cookie }, redirect: 'manual' })
+  const text = (await page.text()).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ')
+  const pageOk = page.status === 200 && /vendor-only/i.test(text)
+  const { data: { session } } = await supabase.auth.getSession()
+  const api = await fetch(`${process.env.NEXT_PUBLIC_BFF_URL}/tenants`, {
+    headers: { authorization: `Bearer ${session.access_token}` },
+  })
+  const ok = pageOk && api.status === 403
+  if (!ok) failed++
+  console.log(`${ok ? 'PASS' : 'FAIL'} /tenants: web notice=${pageOk ? 'shown' : 'MISSING'}, BFF staff JWT → HTTP ${api.status} (expected 403)`)
 }
 
 // Middleware: unauthenticated request must redirect to /login.

@@ -3,7 +3,8 @@
 # + Next.js dev. Supervisor pattern: this environment can silently reap
 # long-running children, so this script stays in the foreground as a watchdog
 # and restarts whichever server stopped answering. Health checks use curl —
-# `ss`/`lsof` are not in PATH in the preview runtime.
+# `ss`/`lsof` are not in PATH in the preview runtime. POSIX-safe starts: no
+# `disown`, no process substitution — the platform runs this via `sh -lc`.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -19,8 +20,7 @@ NEXT_LOG=/tmp/devstack/next.log
 start_bff() {
   pkill -f 'node apps/bff/src/index.js' 2>/dev/null
   sleep 0.5
-  setsid node apps/bff/src/index.js < <(sleep infinity) >> "$BFF_LOG" 2>&1 &
-  disown
+  setsid node apps/bff/src/index.js < /dev/null >> "$BFF_LOG" 2>&1 &
 }
 
 # The BFF proxies /ai/* to the AI service (planner→tools→synthesize, SSE) —
@@ -28,15 +28,13 @@ start_bff() {
 start_ai() {
   pkill -f 'node apps/ai/src/index.js' 2>/dev/null
   sleep 0.5
-  setsid node apps/ai/src/index.js < <(sleep infinity) >> "$AI_LOG" 2>&1 &
-  disown
+  setsid node apps/ai/src/index.js < /dev/null >> "$AI_LOG" 2>&1 &
 }
 
 start_next() {
   pkill -f 'next dev' 2>/dev/null
   sleep 0.5
-  ( cd apps/web && setsid npx next dev < <(sleep infinity) >> "$NEXT_LOG" 2>&1 & )
-  disown
+  ( cd apps/web && setsid npx next dev < /dev/null >> "$NEXT_LOG" 2>&1 & )
 }
 
 start_bff
