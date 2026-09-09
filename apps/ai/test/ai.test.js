@@ -1,6 +1,6 @@
 import { test, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildApp, makeTenantQuery, embed, plan, detectChartIntent, pickProvider } from '../src/app.js'
+import { buildApp, makeTenantQuery, embed, plan, detectChartIntent, pickProvider, validateSql, extractSql } from '../src/app.js'
 
 // ---- Fake pg pool: records every query, serves canned rows by SQL match ----
 function makeFakePool(matchers = []) {
@@ -173,6 +173,10 @@ test('POST /chat answers from the local provider using tool observations and log
 test('POST /chat builds and refines charts across turns (multi-turn session)', async () => {
   const { app, fake } = await makeApp([
     [/SELECT 1 FROM records LIMIT 1/, [{ one: 1 }]],
+    [/JOIN ai_chat_sessions s ON s\.id = m\.session_id/, [
+      { role: 'assistant', content: 'chart ready', chart: { dimension: 'grade', metric: 'mt', filter: null, spec: { type: 'bar', title: 'mt by grade', labels: ['TSR-20', 'SMR-20'], values: [10, 5] } } },
+    ]],
+    [/ON CONFLICT \(tenant_id, session_key\)/, [{ id: 1 }]],
     [/SELECT grade AS label/, [
       { label: 'TSR-20', value: 10 },
       { label: 'SMR-20', value: 5 },
@@ -380,5 +384,75 @@ test('POST /chat/stream emits SSE frames and closes cleanly', async () => {
   assert.match(res.body, /event: token/)
   const noTenant = await app.inject({ method: 'POST', url: '/chat/stream', payload: { message: 'x' } })
   assert.equal(noTenant.statusCode, 400)
+  await app.close()
+})
+
+// ---- Phase 4: text-to-SQL guardrails ----
+test('validateSql accepts single SELECTs and rejects dangerous shapes', () => {
+  assert.deepEqual(validateSql('SELECT count(*) FROM companies'), { sql: 'SELECT count(*) FROM companies' })
+  assert.equal(validateSql('  select 1;  ').sql, 'select 1')
+  assert.equal(validateSql('WITH x AS (SELECT 1) SELECT * FROM x').sql, 'WITH x AS (SELECT 1) SELECT * FROM x')
+  assert.match(validateSql('').error, /empty/)
+  assert.match(validateSql('SELECT 1; SELECT 2').error, /single statement/)
+  assert.match(validateSql('DELETE FROM companies').error, /only SELECT/)
+  assert.match(validateSql("SELECT * FROM companies WHERE name = 'drop everything'").error, /forbidden keyword/, 'keywords inside literals are rejected too — strict by design')
+  assert.equal(extractSql('sql: SELECT count(*) FROM deals'), 'SELECT count(*) FROM deals')
+})
+
+test('run_sql runs SELECTs on the readonly pool with tenant GUC + timeout; mutations never reach it', async () => {
+  const data = makeFakePool([
+    [/^SELECT set_config/, [{ set_config: 't' }]],
+    [/^RESET /, []],
+    [/JOIN ai_chat_sessions s ON s\.id = m\.session_id/, []],
+    [/ON CONFLICT \(tenant_id, session_key\)/, []],
+  ])
+  const ro = makeFakePool([
+    [/^BEGIN$/, []],
+    [/^COMMIT$/, []],
+    [/statement_timeout/, []],
+    [/count\(\*\) FROM companies/, [{ count: '3' }]],
+  ])
+  const { app } = await buildApp({ pool: data.pool, readonlyPool: ro.pool, logger: false })
+  const res = await app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'sql: SELECT count(*) FROM companies' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.ok(b.tools.includes('run_sql'))
+  assert.match(b.reply, /SQL result/)
+  assert.match(b.reply, /"count":"3"/)
+  const gucIdx = ro.calls.findIndex((c) => /set_config\('app\.tenant_id'/.test(c.text))
+  const qIdx = ro.calls.findIndex((c) => /count\(\*\) FROM companies/.test(c.text))
+  assert.ok(gucIdx >= 0 && gucIdx < qIdx, 'transaction-local tenant GUC must precede the query')
+  assert.deepEqual(ro.calls[gucIdx].params, ['alpha'])
+  assert.ok(ro.calls.some((c) => /statement_timeout/.test(c.text)), 'per-query timeout must be set')
+
+  const roCallsBefore = ro.calls.length
+  const bad = await app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'sql: DELETE FROM companies' } })
+  assert.match(JSON.parse(bad.body).reply, /only SELECT/)
+  assert.equal(ro.calls.length, roCallsBefore, 'rejected SQL must never reach the readonly pool')
+  await app.close()
+
+  const noRoApp = await buildApp({ pool: data.pool, logger: false })
+  const noRoRes = await noRoApp.app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'sql: SELECT 1' } })
+  assert.match(JSON.parse(noRoRes.body).reply, /not configured/)
+  await noRoApp.app.close()
+})
+
+test('chat turns persist to ai_chat_messages (Phase 4 conversation memory)', async () => {
+  const data = makeFakePool([
+    [/^SELECT set_config/, [{ set_config: 't' }]],
+    [/^RESET /, []],
+    [/JOIN ai_chat_sessions s ON s\.id = m\.session_id/, [{ role: 'user', content: 'earlier question', chart: null }]],
+    [/ON CONFLICT \(tenant_id, session_key\)/, [{ id: 42 }]],
+  ])
+  const { app } = await buildApp({ pool: data.pool, logger: false })
+  const res = await app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'what is the overview?', session_id: 'mem-test' } })
+  assert.equal(res.statusCode, 200)
+  const inserts = data.calls.filter((c) => /INSERT INTO ai_chat_messages/.test(c.text))
+  assert.equal(inserts.length, 2, 'user + assistant turns must persist')
+  assert.equal(inserts[0].params[1], 'what is the overview?')
+  assert.equal(inserts[0].params[0], 42, 'messages attach to the upserted session')
+  assert.ok(inserts[1].params[1].length > 0, 'assistant reply must be persisted')
+  const toolsParam = JSON.parse(inserts[1].params[2])
+  assert.ok(Array.isArray(toolsParam), 'tool names persist as JSON')
   await app.close()
 })

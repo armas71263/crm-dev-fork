@@ -75,6 +75,7 @@ was explicitly settled with the product owner.
 - **Verify:** per-screen browser walkthrough (DOM evidence), PostHog events firing, SSE chat works through BFF.
 
 ### Phase 4 — AI upgrade + conversation memory (1 week)
+> Status (2026-09-09): items 3+4 DONE and live-verified — text-to-SQL runs on the app_readonly pool (SELECT-only validation, tenant GUC in-tx, 5s statement timeout; mutation attempts rejected before touching the pool; RLS-proven cross-tenant), conversation memory persists in ai_chat_sessions/ai_chat_messages (migration 007) incl. chart intents for multi-turn refinement. Items 1+2 (AI SDK v5 tool-calling, real nomic embeddings) deferred — they need a real provider key for any meaningful live verification; the deterministic local pipeline stays the offline default.
 1. `apps/ai`: real Vercel AI SDK v5 (`streamText`, tool calling) replacing the hand-rolled planner.
 2. Real embeddings: nomic-embed-text-v1.5 (768-d) local (in the Python service or Ollama), NIM key-gated fallback; reindex migration (embeddings table stays `VECTOR(768)`).
 3. Text-to-SQL tool: `app_readonly` role + tenant GUC + statement timeout + SELECT-only validation — RLS-guarded by construction.

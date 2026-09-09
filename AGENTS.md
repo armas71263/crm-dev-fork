@@ -80,3 +80,8 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 ```- Attendance (hr_events — mind the reserved-word "leave" column) and Checklists (active checklist_json) screens added; /data/attendance is new, /data/checklists existed.
 - Demo users in live Supabase: staff.rt/staff.lex (staff), cust.ceat (customer, company CEAT), vendor@test.dev (vendor — created via admin API; the invite flow only grants staff/customer). All have profiles rows now.
 - psql "$SUPABASE_DB_SESSION_POOLER_URL" works from the sandbox; set app.tenant_id per session or RLS hides everything.
+
+## Phase 4 (2026-09-09)
+- Text-to-SQL live: `/ai/chat` accepts `sql: SELECT ...`; runs on the `app_readonly` pool (SELECT-only grants, tenant-isolation RLS TO PUBLIC — fail-closed without the GUC, statement timeout). validateSql rejects multi-statement/mutation/forbidden keywords BEFORE the pool. Mutation attempts verified rejected live.
+- Conversation memory: migration 007 (ai_chat_sessions/ai_chat_messages, RLS) — the in-process session Map is gone; loadMemory/saveTurn persist turns + tool names + chart intents. Chart refinement survives service restarts (live-verified). Memory errors degrade to no-history, never break chat.
+- AI SDK v5 + real embeddings: deferred pending a provider key (OPENROUTER/NIM).

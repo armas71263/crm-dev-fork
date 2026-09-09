@@ -82,16 +82,7 @@ export function makeTenantQuery(pool) {
   }
 }
 
-// Multi-turn session store. Keyed by tenant so one tenant's conversation can
-// never bleed into another's.
-function makeSessions() {
-  const sessions = new Map()
-  return function getSession(tenantId, sessionId) {
-    const key = `${tenantId}:${sessionId || 'default'}`
-    if (!sessions.has(key)) sessions.set(key, { turns: [], lastChart: null })
-    return sessions.get(key)
-  }
-}
+
 
 // Chart intent detection — keywords that signal a visualization request.
 // Multi-turn: if the message has a filter ("now just TSR-20") but no chart
@@ -132,6 +123,10 @@ const CRM_OVERVIEW = /(overview|summary|how many|count|kpi|status|total|metric|p
 export function plan(message, { crm = true, vertical = true } = {}) {
   const m = message.toLowerCase()
   const calls = []
+  // Text-to-SQL: an explicit sql ask, or a message that IS a SELECT/WITH.
+  if (/\bsql\b/i.test(m) || /^\s*(select|with)\b/i.test(message)) {
+    calls.push({ name: 'run_sql', args: { q: message } })
+  }
   if (crm) {
     if (CRM_WORDS.test(m)) calls.push({ name: 'search_crm', args: { q: message } })
     if (CRM_OVERVIEW.test(m)) calls.push({ name: 'get_crm_kpi', args: {} })
@@ -150,10 +145,87 @@ export function plan(message, { crm = true, vertical = true } = {}) {
 // vertical suggest_chart. Used by the chat routes to pick the chart tool.
 export const CRM_CHART_DIMS = new Set(['stage', 'company', 'source'])
 
-export async function buildApp({ pool, logger = true }) {
+// ---- Text-to-SQL guardrails (Phase 4) ----
+// Single read-only statement. The app_readonly role (SELECT-only grants),
+// tenant-isolation RLS and the statement timeout are the real walls — this
+// validation is defense in depth, and it makes bad queries fail fast.
+const SQL_FORBIDDEN = /\b(insert|update|delete|drop|alter|truncate|grant|revoke|copy|create|call|do|vacuum|listen|notify|lock|set|reset|begin|commit|rollback|execute)\b/i
+export function validateSql(sql) {
+  const t = String(sql || '').trim().replace(/;+\s*$/, '')
+  if (!t) return { error: 'empty query' }
+  if (t.includes(';')) return { error: 'only a single statement is allowed' }
+  if (!/^(select|with)\b/i.test(t)) return { error: 'only SELECT (or WITH ... SELECT) queries are allowed' }
+  if (SQL_FORBIDDEN.test(t)) return { error: 'read-only queries only — forbidden keyword detected' }
+  return { sql: t }
+}
+
+// Pull an embedded SELECT out of a natural-language request ("sql: SELECT ...").
+export function extractSql(text) {
+  const m = String(text || '').match(/((?:select|with)\b[^;]*)/i)
+  return m ? m[1].trim() : String(text || '')
+}
+
+export async function buildApp({ pool, readonlyPool, logger = true }) {
   const fastify = Fastify({ logger })
   const tenantQuery = makeTenantQuery(pool)
-  const getSession = makeSessions()
+
+  // ---- Conversation memory (Phase 4): turns persist in Postgres, RLS-scoped
+  // ---- per tenant. A DB hiccup degrades to no-history — chat never breaks.
+  async function loadMemory(tenantId, sessionKey) {
+    const key = sessionKey || 'default'
+    try {
+      const r = await tenantQuery(tenantId,
+        `SELECT m.role, m.content, m.chart FROM ai_chat_messages m
+         JOIN ai_chat_sessions s ON s.id = m.session_id
+         WHERE s.session_key = $1 ORDER BY m.id DESC LIMIT 10`, [key])
+      const rows = r.rows.reverse()
+      const lastChart = [...rows].reverse().find((x) => x.chart)?.chart || null
+      return { history: rows.map((x) => ({ role: x.role, text: x.content })), lastChart }
+    } catch (e) {
+      fastify.log.warn({ err: e.message }, 'chat memory unavailable — continuing without history')
+      return { history: [], lastChart: null }
+    }
+  }
+
+  async function saveTurn(tenantId, sessionKey, { userText, assistantText, tools, chart }) {
+    const key = sessionKey || 'default'
+    try {
+      const s = await tenantQuery(tenantId,
+        `INSERT INTO ai_chat_sessions (tenant_id, session_key) VALUES (app.current_tenant(), $1)
+         ON CONFLICT (tenant_id, session_key) DO UPDATE SET updated_at = now() RETURNING id`, [key])
+      const sid = s.rows[0]?.id
+      if (!sid) return
+      await tenantQuery(tenantId,
+        `INSERT INTO ai_chat_messages (tenant_id, session_id, role, content, tools, chart)
+         VALUES (app.current_tenant(), $1, 'user', $2, '[]'::jsonb, NULL)`, [sid, userText])
+      await tenantQuery(tenantId,
+        `INSERT INTO ai_chat_messages (tenant_id, session_id, role, content, tools, chart)
+         VALUES (app.current_tenant(), $1, 'assistant', $2, $3::jsonb, $4::jsonb)`,
+        [sid, assistantText, JSON.stringify(tools || []), chart ? JSON.stringify(chart) : null])
+    } catch (e) {
+      fastify.log.warn({ err: e.message }, 'chat memory save failed — turn not persisted')
+    }
+  }
+
+  // ---- Text-to-SQL execution: app_readonly pool, transaction-local tenant
+  // ---- GUC + statement timeout. Any error fails closed with a message.
+  async function runReadonly(tenantId, sql) {
+    if (!readonlyPool) return { error: 'text-to-SQL is not configured (no readonly pool)' }
+    const client = await readonlyPool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query("SELECT set_config('app.tenant_id', $1, true)", [tenantId])
+      await client.query("SET LOCAL statement_timeout = '5s'")
+      const r = await client.query(sql)
+      await client.query('COMMIT')
+      return { rows: r.rows.slice(0, 50), rowCount: r.rowCount }
+    } catch (e) {
+      try { await client.query('ROLLBACK') } catch { /* already aborted */ }
+      return { error: `query failed: ${e.message.slice(0, 160)}` }
+    } finally {
+      client.release()
+    }
+  }
 
   // Vertical (rubber-trading) data is template-specific; the CRM schema is
   // universal. Vertical tools run only for tenants whose vertical tables
@@ -261,6 +333,13 @@ export async function buildApp({ pool, logger = true }) {
         `SELECT ${spec.dim} AS label, ${met}::float AS value FROM ${spec.from} ${where} GROUP BY 1 ORDER BY ${dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 20`, params)
       return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) } }
     },
+
+    // run_sql: LLM- or user-written SELECT, executed behind the guardrails.
+    run_sql: async (tenantId, { q, sql }) => {
+      const check = validateSql(sql || extractSql(q))
+      if (check.error) return { error: check.error }
+      return runReadonly(tenantId, check.sql)
+    },
   }
 
   // Reindex a tenant's knowledge base into the embeddings table.
@@ -322,7 +401,7 @@ export async function buildApp({ pool, logger = true }) {
     const t0 = Date.now()
     const requestId = crypto.randomUUID()
     const provider = pickProvider(tenantId)
-    const session = getSession(tenantId, session_id)
+    const mem = await loadMemory(tenantId, session_id)
 
     // 1) Plan which tools to run. CRM tools always; vertical tools only when
     // the tenant has vertical rows. Multi-turn: prepend recent history to context.
@@ -335,16 +414,15 @@ export async function buildApp({ pool, logger = true }) {
     }
 
     // 2) Chart intent — detect visualization requests and build a chart spec.
-    const chartIntent = detectChartIntent(message, session)
+    const chartIntent = detectChartIntent(message, mem)
     let chart = null
     if (chartIntent) {
-      // Multi-turn: if no explicit filter but a previous chart had one, carry it over.
-      if (!chartIntent.filter && session.lastChart?.filter) chartIntent.filter = session.lastChart.filter
-      if (!chartIntent.dimension && session.lastChart?.dimension) chartIntent.dimension = session.lastChart.dimension
+      // Multi-turn: carry a previous chart's filter/dimension when unset.
+      if (!chartIntent.filter && mem.lastChart?.filter) chartIntent.filter = mem.lastChart.filter
+      if (!chartIntent.dimension && mem.lastChart?.dimension) chartIntent.dimension = mem.lastChart.dimension
       const chartTool = (CRM_CHART_DIMS.has(chartIntent.dimension) || !vertical) ? 'suggest_crm_chart' : 'suggest_chart'
       const res = await TOOLS[chartTool](tenantId, chartIntent)
       chart = res.chart
-      session.lastChart = { ...chartIntent, spec: chart }
       observations.push({ tool: chartTool, result: chart })
     }
 
@@ -373,6 +451,10 @@ export async function buildApp({ pool, logger = true }) {
         lines.push(...o.result.map((i) => `• ${i.ticket_id} [${i.category}] ${i.description} (${i.status})`))
       } else if (o.tool === 'get_party' && o.result.length) {
         lines.push(...o.result.map((p) => `• ${p.name} (${p.type})`))
+      } else if (o.tool === 'run_sql' && o.result) {
+        if (o.result.error) lines.push(`• SQL tool: ${o.result.error}`)
+        else if (o.result.rows?.length) lines.push(`• SQL result (${o.result.rowCount} rows): ${JSON.stringify(o.result.rows.slice(0, 5)).slice(0, 400)}`)
+        else lines.push('• SQL result: no rows')
       } else if (o.tool.startsWith('suggest_') && o.result?.labels?.length) {
         lines.push(`• Chart ready: ${o.result.title} (${o.result.labels.length} bars) — rendered below.`)
       }
@@ -381,7 +463,7 @@ export async function buildApp({ pool, logger = true }) {
     const context = lines.join('\n')
 
     // 5) Multi-turn: include recent turns in the LLM prompt.
-    const history = session.turns.slice(-4).map((t) => `${t.role}: ${t.text}`).join('\n')
+    const history = mem.history.slice(-4).map((t) => `${t.role}: ${t.text}`).join('\n')
 
     if (provider.name !== 'local') {
       try {
@@ -403,9 +485,8 @@ export async function buildApp({ pool, logger = true }) {
     const latency = Date.now() - t0
     await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn, tokensOut, costUsd, latencyMs: latency })
 
-    // 6) Record this turn in the session (multi-turn).
-    session.turns.push({ role: 'user', text: message }, { role: 'assistant', text: replyText })
-    if (session.turns.length > 12) session.turns = session.turns.slice(-12)
+    // 6) Persist the turn (Phase 4 conversation memory).
+    await saveTurn(tenantId, session_id, { userText: message, assistantText: replyText, tools: toolNames, chart: chart ? { ...chartIntent, spec: chart } : null })
 
     reply.send({
       reply: replyText,
@@ -431,7 +512,7 @@ export async function buildApp({ pool, logger = true }) {
     const t0 = Date.now()
     const requestId = crypto.randomUUID()
     const provider = pickProvider(tenantId)
-    const session = getSession(tenantId, session_id)
+    const mem = await loadMemory(tenantId, session_id)
 
     send('start', { request_id: requestId, provider: provider.name })
 
@@ -448,16 +529,15 @@ export async function buildApp({ pool, logger = true }) {
     }
 
     // Chart intent — detect and stream a chart spec inline.
-    const chartIntent = detectChartIntent(message, session)
+    const chartIntent = detectChartIntent(message, mem)
     let chart = null
     if (chartIntent) {
-      if (!chartIntent.filter && session.lastChart?.filter) chartIntent.filter = session.lastChart.filter
-      if (!chartIntent.dimension && session.lastChart?.dimension) chartIntent.dimension = session.lastChart.dimension
+      if (!chartIntent.filter && mem.lastChart?.filter) chartIntent.filter = mem.lastChart.filter
+      if (!chartIntent.dimension && mem.lastChart?.dimension) chartIntent.dimension = mem.lastChart.dimension
       const chartTool = (CRM_CHART_DIMS.has(chartIntent.dimension) || !vertical) ? 'suggest_crm_chart' : 'suggest_chart'
       send('tool', { name: chartTool })
       const res = await TOOLS[chartTool](tenantId, chartIntent)
       chart = res.chart
-      session.lastChart = { ...chartIntent, spec: chart }
       send('chart', chart)
     }
 
@@ -478,13 +558,18 @@ export async function buildApp({ pool, logger = true }) {
       else if (o.tool === 'get_kpi' && o.result) lines.push(`KPIs: ${o.result.open_orders} orders, ${o.result.active_mt} MT, ${o.result.suppliers} suppliers`)
       else if (o.tool === 'get_issues' && o.result.length) lines.push(...o.result.map((i) => `${i.ticket_id} [${i.category}] ${i.description}`))
       else if (o.tool === 'get_party' && o.result.length) lines.push(...o.result.map((p) => `${p.name} (${p.type})`))
+      else if (o.tool === 'run_sql' && o.result) {
+        if (o.result.error) lines.push(`SQL tool: ${o.result.error}`)
+        else if (o.result.rows?.length) lines.push(`SQL result (${o.result.rowCount} rows): ${JSON.stringify(o.result.rows.slice(0, 5)).slice(0, 400)}`)
+        else lines.push('SQL result: no rows')
+      }
     }
     if (chart) lines.push(`Chart ready: ${chart.title} — rendered below.`)
     for (const s of semantic) lines.push(`[${s.source_type} ${s.source_id}] ${s.text}`)
     const context = lines.join('\n')
 
     let tokensOut = 0, tokensIn = 0
-    const history = session.turns.slice(-4).map((t) => `${t.role}: ${t.text}`).join('\n')
+    const history = mem.history.slice(-4).map((t) => `${t.role}: ${t.text}`).join('\n')
     if (provider.name !== 'local') {
       // Real LLM: call OpenRouter, then stream the response in word chunks.
       try {
@@ -510,8 +595,7 @@ export async function buildApp({ pool, logger = true }) {
       }
     }
     const latency = Date.now() - t0
-    session.turns.push({ role: 'user', text: message }, { role: 'assistant', text: context || 'ok' })
-    if (session.turns.length > 12) session.turns = session.turns.slice(-12)
+    await saveTurn(tenantId, session_id, { userText: message, assistantText: context || 'ok', tools: toolNames, chart: chart ? { ...chartIntent, spec: chart } : null })
     await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn, tokensOut, costUsd: 0, latencyMs: latency })
     send('done', { tools: toolNames, chart, usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId, tokens_in: tokensIn, tokens_out: tokensOut } })
     reply.raw.end()

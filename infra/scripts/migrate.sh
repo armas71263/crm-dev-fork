@@ -21,6 +21,7 @@ MIGRATIONS=(
   "004_crm|infra/migrations/004_crm.sql"
   "005_services_seed|infra/migrations/005_services_seed.sql"
   "006_directus|infra/migrations/006_directus.sql"
+  "007_chat_memory|infra/migrations/007_chat_memory.sql"
 )
 
 psql "$DSN" -v ON_ERROR_STOP=1 <<SQL
