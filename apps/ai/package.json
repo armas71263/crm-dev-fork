@@ -9,6 +9,8 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.45",
+    "ai": "^7.0.94",
     "fastify": "^4.26.0",
     "pg": "^8.11.0"
   }

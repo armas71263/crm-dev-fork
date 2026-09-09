@@ -1,6 +1,6 @@
 import { test, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildApp, makeTenantQuery, embed, plan, detectChartIntent, pickProvider, validateSql, extractSql } from '../src/app.js'
+import { buildApp, makeTenantQuery, embed, plan, detectChartIntent, pickProvider, validateSql, extractSql, realEmbed } from '../src/app.js'
 
 // ---- Fake pg pool: records every query, serves canned rows by SQL match ----
 function makeFakePool(matchers = []) {
@@ -37,6 +37,8 @@ afterEach(() => {
   delete process.env.OPENROUTER_API_KEY
   delete process.env.NIM_API_KEY
   delete process.env.OPENAI_API_KEY
+  delete process.env.CLOUDFLARE_API_TOKEN
+  delete process.env.CLOUDFLARE_ACCOUNT_ID
 })
 
 // ---- RLS session hygiene (same contract as the BFF) ----
@@ -455,4 +457,44 @@ test('chat turns persist to ai_chat_messages (Phase 4 conversation memory)', asy
   const toolsParam = JSON.parse(inserts[1].params[2])
   assert.ok(Array.isArray(toolsParam), 'tool names persist as JSON')
   await app.close()
+})
+
+test('pickProvider routes to cloudflare only with token AND account, falling back otherwise', () => {
+  delete process.env.CLOUDFLARE_ACCOUNT_ID
+  process.env.AI_PROVIDER = 'cloudflare'
+  delete process.env.CLOUDFLARE_API_TOKEN
+  assert.equal(pickProvider('a').name, 'local', 'no token → local')
+  process.env.CLOUDFLARE_API_TOKEN = 'cfut-test'
+  assert.equal(pickProvider('a').name, 'local', 'no account id → still local (fail closed)')
+  process.env.CLOUDFLARE_ACCOUNT_ID = 'acct123'
+  const p = pickProvider('beta')
+  assert.equal(p.name, 'cloudflare')
+  assert.equal(p.model, '@cf/qwen/qwen3.8-27b')
+  assert.equal(p.tenantId, 'beta')
+})
+
+test('realEmbed returns 768-d vectors and degrades to null without config', async () => {
+  delete process.env.CLOUDFLARE_API_TOKEN
+  delete process.env.CLOUDFLARE_ACCOUNT_ID
+  assert.equal(await realEmbed('hello'), null, 'unconfigured → null (hash fallback)')
+
+  process.env.CLOUDFLARE_API_TOKEN = 'cfut-test'
+  process.env.CLOUDFLARE_ACCOUNT_ID = 'acct123'
+  const real = globalThis.fetch
+  globalThis.fetch = async (url, opts) => {
+    assert.match(String(url), /ai\/run\/@cf\/baai\/bge-base-en-v1\.5$/)
+    assert.match(opts.headers['cf-aig-gateway-id'], /default/)
+    const v1 = new Array(768).fill(0.1); v1[1] = 0.2
+    const v2 = new Array(768).fill(0.3); v2[1] = 0.4
+    return { ok: true, json: async () => ({ success: true, result: { shape: [2, 768], data: [v1, v2] } }) }
+  }
+  try {
+    const single = await realEmbed('one text')
+    assert.equal(single.length, 768)
+    const batch = await realEmbed(['a', 'b'])
+    assert.equal(batch.length, 2)
+    assert.equal(batch[0][1], 0.2)
+  } finally {
+    globalThis.fetch = real
+  }
 })

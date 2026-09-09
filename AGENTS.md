@@ -85,3 +85,10 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - Text-to-SQL live: `/ai/chat` accepts `sql: SELECT ...`; runs on the `app_readonly` pool (SELECT-only grants, tenant-isolation RLS TO PUBLIC — fail-closed without the GUC, statement timeout). validateSql rejects multi-statement/mutation/forbidden keywords BEFORE the pool. Mutation attempts verified rejected live.
 - Conversation memory: migration 007 (ai_chat_sessions/ai_chat_messages, RLS) — the in-process session Map is gone; loadMemory/saveTurn persist turns + tool names + chart intents. Chart refinement survives service restarts (live-verified). Memory errors degrade to no-history, never break chat.
 - AI SDK v5 + real embeddings: deferred pending a provider key (OPENROUTER/NIM).
+
+## Phase 4 complete (2026-09-09, Cloudflare Workers AI)
+- Provider: `AI_PROVIDER=cloudflare` — qwen3.8-27b via the OpenAI-compatible endpoint (`/accounts/{id}/ai/v1`) routed through the AI Gateway (`cf-aig-gateway-id` header + per-tenant `cf-aig-metadata`); bge-base-en-v1.5 (768-d) embeddings via `/ai/run/{model}` (batch).
+- **ai SDK version pairing matters**: `ai@7` + `@ai-sdk/openai-compatible@3` (same spec). Mixing ai@5 with provider@3 fails with "Unsupported model version v4". In ai@7: `maxSteps` is GONE — use `stopWhen: stepCountIs(n)` (default stops at 1 step!); text deltas are `part.text` (not textDelta); usage is `.inputTokens`/`.outputTokens`.
+- **qwen3.8-27b is a reasoning model**: emits reasoning-* parts before text; with tools it may burn the whole step budget on retries — the routes synthesize a grounded fallback from tool observations when no final text arrives, so the user never gets silence.
+- Latent bug fixed: vertical suggest_chart mapped `type`/`category` dims onto records (no such columns) — now a per-dimension SPECS map (category→tickets) and both chart blocks are guarded (chart failure never 500s chat).
+- `.env` gotcha: AI_PROVIDER must exist as a line — an unset var silently means the `local` provider even when all CLOUDFLARE_* keys are present. Restart the whole dev.sh watchdog (it caches .env from ITS start time) after env changes.

@@ -115,7 +115,7 @@ for (const route of routes) {
     method: 'POST',
     headers: { cookie, 'content-type': 'application/json' },
     body: JSON.stringify({ message: 'pipeline overview', session_id: 'verify-' + Date.now() }),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(75000),
   })
   const ct = res.headers.get('content-type') || ''
   let ok = res.status === 200 && /text\/event-stream/.test(ct)

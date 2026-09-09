@@ -1,5 +1,7 @@
 import Fastify from 'fastify'
 import crypto from 'crypto'
+import { streamText, generateText, tool as sdkTool, jsonSchema, stepCountIs } from 'ai'
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 
 const DIM = 768
 
@@ -9,6 +11,7 @@ const PROVIDERS = {
   nim: { name: 'nim', model: process.env.NIM_MODEL || 'meta/llama-3.1-70b', keyEnv: 'NIM_API_KEY' },
   openai: { name: 'openai', model: process.env.OPENAI_MODEL || 'gpt-4o-mini', keyEnv: 'OPENAI_API_KEY' },
   ollama: { name: 'ollama', model: process.env.OLLAMA_MODEL || 'llama3.1', keyEnv: null },
+  cloudflare: { name: 'cloudflare', model: process.env.CLOUDFLARE_LLM_MODEL || '@cf/qwen/qwen3.8-27b', keyEnv: 'CLOUDFLARE_API_TOKEN' },
 }
 
 // A tenant's provider is chosen by env (default "local"). Real providers
@@ -19,34 +22,69 @@ export function pickProvider(tenantId) {
   const p = PROVIDERS[requested] || PROVIDERS.local
   // Real providers need a key (ollama needs a reachable host); else fall back.
   if (p.keyEnv && !process.env[p.keyEnv]) return PROVIDERS.local
+  if (p.name === 'cloudflare' && !process.env.CLOUDFLARE_ACCOUNT_ID) return PROVIDERS.local
   return { ...p, tenantId }
 }
 
-// Real LLM call via OpenRouter (Chat Completions API). Replaces the local
-// extractive stub with a grounded generateText call when an API key is present.
-async function llmGenerate(provider, systemPrompt, userPrompt) {
-  const key = process.env[provider.keyEnv]
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+// SDK model factory (AI SDK v5). Cloudflare Workers AI is served through its
+// OpenAI-compatible endpoint, routed via the AI Gateway (default gateway) with
+// each request tagged by tenant for gateway analytics; OpenRouter works through
+// the same interface.
+function makeSdkModel(provider) {
+  if (provider.name === 'cloudflare') {
+    const cf = createOpenAICompatible({
+      name: 'cloudflare',
+      baseURL: `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
+      apiKey: process.env.CLOUDFLARE_API_TOKEN,
+      headers: {
+        'cf-aig-gateway-id': process.env.CLOUDFLARE_AI_GATEWAY_ID || 'default',
+        'cf-aig-metadata': JSON.stringify({ tenant: provider.tenantId }),
+      },
+    })
+    return cf(provider.model)
+  }
+  if (provider.name === 'openrouter') {
+    const or = createOpenAICompatible({ name: 'openrouter', baseURL: 'https://openrouter.ai/api/v1', apiKey: process.env.OPENROUTER_API_KEY })
+    return or(provider.model)
+  }
+  return null
+}
+
+// Real embeddings via Cloudflare Workers AI (bge-base-en-v1.5, 768-d) through
+// the AI Gateway. Batch-capable; callers fall back to the hash embedder.
+export async function realEmbed(texts) {
+  const token = process.env.CLOUDFLARE_API_TOKEN
+  const account = process.env.CLOUDFLARE_ACCOUNT_ID
+  if (!token || !account) return null
+  const model = process.env.CLOUDFLARE_EMBED_MODEL || '@cf/baai/bge-base-en-v1.5'
+  const wasArray = Array.isArray(texts)
+  const input = (wasArray ? texts : [texts]).map((t) => String(t).slice(0, 1200))
+  const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/${model}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-    body: JSON.stringify({
-      model: provider.model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-    }),
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      'cf-aig-gateway-id': process.env.CLOUDFLARE_AI_GATEWAY_ID || 'default',
+    },
+    body: JSON.stringify({ text: input }),
   })
-  if (!res.ok) {
-    const err = await res.text()
-    throw new Error(`OpenRouter ${res.status}: ${err.slice(0, 200)}`)
+  if (!res.ok) throw new Error(`cloudflare embed ${res.status}: ${(await res.text()).slice(0, 120)}`)
+  const body = await res.json()
+  const data = body.result?.data || body.data
+  if (!Array.isArray(data) || !data.length || !Array.isArray(data[0]) || data[0].length !== 768) {
+    throw new Error('unexpected embedding shape from cloudflare')
   }
-  const data = await res.json()
-  return {
-    text: data.choices?.[0]?.message?.content || '(no response)',
-    tokensIn: data.usage?.prompt_tokens || 0,
-    tokensOut: data.usage?.completion_tokens || 0,
-  }
+  return wasArray ? data : data[0]
+}
+
+// Query embedding for semantic retrieval: real model when configured,
+// deterministic hash embedder otherwise.
+async function embedQuery(text) {
+  try {
+    const real = await realEmbed(text)
+    if (real) return real
+  } catch { /* fall through to the hash embedder */ }
+  return embed(text)
 }
 
 // Deterministic local embedding (hashing trick, L2-normalized).
@@ -280,14 +318,22 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     },
     // suggest_chart: aggregates the data and returns a chart spec the UI renders inline.
     suggest_chart: async (tenantId, { dimension, metric = 'count', title, filter }) => {
-      const DIMS = { grade: 'grade', customer: 'customer', supplier: 'supplier', status: 'status', category: 'category', type: 'type', month: "to_char(date_trunc('month', date), 'YYYY-MM')" }
+      // Dimension-to-table map: category lives on tickets, not records.
+      const SPECS = {
+        grade: { from: 'records', dim: 'grade' },
+        customer: { from: 'records', dim: 'customer' },
+        supplier: { from: 'records', dim: 'supplier' },
+        status: { from: 'records', dim: 'status' },
+        category: { from: 'tickets', dim: 'category' },
+        month: { from: 'records', dim: "to_char(date_trunc('month', date), 'YYYY-MM')" },
+      }
       const METRICS = { mt: 'sum(mt)', fcl: 'sum(fcl)', count: 'count(*)', revenue: 'sum(mt*price_usd)', avg_price: 'avg(price_usd)' }
-      const dim = DIMS[dimension] || DIMS.customer
+      const spec = SPECS[dimension] || SPECS.customer
       const met = METRICS[metric] || METRICS.count
       let where = '', params = []
-      if (filter) { where = 'WHERE grade ILIKE $1 OR customer ILIKE $1 OR supplier ILIKE $1'; params = [`%${filter}%`] }
+      if (filter && spec.from === 'records') { where = 'WHERE grade ILIKE $1 OR customer ILIKE $1 OR supplier ILIKE $1'; params = [`%${filter}%`] }
       const r = await tenantQuery(tenantId,
-        `SELECT ${dim} AS label, ${met}::float AS value FROM records ${where} GROUP BY 1 ORDER BY ${dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 20`, params)
+        `SELECT ${spec.dim} AS label, ${met}::float AS value FROM ${spec.from} ${where} GROUP BY 1 ORDER BY ${dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 20`, params)
       return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) } }
     },
 
@@ -342,6 +388,47 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     },
   }
 
+  // SDK tool definitions: the model plans and calls these (AI SDK v5);
+  // execution stays in TOOLS — same tenant-scoped implementations, same
+  // guardrails (run_sql validates before it ever touches the readonly pool).
+  function sdkTools(tid) {
+    const defs = {
+      search_crm: {
+        d: 'Search the CRM — companies, contacts, leads, deals, activities — by keyword.',
+        s: { type: 'object', properties: { q: { type: 'string', description: 'keyword' } }, required: ['q'] },
+      },
+      get_crm_kpi: {
+        d: 'CRM KPIs: companies, contacts, open leads, open deals, pipeline value, open tasks. Use for overview and how-many questions.',
+        s: { type: 'object', properties: {} },
+      },
+      search_records: {
+        d: 'Search rubber-trading order records by keyword (order id, customer, supplier, grade).',
+        s: { type: 'object', properties: { q: { type: 'string', description: 'keyword' } }, required: ['q'] },
+      },
+      get_kpi: {
+        d: 'Trading KPIs: open orders, active MT, suppliers, customers.',
+        s: { type: 'object', properties: {} },
+      },
+      get_issues: {
+        d: 'Recent open quality tickets.',
+        s: { type: 'object', properties: {} },
+      },
+      get_party: {
+        d: 'Look up suppliers and customers by name.',
+        s: { type: 'object', properties: { q: { type: 'string', description: 'party name' } }, required: ['q'] },
+      },
+      run_sql: {
+        d: 'Run a read-only SQL query (a single SELECT or WITH...SELECT statement only) against the tenant database, for questions the other tools cannot answer.',
+        s: { type: 'object', properties: { sql: { type: 'string', description: 'the SELECT statement to run' } }, required: ['sql'] },
+      },
+    }
+    const out = {}
+    for (const [name, { d, s }] of Object.entries(defs)) {
+      out[name] = sdkTool({ description: d, inputSchema: jsonSchema(s), execute: (args) => TOOLS[name](tid, args) })
+    }
+    return out
+  }
+
   // Reindex a tenant's knowledge base into the embeddings table.
   fastify.post('/index', async (req) => {
     const tenantId = req.headers['x-tenant-id']
@@ -380,8 +467,13 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
 
     await tenantQuery(tenantId, 'DELETE FROM embeddings')
     let indexed = 0
-    for (const s of sources) {
-      const vec = embed(s.text)
+    // Real embeddings (bge-base 768-d) when configured — one batched call;
+    // deterministic hash embedder otherwise.
+    let vectors = null
+    try { vectors = await realEmbed(sources.map((s) => s.text)) }
+    catch (e) { fastify.log.warn({ err: e.message }, 'real embeddings unavailable — hash fallback') }
+    for (const [i, s] of sources.entries()) {
+      const vec = vectors ? vectors[i] : embed(s.text)
       await tenantQuery(tenantId,
         `INSERT INTO embeddings (tenant_id, source_type, source_id, metadata, vector)
          VALUES (app.current_tenant(), $1, $2, $3::jsonb, $4::vector)`,
@@ -403,10 +495,10 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     const provider = pickProvider(tenantId)
     const mem = await loadMemory(tenantId, session_id)
 
-    // 1) Plan which tools to run. CRM tools always; vertical tools only when
-    // the tenant has vertical rows. Multi-turn: prepend recent history to context.
+    // 1) Plan which tools to run. The local provider uses the keyword planner;
+    // real providers run the SDK agent loop below (the model picks tools).
     const vertical = await hasVerticalData(tenantId)
-    const toolCalls = plan(message, { vertical })
+    const toolCalls = provider.name === 'local' ? plan(message, { vertical }) : []
     const observations = []
     for (const tc of toolCalls) {
       const obs = await TOOLS[tc.name](tenantId, tc.args)
@@ -421,22 +513,31 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
       if (!chartIntent.filter && mem.lastChart?.filter) chartIntent.filter = mem.lastChart.filter
       if (!chartIntent.dimension && mem.lastChart?.dimension) chartIntent.dimension = mem.lastChart.dimension
       const chartTool = (CRM_CHART_DIMS.has(chartIntent.dimension) || !vertical) ? 'suggest_crm_chart' : 'suggest_chart'
-      const res = await TOOLS[chartTool](tenantId, chartIntent)
-      chart = res.chart
-      observations.push({ tool: chartTool, result: chart })
+      try {
+        const res = await TOOLS[chartTool](tenantId, chartIntent)
+        chart = res.chart
+        observations.push({ tool: chartTool, result: chart })
+      } catch (e) {
+        fastify.log.warn({ err: e.message }, 'chart tool failed — continuing without a chart')
+        chart = null
+      }
     }
 
-    // 3) Semantic retrieval from the knowledge base.
-    const vec = embed(message)
-    const hits = await tenantQuery(tenantId,
-      `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
-       FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
-    const semantic = hits.rows.filter((r) => r.score > 0)
+    // 3) Semantic retrieval from the knowledge base (local path — the SDK
+    //    agent retrieves via tools). Real embeddings when configured.
+    let semantic = []
+    if (provider.name === 'local') {
+      const vec = await embedQuery(message)
+      const hits = await tenantQuery(tenantId,
+        `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
+         FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
+      semantic = hits.rows.filter((r) => r.score > 0)
+    }
 
     // 4) Synthesize. Real provider calls OpenRouter with the gathered context;
     //    local provider = extractive grounded answer.
     let replyText, tokensIn = message.length, tokensOut = 0, costUsd = 0
-    const toolNames = observations.map((o) => o.tool)
+    let toolNames = observations.map((o) => o.tool)
     const lines = []
     for (const o of observations) {
       if (o.tool === 'search_records' && o.result.length) {
@@ -466,11 +567,26 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     const history = mem.history.slice(-4).map((t) => `${t.role}: ${t.text}`).join('\n')
 
     if (provider.name !== 'local') {
+      // SDK agent path (AI SDK v5): the model plans and calls tools itself,
+      // grounded in the tenant's data; conversation memory rides along.
       try {
-        const sys = `You are a B2B operations assistant for tenant "${tenantId}". Answer the user's question using ONLY the context below. Be concise and specific. If the context doesn't contain the answer, say so.`
-        const result = await llmGenerate(provider, sys, `Recent conversation:\n${history}\n\nContext:\n${context}\n\nQuestion: ${message}`)
-        replyText = result.text
-        tokensIn = result.tokensIn; tokensOut = result.tokensOut
+        const result = await generateText({
+          model: makeSdkModel(provider),
+          system: `You are a B2B CRM + operations assistant for tenant "${tenantId}". Answer grounded in the tenant's data using the provided tools. Be concise and specific. Prefer the dedicated search/KPI tools; only use run_sql for questions they cannot answer (a single read-only SELECT). Once you have relevant results, answer immediately — do not repeat similar tool calls. If the tools don't contain the answer, say so.`,
+          messages: [...mem.history.slice(-8).map((t) => ({ role: t.role, content: t.text })), { role: 'user', content: message }],
+          tools: sdkTools(tenantId),
+          stopWhen: stepCountIs(8),
+        })
+        replyText = result.text || ''
+        toolNames = [...toolNames, ...result.toolCalls.map((c) => c.toolName)]
+        tokensIn = result.usage.inputTokens || 0
+        tokensOut = result.usage.outputTokens || 0
+        if (!replyText.trim()) {
+          // Step budget exhausted before a final answer — synthesize one from
+          // the tool observations so the user never gets silence.
+          const obsLines = (result.toolResults || []).map((r) => `${r.toolName}: ${JSON.stringify(r.result).slice(0, 300)}`)
+          replyText = obsLines.length ? `Based on ${tenantId}'s data (tools: ${toolNames.join(', ')}):\n${obsLines.join('\n')}` : `I couldn't find anything relevant for "${message}".`
+        }
       } catch (e) {
         fastify.log.warn({ msg: 'LLM call failed, falling back', err: e.message })
         replyText = context ? `Based on ${tenantId}'s data (tools: ${toolNames.join(', ')}):\n${context}` : `I couldn't find anything relevant for "${message}".`
@@ -517,9 +633,10 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     send('start', { request_id: requestId, provider: provider.name })
 
     // Plan + run tools, streaming each tool observation as it completes.
-    // CRM tools always; vertical tools only when the tenant has vertical rows.
+    // The local provider uses the keyword planner; real providers stream the
+    // SDK agent loop below (model-driven tool calls).
     const vertical = await hasVerticalData(tenantId)
-    const toolCalls = plan(message, { vertical })
+    const toolCalls = provider.name === 'local' ? plan(message, { vertical }) : []
     const observations = []
     for (const tc of toolCalls) {
       send('tool', { name: tc.name })
@@ -535,21 +652,29 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
       if (!chartIntent.filter && mem.lastChart?.filter) chartIntent.filter = mem.lastChart.filter
       if (!chartIntent.dimension && mem.lastChart?.dimension) chartIntent.dimension = mem.lastChart.dimension
       const chartTool = (CRM_CHART_DIMS.has(chartIntent.dimension) || !vertical) ? 'suggest_crm_chart' : 'suggest_chart'
-      send('tool', { name: chartTool })
-      const res = await TOOLS[chartTool](tenantId, chartIntent)
-      chart = res.chart
-      send('chart', chart)
+      try {
+        send('tool', { name: chartTool })
+        const res = await TOOLS[chartTool](tenantId, chartIntent)
+        chart = res.chart
+        send('chart', chart)
+      } catch (e) {
+        fastify.log.warn({ err: e.message }, 'chart tool failed — continuing without a chart')
+        chart = null
+      }
     }
 
-    // Semantic retrieval.
-    const vec = embed(message)
-    const hits = await tenantQuery(tenantId,
-      `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
-       FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
-    const semantic = hits.rows.filter((r) => r.score > 0)
+    // Semantic retrieval (local path — the SDK agent retrieves via tools).
+    let semantic = []
+    if (provider.name === 'local') {
+      const vec = await embedQuery(message)
+      const hits = await tenantQuery(tenantId,
+        `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
+         FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
+      semantic = hits.rows.filter((r) => r.score > 0)
+    }
 
     // Synthesize and stream token-by-token (word chunks for the local provider).
-    const toolNames = observations.map((o) => o.tool)
+    let toolNames = observations.map((o) => o.tool)
     const lines = []
     for (const o of observations) {
       if (o.tool === 'search_records' && o.result.length) lines.push(...o.result.map((r) => `${r.order_id}: ${r.customer} ${r.grade} ${r.mt}MT (${r.status})`))
@@ -568,18 +693,37 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     for (const s of semantic) lines.push(`[${s.source_type} ${s.source_id}] ${s.text}`)
     const context = lines.join('\n')
 
-    let tokensOut = 0, tokensIn = 0
-    const history = mem.history.slice(-4).map((t) => `${t.role}: ${t.text}`).join('\n')
+    let tokensOut = 0, tokensIn = 0, sdkReply = ''
     if (provider.name !== 'local') {
-      // Real LLM: call OpenRouter, then stream the response in word chunks.
+      // SDK agent path (AI SDK v5): streamed tool-calls + text deltas.
       try {
-        const sys = `You are a B2B operations assistant for tenant "${tenantId}". Answer using ONLY the context below. Be concise.`
-        const result = await llmGenerate(provider, sys, `Recent conversation:\n${history}\n\nContext:\n${context}\n\nQuestion: ${message}`)
-        tokensIn = result.tokensIn; tokensOut = result.tokensOut
-        const words = result.text.split(/(\s+)/)
-        for (const w of words) {
-          send('token', { text: w })
-          await new Promise((r) => setTimeout(r, 12))
+        const stream = streamText({
+          model: makeSdkModel(provider),
+          system: `You are a B2B CRM + operations assistant for tenant "${tenantId}". Answer grounded in the tenant's data using the provided tools. Be concise and specific. Prefer the dedicated search/KPI tools; only use run_sql for questions they cannot answer (a single read-only SELECT). Once you have relevant results, answer immediately — do not repeat similar tool calls. If the tools don't contain the answer, say so.`,
+          messages: [...mem.history.slice(-8).map((t) => ({ role: t.role, content: t.text })), { role: 'user', content: message }],
+          tools: sdkTools(tenantId),
+          stopWhen: stepCountIs(8),
+        })
+        const toolResults = []
+        for await (const part of stream.fullStream) {
+          if (part.type === 'tool-call') send('tool', { name: part.toolName })
+          else if (part.type === 'tool-result') {
+            toolResults.push({ toolName: part.toolName, result: part.result })
+            send('observation', { tool: part.toolName, count: Array.isArray(part.result) ? part.result.length : 1 })
+          }
+          else if (part.type === 'text-delta') send('token', { text: part.text })
+        }
+        const usage = await stream.usage
+        tokensIn = usage.inputTokens || 0
+        tokensOut = usage.outputTokens || 0
+        toolNames = [...toolNames, ...(await stream.toolCalls).map((c) => c.toolName)]
+        sdkReply = await stream.text
+        if (!sdkReply || !sdkReply.trim()) {
+          // Step budget exhausted before a final answer — stream a synthesized
+          // one from the tool observations so the user never gets silence.
+          const obsLines = toolResults.map((r) => `${r.toolName}: ${JSON.stringify(r.result).slice(0, 300)}`)
+          sdkReply = obsLines.length ? `Based on ${tenantId}'s data (tools: ${toolNames.join(', ')}):\n${obsLines.join('\n')}` : `Nothing found for "${message}".`
+          for (const w of sdkReply.split(/(\s+)/)) { send('token', { text: w }); await new Promise((r) => setTimeout(r, 8)) }
         }
       } catch (e) {
         send('token', { text: `(LLM unavailable: ${e.message.slice(0,80)}) Falling back to data:\n` })
@@ -595,7 +739,7 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
       }
     }
     const latency = Date.now() - t0
-    await saveTurn(tenantId, session_id, { userText: message, assistantText: context || 'ok', tools: toolNames, chart: chart ? { ...chartIntent, spec: chart } : null })
+    await saveTurn(tenantId, session_id, { userText: message, assistantText: sdkReply || context || 'ok', tools: toolNames, chart: chart ? { ...chartIntent, spec: chart } : null })
     await logUsage(tenantId, { requestId, provider: provider.name, model: provider.model, tool: toolNames.join(',') || 'planner', tokensIn, tokensOut, costUsd: 0, latencyMs: latency })
     send('done', { tools: toolNames, chart, usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId, tokens_in: tokensIn, tokens_out: tokensOut } })
     reply.raw.end()
