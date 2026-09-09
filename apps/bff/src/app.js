@@ -74,6 +74,11 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
         ))
       if (!allowed) return reply.code(403).send({ error: 'forbidden: customer role is portal-scoped' })
     }
+    // The tenant registry is vendor territory: ordinary tenant staff get 403
+    // on /tenants* (their own branding is served by /data/theme instead).
+    if (req.auth.role !== 'vendor' && /^\/tenants/.test(req.url.split('?')[0])) {
+      return reply.code(403).send({ error: 'forbidden: tenant registry requires the vendor role' })
+    }
   })
 
   fastify.get('/health', async () => ({ ok: true, service: 'bff' }))
@@ -111,6 +116,19 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   registerCrmRoutes(fastify, { tenantQuery, writeAudit })
 
   // ---- Data endpoints (RLS-enforced) ----
+  // Module presence: the web nav shows the vertical (template) screens only
+  // when the tenant actually holds vertical rows — same probe logic as the
+  // AI service's hasVerticalData.
+  fastify.get('/data/modules', async (req) => {
+    const r = await tenantQuery(req, 'SELECT count(*)::int AS n FROM records')
+    return { vertical: r.rows[0].n > 0 }
+  })
+
+  fastify.get('/data/feed', async (req) => {
+    const r = await tenantQuery(req, 'SELECT category, title, description, priority, published_at FROM feed_items ORDER BY published_at DESC LIMIT 100')
+    return { feed: r.rows }
+  })
+
   fastify.get('/data/dashboard', async (req) => {
     const records = await tenantQuery(req, 'SELECT order_id, customer, supplier, grade, mt, fcl, price_usd, status FROM records ORDER BY created_at DESC')
     const kpi = await tenantQuery(req, `SELECT
@@ -136,6 +154,12 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
   })
 
   fastify.get('/data/parties', async (req) => {
+    // ?full=1 returns row objects (web tables); the default name-list shape
+    // stays for the legacy preview SPA.
+    if (req.query.full === '1' || req.query.full === 'true') {
+      const r = await tenantQuery(req, "SELECT name, type, contact, tags FROM parties ORDER BY name")
+      return { parties: r.rows }
+    }
     const sup = await tenantQuery(req, "SELECT name FROM parties WHERE type='supplier' ORDER BY name")
     const cus = await tenantQuery(req, "SELECT name FROM parties WHERE type='customer' ORDER BY name")
     return { suppliers: sup.rows.map(r => r.name), customers: cus.rows.map(r => r.name) }
@@ -435,6 +459,70 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
     }
     await adminPool.query('UPDATE app.tenants SET tier=$1 WHERE id=$2', [toTier, id])
     return { escalated: true, id, fromTier, toTier, isolation: toTier === 'B' ? `tenant_${id} schema` : `tenant_${id} database` }
+  })
+
+  // ---- Users & invites (tenant-scoped) ----
+  // Profiles live in Postgres (RLS tenant_isolation, migration 003); creating
+  // auth users needs the Supabase service role — this is the only place that
+  // key ever reaches, and it never leaves the server.
+  fastify.get('/users', async (req) => {
+    const r = await tenantQuery(req, 'SELECT id, role, company_id, display_name, created_at FROM profiles ORDER BY created_at')
+    return { users: r.rows }
+  })
+
+  fastify.post('/users/invite', async (req, reply) => {
+    const { email, role = 'staff', companyId = null, displayName = null } = req.body || {}
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(email))) return reply.code(400).send({ error: 'valid email required' })
+    if (!['staff', 'customer'].includes(role)) return reply.code(400).send({ error: 'role must be staff or customer' })
+    if (role === 'customer' && !companyId) return reply.code(400).send({ error: 'customer invites need a companyId' })
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+    const base = process.env.SUPABASE_URL
+    if (!key || !base) return reply.code(503).send({ error: 'invites are not configured (missing service key)' })
+    const create = await fetch(`${base}/auth/v1/admin/users`, {
+      method: 'POST',
+      headers: { apikey: key, authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ email, app_metadata: { tenant_id: req.tenantId, role, company_id: companyId }, email_confirm: true }),
+    })
+    if (create.status === 422) return reply.code(409).send({ error: 'a user with this email already exists' })
+    if (!create.ok) {
+      fastify.log.warn({ status: create.status }, 'admin createUser failed')
+      return reply.code(502).send({ error: 'identity provider rejected the invite' })
+    }
+    const user = await create.json()
+    // Recovery link = the invitee sets their own password on first use (no
+    // email infrastructure in the loop yet).
+    let inviteUrl = null
+    try {
+      const link = await fetch(`${base}/auth/v1/admin/generate_link`, {
+        method: 'POST',
+        headers: { apikey: key, authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'recovery', email }),
+      })
+      if (link.ok) inviteUrl = (await link.json()).action_link || null
+    } catch { /* user exists; the link is a convenience, not a hard requirement */ }
+    await tenantQuery(req,
+      `INSERT INTO profiles (id, tenant_id, company_id, role, display_name) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET role=EXCLUDED.role, company_id=EXCLUDED.company_id, display_name=EXCLUDED.display_name`,
+      [user.id, req.tenantId, companyId, role, displayName])
+    await writeAudit(req, 'invite', 'profiles', user.id, { email, role })
+    return reply.code(201).send({ user: { id: user.id, email: user.email || email }, invite_url: inviteUrl })
+  })
+
+  // Per-tenant branding, self-scoped: staff and vendors read/write their own
+  // tenant's theme. The /tenants/:id/theme routes stay for vendor tooling.
+  fastify.get('/data/theme', async (req) => {
+    const r = await adminPool.query('SELECT theme, label FROM app.tenants WHERE id=$1', [req.tenantId])
+    if (!r.rows.length) return { tenant: req.tenantId, label: null, theme: {} }
+    return { tenant: req.tenantId, label: r.rows[0].label, theme: r.rows[0].theme || {} }
+  })
+
+  fastify.put('/data/theme', async (req, reply) => {
+    const { theme } = req.body || {}
+    if (!theme || typeof theme !== 'object' || Array.isArray(theme)) return reply.code(400).send({ error: 'theme object required' })
+    const r = await adminPool.query('UPDATE app.tenants SET theme=$1 WHERE id=$2 RETURNING theme, label', [JSON.stringify(theme), req.tenantId])
+    if (!r.rows.length) return reply.code(404).send({ error: 'tenant not found' })
+    await writeAudit(req, 'update', 'app.tenants', null, { keys: Object.keys(theme) })
+    return { tenant: req.tenantId, label: r.rows[0].label, theme: r.rows[0].theme }
   })
 
   // Per-tenant branding (Phase 5a) — read/update the theme JSON stored in app.tenants.

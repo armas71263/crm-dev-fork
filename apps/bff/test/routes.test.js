@@ -583,3 +583,88 @@ test('GET /search includes the CRM collection legs', async () => {
   await app.close()
 })
 
+// ---- Vendor gate: the tenant registry is vendor territory ----
+test('staff JWTs are 403 from /tenants*, vendor JWTs pass; /data/theme serves own tenant', async () => {
+  const staffAuth = { mode: 'jwt', verify: async () => ({ userId: 'u1', tenantId: 'alpha', companyId: null, role: 'staff' }) }
+  const staffApp = await buildApp({
+    pool: tenantScoped().pool, adminPool: makeFakePool().pool,
+    aiServiceUrl: 'http://127.0.0.1:9', auth: staffAuth, logger: false,
+  })
+  assert.equal((await staffApp.inject({ method: 'GET', url: '/tenants', headers: { authorization: 'Bearer t' } })).statusCode, 403, 'ordinary tenant staff must not see the tenant registry')
+  assert.equal((await staffApp.inject({ method: 'POST', url: '/tenants', headers: { authorization: 'Bearer t' }, payload: { id: 'x', label: 'X' } })).statusCode, 403)
+  await staffApp.close()
+
+  const vendorAuth = { mode: 'jwt', verify: async () => ({ userId: 'v1', tenantId: 'alpha', companyId: null, role: 'vendor' }) }
+  const admin = makeFakePool([[/FROM app\.tenants ORDER BY/, [{ id: 'alpha', label: 'Alpha', template: 'rubbertrack', tier: 'A', status: 'active', created_at: '2026-09-01' }]]])
+  const vendorApp = await buildApp({
+    pool: tenantScoped().pool, adminPool: admin.pool,
+    aiServiceUrl: 'http://127.0.0.1:9', auth: vendorAuth, logger: false,
+  })
+  const list = await vendorApp.inject({ method: 'GET', url: '/tenants', headers: { authorization: 'Bearer t' } })
+  assert.equal(list.statusCode, 200)
+  assert.deepEqual(JSON.parse(list.body).tenants[0], { id: 'alpha', label: 'Alpha', template: 'rubbertrack', tier: 'A', status: 'active', created_at: '2026-09-01' })
+  await vendorApp.close()
+})
+
+test('GET/PUT /data/theme scope branding to the caller own tenant', async () => {
+  const auth = { mode: 'jwt', verify: async () => ({ userId: 'u1', tenantId: 'alpha', companyId: null, role: 'staff' }) }
+  const admin = makeFakePool([[/SELECT theme, label FROM app\.tenants WHERE id=\$1/, [{ theme: { accent: '#123456' }, label: 'Alpha' }]]])
+  const app = await buildApp({ pool: tenantScoped().pool, adminPool: admin.pool, aiServiceUrl: 'http://127.0.0.1:9', auth, logger: false })
+  const H = { authorization: 'Bearer t' }
+  const get = await app.inject({ method: 'GET', url: '/data/theme', headers: H })
+  assert.equal(get.statusCode, 200)
+  const b = JSON.parse(get.body)
+  assert.equal(b.tenant, 'alpha')
+  assert.equal(b.label, 'Alpha')
+  assert.equal(b.theme.accent, '#123456')
+  assert.equal(admin.calls[0].params[0], 'alpha', 'theme reads are scoped to the token tenant, never a path parameter')
+
+  const bad = await app.inject({ method: 'PUT', url: '/data/theme', headers: { ...H, 'content-type': 'application/json' }, payload: { theme: 'not-an-object' } })
+  assert.equal(bad.statusCode, 400)
+  await app.close()
+})
+
+// ---- Module flag + feed + parties full mode ----
+test('GET /data/modules reports vertical presence; /data/feed lists the news', async () => {
+  const { app } = await makeApp([
+    [/count\(\*\)::int AS n FROM records/, [{ n: 3 }]],
+    [/FROM feed_items ORDER BY published_at DESC LIMIT 100/, [{ category: 'market', title: 'Rubber up', priority: 'high', published_at: '2026-09-01', description: 'd' }]],
+  ])
+  const mods = JSON.parse((await app.inject({ method: 'GET', url: '/data/modules' })).body)
+  assert.equal(mods.vertical, true)
+  const feed = JSON.parse((await app.inject({ method: 'GET', url: '/data/feed' })).body)
+  assert.equal(feed.feed[0].title, 'Rubber up')
+  await app.close()
+})
+
+test('GET /data/parties?full=1 returns row objects for the web tables', async () => {
+  const { app } = await makeApp([
+    [/SELECT name, type, contact, tags FROM parties/, [{ name: 'BKT', type: 'customer', contact: { name: 'Raj' }, tags: [] }]],
+  ])
+  const body = JSON.parse((await app.inject({ method: 'GET', url: '/data/parties?full=1' })).body)
+  assert.deepEqual(body.parties, [{ name: 'BKT', type: 'customer', contact: { name: 'Raj' }, tags: [] }])
+  await app.close()
+})
+
+// ---- Users & invites ----
+test('GET /users lists tenant profiles through the staff pool', async () => {
+  const { app } = await makeApp([
+    [/FROM profiles ORDER BY created_at/, [{ id: 'u1', role: 'staff', company_id: null, display_name: 'RT Admin', created_at: '2026-09-01' }]],
+  ])
+  const body = JSON.parse((await app.inject({ method: 'GET', url: '/users', headers: { 'x-tenant-id': 'alpha' } })).body)
+  assert.equal(body.users[0].display_name, 'RT Admin')
+  await app.close()
+})
+
+test('POST /users/invite validates input and fails closed without a service key', async () => {
+  const { app } = await makeApp()
+  const H = { 'x-tenant-id': 'alpha', 'content-type': 'application/json' }
+  assert.equal((await app.inject({ method: 'POST', url: '/users/invite', headers: H, payload: { email: 'nope' } })).statusCode, 400)
+  assert.equal((await app.inject({ method: 'POST', url: '/users/invite', headers: H, payload: { email: 'a@b.co', role: 'admin' } })).statusCode, 400, 'only staff/customer roles can be granted')
+  assert.equal((await app.inject({ method: 'POST', url: '/users/invite', headers: H, payload: { email: 'a@b.co', role: 'customer' } })).statusCode, 400, 'customer invites need a companyId')
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY
+  delete process.env.SUPABASE_URL
+  const noKey = await app.inject({ method: 'POST', url: '/users/invite', headers: H, payload: { email: 'a@b.co', role: 'staff' } })
+  assert.equal(noKey.statusCode, 503, 'invites must fail closed without a configured service key')
+  await app.close()
+})
