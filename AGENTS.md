@@ -92,3 +92,9 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - **qwen3.8-27b is a reasoning model**: emits reasoning-* parts before text; with tools it may burn the whole step budget on retries — the routes synthesize a grounded fallback from tool observations when no final text arrives, so the user never gets silence.
 - Latent bug fixed: vertical suggest_chart mapped `type`/`category` dims onto records (no such columns) — now a per-dimension SPECS map (category→tickets) and both chart blocks are guarded (chart failure never 500s chat).
 - `.env` gotcha: AI_PROVIDER must exist as a line — an unset var silently means the `local` provider even when all CLOUDFLARE_* keys are present. Restart the whole dev.sh watchdog (it caches .env from ITS start time) after env changes.
+
+## Phase 5 (2026-09-10, predictions)
+- apps/predictions: FastAPI in a uv venv (python3.12 — pip needs a venv, PEP 668). dev.sh supervises :5100 with a health check. Connects as app_role via the session pooler with set_config(app.tenant_id) per connection (RLS boundary).
+- Forecaster: damped-trend Holt ETS (statsmodels) — deliberately NOT trend-ARIMA: a single outlying month made ARIMA extrapolate ~4x the level. Chronos-Bolt (AutoGluon) is opt-in via PREDICTIONS_USE_CHRONOS=1 (downloaded into the venv but unverified in this environment).
+- Migration 008: predictions table (RLS, app_role grants) + synthetic 24-month order history (ORD-HIST-* rows, idempotent) for the demo tenant. The series is a monthly AGGREGATE (~720 MT base).
+- Forecast flow: web Generate button -> /api/forecast proxy -> BFF POST /data/forecast -> predictions service (retrain + upsert) -> dashboard reads GET /data/forecast/:series; the assistant reads the stored row via the get_forecast tool (never fabricates).

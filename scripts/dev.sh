@@ -31,6 +31,13 @@ start_ai() {
   setsid node apps/ai/src/index.js < /dev/null >> "$AI_LOG" 2>&1 &
 }
 
+# Predictions service (Phase 5): tenant-series forecasting on :5100.
+start_predictions() {
+  pkill -f 'uvicorn main:app' 2>/dev/null
+  sleep 0.5
+  ( cd apps/predictions && setsid .venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 5100 < /dev/null >> /tmp/devstack/predictions.log 2>&1 & )
+}
+
 start_next() {
   pkill -f 'next dev' 2>/dev/null
   sleep 0.5
@@ -39,6 +46,7 @@ start_next() {
 
 start_bff
 start_ai
+start_predictions
 start_next
 
 # Any completed HTTP response (even 3xx/4xx) means the server is alive;
@@ -52,6 +60,10 @@ while true; do
   if ! curl -s -m 4 -o /dev/null http://127.0.0.1:4000/health; then
     echo "[dev.sh] $(date +%T) BFF unresponsive — restarting" >> "$BFF_LOG"
     start_bff
+  fi
+  if ! curl -s -m 4 -o /dev/null http://127.0.0.1:5100/health; then
+    echo "[dev.sh] $(date +%T) predictions unresponsive — restarting" >> /tmp/devstack/predictions.log
+    start_predictions
   fi
   if ! curl -s -m 4 -o /dev/null http://127.0.0.1:3000/; then
     echo "[dev.sh] $(date +%T) next unresponsive — restarting" >> "$NEXT_LOG"

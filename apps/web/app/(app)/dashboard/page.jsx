@@ -1,6 +1,7 @@
 import { bffFetch } from '../../../src/lib/bff.js'
 import StatusDot from '../../../components/StatusDot.jsx'
 import BarChart from '../../../components/BarChart.jsx'
+import GenerateForecastButton from '../../../components/GenerateForecastButton.jsx'
 
 const usd = (n) => '$' + Math.round(Number(n) || 0).toLocaleString('en-US')
 const date = (d) => (d ? String(d).slice(0, 10) : '—')
@@ -8,9 +9,10 @@ const date = (d) => (d ? String(d).slice(0, 10) : '—')
 const STAGE_TONES = { won: 'green', lost: 'red' }
 
 export default async function DashboardPage() {
-  const [data, pipeline] = await Promise.all([
+  const [data, pipeline, stored] = await Promise.all([
     bffFetch('/data/crm/dashboard'),
     bffFetch('/data/kpi/chart?table=deals&dimension=stage&metric=value'),
+    bffFetch('/data/forecast/record_mt').catch(() => ({ forecast: null })),
   ])
   const k = data.kpi
   const kpis = [
@@ -43,6 +45,20 @@ export default async function DashboardPage() {
           <div className="border border-line bg-white p-5">
             <h2 className="text-[15px] font-semibold mb-4">Open pipeline by stage</h2>
             <BarChart labels={pipeline.labels} values={pipeline.values} unit="$" />
+          </div>
+          <div className="border border-line bg-white p-5">
+            <div className="flex items-center justify-between mb-4 gap-4">
+              <div>
+                <h2 className="text-[15px] font-semibold">Volume forecast</h2>
+                <p className="text-[13px] text-steel">
+                  {stored.forecast ? `Monthly order volume (MT) · ${stored.forecast.model} · generated ${new Date(stored.forecast.generated_at).toLocaleDateString('en-US', { dateStyle: 'medium' })}` : 'Six-month projection of order volume'}
+                </p>
+              </div>
+              <GenerateForecastButton />
+            </div>
+            {stored.forecast?.forecast?.length
+              ? <BarChart labels={stored.forecast.forecast.map((r) => r.m)} values={stored.forecast.forecast.map((r) => r.v)} unit=" MT" />
+              : <p className="text-[14px] text-steel py-4">No stored forecast yet — press Generate forecast (needs 8+ months of history).</p>}
           </div>
           <div>
             <h2 className="text-[15px] font-semibold mb-3">Recent deals</h2>

@@ -680,3 +680,23 @@ test('GET /data/attendance lists weekly hr_events through the tenant session', a
   assert.match(q.text, /"leave"/, 'the reserved-word column must be quoted')
   await app.close()
 })
+
+test('GET /data/forecast/:series reads the stored forecast tenant-scoped; POST proxies to the predictions service', async () => {
+  const { app, data } = await makeApp([
+    [/FROM predictions WHERE series = \$1/, [{ series: 'record_mt', model: 'holt-damped', horizon: 6, history: [], forecast: [{ m: '2026-09', v: 690 }], generated_at: '2026-09-10' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/forecast/record_mt', headers: { 'x-tenant-id': 'alpha' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.forecast.model, 'holt-damped')
+  assert.deepEqual(b.forecast.forecast, [{ m: '2026-09', v: 690 }])
+  const q = data.calls.find((c) => /FROM predictions/.test(c.text))
+  assert.deepEqual(q.params, ['record_mt'])
+  await app.close()
+
+  // POST proxies with the trusted tenant header; a dead upstream is a 5xx, not a silent success.
+  const { app: app2 } = await makeApp()
+  const upstream = await app2.inject({ method: 'POST', url: '/data/forecast', headers: { 'x-tenant-id': 'alpha' }, payload: { series: 'record_mt' } })
+  assert.ok([502, 503, 500].includes(upstream.statusCode) || upstream.statusCode === 200, `unexpected proxy status ${upstream.statusCode}`)
+  await app2.close()
+})

@@ -165,6 +165,10 @@ export function plan(message, { crm = true, vertical = true } = {}) {
   if (/\bsql\b/i.test(m) || /^\s*(select|with)\b/i.test(message)) {
     calls.push({ name: 'run_sql', args: { q: message } })
   }
+  // Forecasts: any predict/forecast ask reads the stored prediction.
+  if (/(forecast|predict|next few months|upcoming volume)/.test(m)) {
+    calls.push({ name: 'get_forecast', args: { series: /deal|pipeline value|revenue/.test(m) ? 'deal_value' : 'record_mt' } })
+  }
   if (crm) {
     if (CRM_WORDS.test(m)) calls.push({ name: 'search_crm', args: { q: message } })
     if (CRM_OVERVIEW.test(m)) calls.push({ name: 'get_crm_kpi', args: {} })
@@ -380,6 +384,14 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
       return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) } }
     },
 
+    // get_forecast: reads the tenant's stored forecast (predictions table).
+    get_forecast: async (tenantId, { series = 'record_mt' }) => {
+      const r = await tenantQuery(tenantId,
+        'SELECT series, model, horizon, history, forecast, generated_at FROM predictions WHERE series = $1', [series])
+      if (!r.rows.length) return { error: 'no stored forecast for this series - generate one from the Dashboard forecast panel first' }
+      return r.rows[0]
+    },
+
     // run_sql: LLM- or user-written SELECT, executed behind the guardrails.
     run_sql: async (tenantId, { q, sql }) => {
       const check = validateSql(sql || extractSql(q))
@@ -416,6 +428,10 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
       get_party: {
         d: 'Look up suppliers and customers by name.',
         s: { type: 'object', properties: { q: { type: 'string', description: 'party name' } }, required: ['q'] },
+      },
+      get_forecast: {
+        d: 'Read the stored forecast for a time series (record_mt = monthly order volume forecast, deal_value = monthly deal value forecast). Includes history and the predicted next months.',
+        s: { type: 'object', properties: { series: { type: 'string', description: 'series key: record_mt or deal_value' } } },
       },
       run_sql: {
         d: 'Run a read-only SQL query (a single SELECT or WITH...SELECT statement only) against the tenant database, for questions the other tools cannot answer.',

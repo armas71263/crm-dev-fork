@@ -17,9 +17,10 @@ export { createAuthVerifier }
 // `aiServiceUrl` is where the AI service lives; `auth` is a Supabase
 // JWT verifier — when absent the BFF runs in explicit dev mode (x-tenant-id
 // header), which production boots never do (see src/index.js).
-export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, auth, logger = true } = {}) {
+export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, predictionsServiceUrl, auth, logger = true } = {}) {
   const fastify = Fastify({ logger })
   const AI_SERVICE_URL = aiServiceUrl || 'http://localhost:5000'
+  const PREDICTIONS_SERVICE_URL = predictionsServiceUrl || 'http://localhost:5100'
 
   await fastify.register(cors, { origin: true })
   // The preview SPA is gone: no inline event handlers and no CDN scripts are
@@ -574,6 +575,24 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, au
     }
     reply.header('content-disposition', `attachment; filename="${id}-backup.json"`)
     return dump
+  })
+
+  // ---- Predictions (Phase 5): proxy the forecast job, read stored forecasts ----
+  fastify.post('/data/forecast', async (req, reply) => {
+    const res = await fetch(`${PREDICTIONS_SERVICE_URL}/forecast`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
+      body: JSON.stringify(req.body || {}),
+    })
+    reply.code(res.status)
+    reply.send(await res.text())
+  })
+
+  fastify.get('/data/forecast/:series', async (req) => {
+    const r = await tenantQuery(req,
+      'SELECT series, model, horizon, history, forecast, generated_at FROM predictions WHERE series = $1',
+      [req.params.series])
+    return { forecast: r.rows[0] || null }
   })
 
   // Proxy to AI service (approve the AI contexts)

@@ -7,6 +7,7 @@ import { buildApp, createAuthVerifier } from './app.js'
 
 const PORT = parseInt(process.env.BFF_PORT || '4000', 10)
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5000'
+const PREDICTIONS_SERVICE_URL = process.env.PREDICTIONS_SERVICE_URL || 'http://localhost:5100'
 
 // Supabase poolers REQUIRE TLS; node-pg does not enable it by default and a
 // plaintext connection to the pooler stalls forever (psql works only because
@@ -70,7 +71,7 @@ if (process.env.SUPABASE_URL) {
   console.warn('BFF running in DEV AUTH mode (x-tenant-id header) — never use in production')
 }
 
-const fastify = await buildApp({ pool, customerPool, adminPool, aiServiceUrl: AI_SERVICE_URL, auth })
+const fastify = await buildApp({ pool, customerPool, adminPool, aiServiceUrl: AI_SERVICE_URL, predictionsServiceUrl: PREDICTIONS_SERVICE_URL, auth })
 
 const start = async () => {
   try {

@@ -83,6 +83,7 @@ was explicitly settled with the product owner.
 - **Verify:** grounded answers cite tool observations; SQL tool mutation attempt fails; semantic search sanity check vs old hash embeddings.
 
 ### Phase 5 — Predictions service (1 week)
+> Status (2026-09-10): COMPLETE (time-series core, live-verified) — apps/predictions FastAPI (uv venv) on :5100, supervised by dev.sh. Damped-trend Holt ETS (statsmodels) is the verified default forecaster (sane on spikes, unlike trend-ARIMA); Chronos-Bolt via AutoGluon is wired as an opt-in (PREDICTIONS_USE_CHRONOS=1). predictions table (migration 008, RLS) stores per-tenant forecasts idempotently; synthetic 24-month rubbertrack history seeds a learnable series. BFF POST /data/forecast + GET /data/forecast/:series (RLS-scoped); dashboard Volume-forecast panel with Generate button; get_forecast assistant tool. Verified live: forecast job + stored read, cold tenant (insufficient data), cross-tenant isolation, assistant grounded forecast table, panel rendering. Tabular win-probability (TabPFNMix/LightGBM) deferred.
 1. New `apps/predictions` FastAPI (Python 3.11): AutoGluon TimeSeries (Chronos-Bolt + AutoARIMA fallback) + Tabular (TabPFNMix + LightGBM); serves embeddings endpoint too.
 2. `predictions` table (RLS; model, horizon, generated_at, per-tenant); idempotent scheduled forecast job; cold-start (<N history) → AutoARIMA or explicit "insufficient data".
 3. BFF `/data/forecast`; dashboard forecast panel; `get_forecast` assistant tool.
