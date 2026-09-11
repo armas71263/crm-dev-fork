@@ -1,4 +1,4 @@
-import { createClient } from '../../../../../../src/lib/supabase/server.js'
+import { createClient } from '../../../../../src/lib/supabase/server.js'
 
 export const dynamic = 'force-dynamic'
 

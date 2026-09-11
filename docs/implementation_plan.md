@@ -89,6 +89,14 @@ was explicitly settled with the product owner.
 3. BFF `/data/forecast`; dashboard forecast panel; `get_forecast` assistant tool.
 - **Verify:** forecast integration test on seeded history; cold tenant returns insufficient-data; predictions table isolation test.
 
+### Phase 6.5 — agentic trust layer (2026-09-11, COMPLETE + live-verified)
+Patterns adopted from Comp AI's design, rebuilt on our stack:
+- **Evidence ledger + suggestions**: the AI can observe and propose, never write. Migration 010 (ai_observations/ai_suggestions/agent_tasks, RLS); propose_change/record_observation tools; staff settlement endpoints (GET /data/suggestions, POST /data/suggestions/:id/resolve with a server-side field whitelist + audit); Suggestions screen. Live-verified: model proposed a website change (record untouched) → staff accepted → row updated + audit row written.
+- **Durable work queue**: agent_tasks with FOR UPDATE SKIP LOCKED leases, due_at scheduling, budget gate against 24h AI usage (AGENT_DAILY_TOKEN_BUDGET); dispatcher in the AI service (insights_refresh, forecast_refresh). Live-verified: task claimed + done + snapshot written.
+- **Credential-free agent**: the AI service holds NO DB credentials (no pg import). All access via the BFF internal gateway — named op registry (SQL server-side), /internal/sql behind validateSql + app_readonly pool, shared-secret token, tenant GUC applied server-side. Live-verified: 401/404 security matrix, real tenant data, mutation rejection. A GUC-nulling bug (staffQuery req-shape) was caught by live verification and fixed — RLS failed closed, zero rows, no leak.
+- **Versioned skills**: agent behavioral rules as markdown (apps/ai/skills: evidence, data-boundaries, proposing-changes) loaded into the system prompt. Observed live: the model refused to propose a no-op change citing current values.
+- **URL-as-state views**: companies/contacts/deals filters live in the query string (shareable links).
+Tests: BFF 70/70, AI 28/28 (gateway mocks).
 ### Phase 6 — WrenAI embedding (spike 1–2 days, then ~1 week)
 > Status (2026-09-11): spike DONE and PASSED (live) — migration 009: per-tenant read-only views in schema `bi` (tenant hardcoded in the view WHERE, immune to GUC tampering) + restricted `bi_<tenant>` login roles; cross-tenant matrix verified against Supabase (own rows only; base tables + other tenants views permission-denied; GUC attack ineffective). Report: docs/spikes/wrenai-isolation.md. WrenAI runtime itself is infeasible in the 1.9GB dev sandbox (6 containers) — the plan-sanctioned fallback shipped instead: the Ask-the-data dashboard card (streaming, read-only SQL via the assistant). Production WrenAI path documented (bi_<tenant> connection profiles + Cloudflare LLM).
 1. Spike: per-tenant project + connection profile + restricted DB role scoped to per-tenant views; cross-tenant query attempt **must fail**.

@@ -145,6 +145,9 @@ export function registerInternalRoutes(fastify, { staffQuery, runReadonly }) {
     ins_issue_mix: [() => [], `SELECT category, count(*)::int AS n FROM tickets GROUP BY category ORDER BY n DESC`],
     ins_v_trend: [() => [], `SELECT to_char(date_trunc('month', date),'YYYY-MM') AS m, sum(mt)::float AS mt FROM records GROUP BY 1 ORDER BY 1`],
     ins_v_totals: [() => [], `SELECT count(*)::int AS orders, coalesce(sum(mt),0)::float AS mt, coalesce(sum(mt*price_usd),0)::float AS revenue FROM records`],
+    snapshot_insert: [(p) => [JSON.stringify(p.insights), p.provider],
+      `INSERT INTO insights_snapshots (tenant_id, insights, provider) VALUES (app.current_tenant(), $1::jsonb, $2)`],
+    insights_latest: [() => [], `SELECT insights, provider, created_at FROM insights_snapshots ORDER BY created_at DESC LIMIT 1`],
     // ---- evidence ledger + suggestions ----
     observation_insert: [(p) => [p.source, p.entity_type, p.entity_id ?? null, p.observation_type, JSON.stringify(p.observed ?? {})],
       `INSERT INTO ai_observations (tenant_id, source, entity_type, entity_id, observation_type, observed)
