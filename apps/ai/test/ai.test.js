@@ -504,3 +504,21 @@ test('realEmbed returns 768-d vectors and degrades to null without config', asyn
     globalThis.fetch = real
   }
 })
+
+// ---- Phase 7: observability ----
+test('GET /metrics serves aggregate Prometheus counters (no tenant data)', async () => {
+  const { app } = await makeApp([
+    ['vertical_probe', []],
+    ['get_crm_kpi', [{ companies: 1, contacts: 1, open_leads: 1, open_deals: 1, pipeline_value: 1, open_tasks: 1, overdue_tasks: 0 }]],
+    ['semantic_search', []],
+  ])
+  await app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'overview' } })
+  const res = await app.inject({ method: 'GET', url: '/metrics' })
+  assert.equal(res.statusCode, 200)
+  assert.match(res.headers['content-type'], /text\/plain/)
+  assert.match(res.body, /# TYPE ai_chat_requests_total counter/)
+  assert.match(res.body, /ai_chat_requests_total\{route="chat"\} \d+/)
+  assert.match(res.body, /process_uptime_seconds/)
+  assert.ok(!/alpha|rubbertrack|lexley/.test(res.body), 'metrics must never contain tenant identifiers')
+  await app.close()
+})

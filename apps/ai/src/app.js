@@ -3,6 +3,7 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { incCounter, renderMetrics } from './metrics.js'
 import { streamText, generateText, tool as sdkTool, jsonSchema, stepCountIs } from 'ai'
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 
@@ -283,10 +284,17 @@ export async function buildApp({ gateway, logger = true }) {
   async function logUsage(tenantId, { requestId, provider, model, tool, tokensIn = 0, tokensOut = 0, costUsd = 0, latencyMs = 0 }) {
     try {
       await gw(tenantId, 'usage_log', { request_id: requestId, provider, model, tool, tokens_in: tokensIn, tokens_out: tokensOut, cost_usd: costUsd, latency_ms: latencyMs })
+      incCounter('ai_tokens_total', { provider: String(provider) }, (tokensIn || 0) + (tokensOut || 0))
     } catch (e) { fastify.log.warn({ msg: 'usage log failed', err: e.message }) }
   }
 
   fastify.get('/health', async () => ({ ok: true, service: 'ai' }))
+
+  // Aggregate observability — no tenant data on the scrape surface.
+  fastify.get('/metrics', async (_req, reply) => {
+    reply.header('content-type', 'text/plain; charset=utf-8')
+    return renderMetrics({ extra: { nodejs_heap_used_bytes: process.memoryUsage().heapUsed } })
+  })
 
   // ---- Agent tools — each returns tenant-scoped structured data ----
   const TOOLS = {
@@ -562,6 +570,7 @@ export async function buildApp({ gateway, logger = true }) {
     })
     const send = (event, data) => reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
     const t0 = Date.now()
+    incCounter('ai_chat_requests_total', { route: 'stream' })
     const requestId = crypto.randomUUID()
     const provider = pickProvider(tenantId)
     const mem = await loadMemory(tenantId, session_id)
@@ -784,8 +793,10 @@ export async function buildApp({ gateway, logger = true }) {
       if (!handler) throw new Error(`unknown task_type ${task.task_type}`)
       const result = await handler(tenantId, task.payload || {})
       await gw(tenantId, 'task_finish', { id: task.id, status: 'done', result })
+      incCounter('agent_tasks_total', { status: 'done', type: task.task_type })
     } catch (e) {
       await gw(tenantId, 'task_finish', { id: task.id, status: 'failed', error: e.message }).catch(() => {})
+      incCounter('agent_tasks_total', { status: 'failed', type: task.task_type })
     }
     return true
   }

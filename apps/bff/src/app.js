@@ -7,6 +7,7 @@ import * as XLSX from 'xlsx'
 import { createAuthVerifier } from './auth.js'
 import { registerCrmRoutes } from './crm.js'
 import { registerInternalRoutes } from './internal.js'
+import { incCounter, observeDuration, renderMetrics } from './metrics.js'
 
 export { createAuthVerifier }
 
@@ -44,7 +45,7 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
   // JWT mode: tenant identity comes from the verified token only; the
   // x-tenant-id header is ignored entirely. Dev mode (no verifier injected)
   // keeps the legacy header behavior for local compose/preview runs.
-  const PUBLIC_PATHS = new Set(['/health'])
+  const PUBLIC_PATHS = new Set(['/health', '/health/deep', '/metrics'])
   // Internal gateway routes carry their own shared-secret token check; the
   // JWT preHandler must not touch them (the AI service has no user token).
   const INTERNAL_PREFIX = '/internal/'
@@ -88,6 +89,41 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
   })
 
   fastify.get('/health', async () => ({ ok: true, service: 'bff' }))
+
+  // ---- Phase 7 observability ----
+  // Aggregate request metrics (route + status + duration). No tenant data
+  // ever enters /metrics — a scrape must not leak identities.
+  fastify.addHook('onRequest', async (req) => { req._start = process.hrtime.bigint() })
+  fastify.addHook('onResponse', async (req, reply) => {
+    const secs = Number(process.hrtime.bigint() - (req._start || process.hrtime.bigint())) / 1e9
+    const route = req.routerPath || req.url.split('?')[0].replace(/[0-9a-f-]{8,}/g, ':id')
+    incCounter('http_requests_total', { route, status: String(reply.statusCode) })
+    observeDuration('http_request_duration_seconds', secs)
+  })
+
+  fastify.get('/metrics', async (_req, reply) => {
+    reply.header('content-type', 'text/plain; charset=utf-8')
+    return renderMetrics({ extra: { nodejs_heap_used_bytes: process.memoryUsage().heapUsed } })
+  })
+
+  // Deep health: the endpoint an uptime monitor (Uptime Kuma, Better Stack,
+  // SigNoz alerting) polls — one JSON answer for DB + AI + predictions.
+  fastify.get('/health/deep', async () => {
+    const checks = {}
+    const check = async (name, fn) => {
+      const t0 = Date.now()
+      try { await fn(); checks[name] = { status: 'up', latency_ms: Date.now() - t0 } }
+      catch (e) { checks[name] = { status: 'down', latency_ms: Date.now() - t0, error: String(e.message || e).slice(0, 120) } }
+    }
+    await Promise.all([
+      check('db', async () => { const r = await pool.query('SELECT 1 AS ok'); if (!r.rows.length) throw new Error('no rows') }),
+      check('ai', async () => { const res = await fetch(`${AI_SERVICE_URL}/health`, { signal: AbortSignal.timeout(3000) }); if (!res.ok) throw new Error(`HTTP ${res.status}`) }),
+      check('predictions', async () => { const res = await fetch(`${PREDICTIONS_SERVICE_URL}/health`, { signal: AbortSignal.timeout(3000) }); if (!res.ok) throw new Error(`HTTP ${res.status}`) }),
+    ])
+    const up = Object.values(checks).every((c) => c.status === 'up')
+    incCounter('health_checks_total', { status: up ? 'up' : 'down' })
+    return { status: up ? 'ok' : 'degraded', checks, uptime_seconds: Math.round(process.uptime()) }
+  })
 
   const staffQuery = makeTenantQuery(pool)
   const customerQuery = customerPool ? makeTenantQuery(customerPool) : null

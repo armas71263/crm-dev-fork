@@ -804,3 +804,30 @@ test('internal sql gateway rejects mutations before the readonly pool and runs v
   delete process.env.BFF_INTERNAL_TOKEN
   await app.close()
 })
+
+// ---- Phase 7: observability ----
+test('GET /metrics serves Prometheus text with request counters after traffic', async () => {
+  const { app } = await makeApp()
+  await app.inject({ method: 'GET', url: '/health' })
+  const res = await app.inject({ method: 'GET', url: '/metrics' })
+  assert.equal(res.statusCode, 200)
+  assert.match(res.headers['content-type'], /text\/plain/)
+  assert.match(res.body, /# TYPE http_requests_total counter/)
+  assert.match(res.body, /http_requests_total\{route="\/health",status="200"\} \d+/)
+  assert.match(res.body, /# TYPE http_request_duration_seconds histogram/)
+  assert.match(res.body, /http_request_duration_seconds_count \d+/)
+  await app.close()
+})
+
+test('GET /health/deep reports per-service status and flags degradation', async () => {
+  const { app } = await makeApp([[/^SELECT 1/, [{ ok: 1 }]]])
+  const res = await app.inject({ method: 'GET', url: '/health/deep' })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.checks.db.status, 'up', 'db is up with the fake pool')
+  assert.equal(b.checks.ai.status, 'down', 'no AI service in the test env')
+  assert.equal(b.checks.predictions.status, 'down')
+  assert.ok(typeof b.checks.db.latency_ms === 'number')
+  assert.equal(b.status, 'degraded', 'one down service degrades the whole answer')
+  await app.close()
+})
