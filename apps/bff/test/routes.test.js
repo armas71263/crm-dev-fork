@@ -700,3 +700,107 @@ test('GET /data/forecast/:series reads the stored forecast tenant-scoped; POST p
   assert.ok([502, 503, 500].includes(upstream.statusCode) || upstream.statusCode === 200, `unexpected proxy status ${upstream.statusCode}`)
   await app2.close()
 })
+
+// ---- Phase 6.5: suggestions (human settlement of AI-proposed changes) ----
+test('GET /data/suggestions lists pending suggestions tenant-scoped', async () => {
+  const { app } = await makeApp([
+    [/FROM ai_suggestions/, [{ id: 's1', entity_type: 'company', entity_id: '1', field: 'industry', proposed_value: 'Tire manufacturing', status: 'pending' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/suggestions', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.suggestions.length, 1)
+  assert.equal(b.suggestions[0].field, 'industry')
+  await app.close()
+})
+
+test('accepting a suggestion applies the whitelisted field update, audits it, and marks it accepted', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions/, [{ id: 's1', entity_type: 'company', entity_id: '7', field: 'industry', proposed_value: 'Tire manufacturing', status: 'pending' }]],
+    [/UPDATE companies SET industry = \$1/, [{ id: 7 }]],
+    [/UPDATE ai_suggestions SET status/, [{ id: 's1' }]],
+    [/INSERT INTO audit_logs/, []],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/data/suggestions/s1/resolve', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { action: 'accept' } })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { id: 's1', status: 'accepted' })
+  assert.ok(data.calls.some((c) => /UPDATE companies SET industry = \$1 WHERE id = \$2/.test(c.text)), 'the whitelisted field must be applied')
+  assert.ok(data.calls.some((c) => c.params?.includes('suggestion_accept')), 'accepts are audited')
+  await app.close()
+})
+
+test('accepting a suggestion with a non-whitelisted field never writes to the CRM', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions/, [{ id: 's2', entity_type: 'company', entity_id: '7', field: 'extra', proposed_value: '{}', status: 'pending' }]],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/data/suggestions/s2/resolve', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { action: 'accept' } })
+  assert.equal(res.statusCode, 400)
+  assert.ok(!data.calls.some((c) => /UPDATE companies/.test(c.text)), 'non-whitelisted fields must never write')
+  await app.close()
+})
+
+test('rejecting a suggestion marks it without touching CRM records', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions/, [{ id: 's3', entity_type: 'deal', entity_id: '9', field: 'stage', proposed_value: 'won', status: 'pending' }]],
+    [/UPDATE ai_suggestions SET status/, [{ id: 's3' }]],
+    [/INSERT INTO audit_logs/, []],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/data/suggestions/s3/resolve', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { action: 'reject' } })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { id: 's3', status: 'rejected' })
+  assert.ok(!data.calls.some((c) => /UPDATE deals/.test(c.text)), 'rejects never write to the CRM')
+  await app.close()
+})
+
+test('resolving a non-pending suggestion conflicts (409)', async () => {
+  const { app } = await makeApp([
+    [/SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions/, [{ id: 's4', entity_type: 'deal', entity_id: '9', field: 'stage', proposed_value: 'won', status: 'accepted' }]],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/data/suggestions/s4/resolve', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { action: 'accept' } })
+  assert.equal(res.statusCode, 409)
+  await app.close()
+})
+
+test('GET /data/agent-tasks lists the durable queue', async () => {
+  const { app } = await makeApp([
+    [/FROM agent_tasks/, [{ id: 't1', task_type: 'insights_refresh', status: 'done', due_at: null, attempts: 1 }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/agent-tasks', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 200)
+  assert.equal(JSON.parse(res.body).tasks.length, 1)
+  await app.close()
+})
+
+// ---- Phase 6.5: internal gateway security ----
+test('internal gateway refuses callers without the exact token and unknown ops', async () => {
+  process.env.BFF_INTERNAL_TOKEN = 'secret-token'
+  const { app } = await makeApp()
+  const noToken = await app.inject({ method: 'POST', url: '/internal/data', payload: { op: 'get_crm_kpi', params: {} } })
+  assert.equal(noToken.statusCode, 401)
+  const badToken = await app.inject({ method: 'POST', url: '/internal/data', headers: { 'x-internal-token': 'wrong-length' }, payload: { op: 'get_crm_kpi', params: {} } })
+  assert.equal(badToken.statusCode, 401)
+  const badTenant = await app.inject({ method: 'POST', url: '/internal/data', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'EVIL; DROP' }, payload: { op: 'get_crm_kpi', params: {} } })
+  assert.equal(badTenant.statusCode, 400)
+  const good = await app.inject({ method: 'POST', url: '/internal/data', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' }, payload: { op: 'get_crm_kpi', params: {} } })
+  assert.equal(good.statusCode, 200)
+  const unknown = await app.inject({ method: 'POST', url: '/internal/data', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' }, payload: { op: 'drop_all_tables', params: {} } })
+  assert.equal(unknown.statusCode, 404)
+  delete process.env.BFF_INTERNAL_TOKEN
+  await app.close()
+})
+
+test('internal sql gateway rejects mutations before the readonly pool and runs validated SELECTs', async () => {
+  process.env.BFF_INTERNAL_TOKEN = 'secret-token'
+  const data = tenantScoped()
+  const ro = makeFakePool([[/^BEGIN/, []], [/set_config/, []], [/SET LOCAL statement_timeout/, []], [/COMMIT/, []], [/SELECT count/, [{ n: 3 }]]])
+  const app = await buildApp({ pool: data.pool, adminPool: makeFakePool().pool, readonlyPool: ro.pool, logger: false })
+  const mut = await app.inject({ method: 'POST', url: '/internal/sql', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' }, payload: { sql: 'DELETE FROM companies' } })
+  assert.match(JSON.parse(mut.body).error, /only SELECT/)
+  assert.ok(!ro.calls.some((c) => /DELETE/i.test(c.text)), 'mutations never reach the readonly pool')
+  const sel = await app.inject({ method: 'POST', url: '/internal/sql', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' }, payload: { sql: 'SELECT count(*) FROM companies' } })
+  assert.equal(sel.statusCode, 200)
+  assert.deepEqual(JSON.parse(sel.body).rows, [{ n: 3 }])
+  assert.ok(ro.calls.some((c) => /set_config/.test(c.text)), 'the tenant GUC is applied inside the readonly transaction')
+  delete process.env.BFF_INTERNAL_TOKEN
+  await app.close()
+})

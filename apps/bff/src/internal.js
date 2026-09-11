@@ -180,7 +180,9 @@ export function registerInternalRoutes(fastify, { staffQuery, runReadonly }) {
     const expected = process.env.BFF_INTERNAL_TOKEN
     if (!expected) { reply.code(503).send({ error: 'internal gateway not configured' }); return false }
     const got = req.headers['x-internal-token']
-    if (!got || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected))) {
+    const a = Buffer.from(String(got || ''))
+    const b = Buffer.from(expected)
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       reply.code(401).send({ error: 'internal token required' })
       return false
     }

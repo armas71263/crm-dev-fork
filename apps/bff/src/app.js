@@ -604,6 +604,56 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
     return dump
   })
 
+  // ---- Phase 6.5: suggestions (human settlement of AI-proposed changes) ----
+  // Accept applies ONE whitelisted field through the staff pool (RLS); the
+  // agent itself can never write. Reject only marks. Table/field names come
+  // from this server-side whitelist — suggestion rows only index into it.
+  const SUGGESTION_TARGETS = {
+    company: { table: 'companies', fields: new Set(['name', 'type', 'industry', 'website', 'phone', 'email', 'address', 'notes', 'status']) },
+    contact: { table: 'contacts', fields: new Set(['full_name', 'first_name', 'last_name', 'title', 'email', 'phone', 'mobile', 'linkedin', 'status']) },
+    lead: { table: 'leads', fields: new Set(['name', 'company_name', 'contact_name', 'email', 'phone', 'source', 'value', 'status']) },
+    deal: { table: 'deals', fields: new Set(['name', 'stage', 'status', 'value', 'probability', 'currency']) },
+  }
+
+  fastify.get('/data/suggestions', async (req) => {
+    const r = await tenantQuery(req,
+      `SELECT id, entity_type, entity_id, field, current_value, proposed_value, evidence, status, resolved_at, created_at
+       FROM ai_suggestions ORDER BY (status='pending') DESC, created_at DESC LIMIT 100`)
+    return { suggestions: r.rows }
+  })
+
+  fastify.post('/data/suggestions/:id/resolve', async (req, reply) => {
+    const { id } = req.params
+    const { action } = req.body || {}
+    if (!['accept', 'reject'].includes(action)) return reply.code(400).send({ error: 'action must be accept or reject' })
+    const found = await tenantQuery(req, `SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions WHERE id=$1`, [id])
+    const sug = found.rows[0]
+    if (!sug) return reply.code(404).send({ error: 'suggestion not found' })
+    if (sug.status !== 'pending') return reply.code(409).send({ error: `suggestion already ${sug.status}` })
+    if (action === 'accept') {
+      const target = SUGGESTION_TARGETS[sug.entity_type]
+      if (!target || !target.fields.has(sug.field)) return reply.code(400).send({ error: `unsupported target: ${sug.entity_type}.${sug.field}` })
+      const upd = await tenantQuery(req,
+        `UPDATE ${target.table} SET ${sug.field} = $1 WHERE id = $2 RETURNING id`, [sug.proposed_value, sug.entity_id])
+      if (!upd.rows.length) return reply.code(404).send({ error: 'target record not found in this tenant' })
+      await writeAudit(req, 'suggestion_accept', target.table, String(sug.entity_id), { suggestion_id: id, field: sug.field, value: sug.proposed_value })
+    } else {
+      await writeAudit(req, 'suggestion_reject', 'ai_suggestions', String(id), {})
+    }
+    await tenantQuery(req,
+      `UPDATE ai_suggestions SET status=$1, resolved_at=now(), resolved_by=$2 WHERE id=$3`,
+      [action === 'accept' ? 'accepted' : 'rejected', req.auth?.userId ?? null, id])
+    return { id, status: action === 'accept' ? 'accepted' : 'rejected' }
+  })
+
+  // The tenant's durable agent task queue (scheduled by the assistant or API).
+  fastify.get('/data/agent-tasks', async (req) => {
+    const r = await tenantQuery(req,
+      `SELECT id, task_type, payload, status, due_at, attempts, result, error, created_at, updated_at
+       FROM agent_tasks ORDER BY (status='pending') DESC, created_at DESC LIMIT 50`)
+    return { tasks: r.rows }
+  })
+
   // ---- Predictions (Phase 5): proxy the forecast job, read stored forecasts ----
   fastify.post('/data/forecast', async (req, reply) => {
     const res = await fetch(`${PREDICTIONS_SERVICE_URL}/forecast`, {
