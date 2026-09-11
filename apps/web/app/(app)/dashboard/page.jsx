@@ -2,6 +2,7 @@ import { bffFetch } from '../../../src/lib/bff.js'
 import StatusDot from '../../../components/StatusDot.jsx'
 import BarChart from '../../../components/BarChart.jsx'
 import GenerateForecastButton from '../../../components/GenerateForecastButton.jsx'
+import AskDataCard from '../../../components/AskDataCard.jsx'
 
 const usd = (n) => '$' + Math.round(Number(n) || 0).toLocaleString('en-US')
 const date = (d) => (d ? String(d).slice(0, 10) : '—')
@@ -102,10 +103,11 @@ export default async function DashboardPage() {
               ))}
             </div>
           </div>
+          <AskDataCard />
           <div className="border border-line bg-white p-5">
-            <h2 className="text-[15px] font-semibold mb-2">Ask the assistant</h2>
+            <h2 className="text-[15px] font-semibold mb-2">Full assistant</h2>
             <p className="text-[13px] text-steel">
-              Chat with your CRM data — pipeline, companies, tasks, charts.{' '}
+              Streaming chat with charts and memory.{' '}
               <a href="/assistant" className="text-leaf font-medium hover:text-leaf-deep">Open assistant →</a>
             </p>
           </div>

@@ -90,6 +90,7 @@ was explicitly settled with the product owner.
 - **Verify:** forecast integration test on seeded history; cold tenant returns insufficient-data; predictions table isolation test.
 
 ### Phase 6 — WrenAI embedding (spike 1–2 days, then ~1 week)
+> Status (2026-09-11): spike DONE and PASSED (live) — migration 009: per-tenant read-only views in schema `bi` (tenant hardcoded in the view WHERE, immune to GUC tampering) + restricted `bi_<tenant>` login roles; cross-tenant matrix verified against Supabase (own rows only; base tables + other tenants views permission-denied; GUC attack ineffective). Report: docs/spikes/wrenai-isolation.md. WrenAI runtime itself is infeasible in the 1.9GB dev sandbox (6 containers) — the plan-sanctioned fallback shipped instead: the Ask-the-data dashboard card (streaming, read-only SQL via the assistant). Production WrenAI path documented (bi_<tenant> connection profiles + Cloudflare LLM).
 1. Spike: per-tenant project + connection profile + restricted DB role scoped to per-tenant views; cross-tenant query attempt **must fail**.
 2. On success: compose service, MDL generation from module registry, embed UI in Next.js.
 3. Fallback if spike fails: extend the assistant's text-to-SQL into a lightweight dashboard feature (no new dependency).

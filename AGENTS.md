@@ -98,3 +98,8 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - Forecaster: damped-trend Holt ETS (statsmodels) — deliberately NOT trend-ARIMA: a single outlying month made ARIMA extrapolate ~4x the level. Chronos-Bolt (AutoGluon) is opt-in via PREDICTIONS_USE_CHRONOS=1 (downloaded into the venv but unverified in this environment).
 - Migration 008: predictions table (RLS, app_role grants) + synthetic 24-month order history (ORD-HIST-* rows, idempotent) for the demo tenant. The series is a monthly AGGREGATE (~720 MT base).
 - Forecast flow: web Generate button -> /api/forecast proxy -> BFF POST /data/forecast -> predictions service (retrain + upsert) -> dashboard reads GET /data/forecast/:series; the assistant reads the stored row via the get_forecast tool (never fabricates).
+
+## Phase 6 (2026-09-11, BI isolation + Ask-the-data)
+- BI credentials are ISOLATED BY CONSTRUCTION: schema `bi` views hardcode `WHERE tenant_id = '<tenant>'` (NOT the app.tenant_id GUC — any session can SET that), and `bi_<tenant>` login roles get USAGE on `bi` + SELECT on their own views ONLY. A leaked BI credential cannot read another tenant even with GUC tampering (live-proven). Connect via pooler as `bi_<tenant>.<project_ref>`.
+- WrenAI (6 containers) cannot run in the 1.9GB dev sandbox; the dashboard "Ask the data" card is the plan-sanctioned fallback. Production path: per-tenant WrenAI project + connection profile on `bi_<tenant>` credentials, LLM = Cloudflare Workers AI OpenAI-compatible endpoint.
+- Long-held NON-STREAMING requests through the Next dev server get killed by the environment (connection severed mid-flight); the SSE streaming proxy is the reliable pattern — the AskDataCard streams via /api/ai/chat/stream.
