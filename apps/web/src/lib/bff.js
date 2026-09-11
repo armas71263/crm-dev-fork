@@ -35,6 +35,7 @@ export function sectionsForRole(role, { vertical = false } = {}) {
     { href: '/dashboard', label: 'Dashboard' },
     { href: '/assistant', label: 'Assistant' },
     { href: '/insights', label: 'Insights' },
+    { href: '/suggestions', label: 'Suggestions' },
     { href: '/search', label: 'Search' },
     { href: '/companies', label: 'Companies' },
     { href: '/contacts', label: 'Contacts' },
