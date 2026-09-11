@@ -200,7 +200,9 @@ export function registerInternalRoutes(fastify, { staffQuery, runReadonly }) {
     try {
       const paramsArr = pick(params)
       const text = typeof sql === 'function' ? sql(params) : sql
-      const r = await staffQuery(tenantId, text, paramsArr)
+      // staffQuery takes a req-like object and reads .tenantId — a bare string
+      // would silently null the GUC and RLS would fail closed (0 rows).
+      const r = await staffQuery({ tenantId }, text, paramsArr)
       return { rows: r.rows }
     } catch (e) {
       return { error: `op ${op} failed: ${e.message.slice(0, 160)}` }
