@@ -105,6 +105,7 @@ Tests: BFF 70/70, AI 28/28 (gateway mocks).
 - **Verify:** spike isolation report; embedded UI walkthrough.
 
 ### Phase 7 — Observability (2–3 days)
+> Status (2026-09-11): DONE for everything runnable here — zero-dependency Prometheus /metrics on BFF + AI (aggregate only, no tenant data), /health/deep service matrix (the uptime-monitor endpoint), /ops staff screen, PostHog Cloud server events (env-gated no-op without key). SigNoz (needs ~8GB) and Uptime Kuma are production deployments — exact steps in docs/observability.md; our scrape format is SigNoz/Prometheus-native. Tests: BFF 72/72, AI 29/29.
 1. SigNoz compose profile; OTel SDK in BFF/AI/predictions (Node + Python instrumentation).
 2. Uptime Kuma for external uptime checks.
 3. PostHog Cloud: client events in Next.js, server events in BFF.

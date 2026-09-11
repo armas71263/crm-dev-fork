@@ -437,6 +437,7 @@ export async function buildApp({ gateway, logger = true }) {
     if (!message) return reply.code(400).send({ error: 'message required' })
 
     const t0 = Date.now()
+    incCounter('ai_chat_requests_total', { route: 'chat' })
     const requestId = crypto.randomUUID()
     const provider = pickProvider(tenantId)
     const mem = await loadMemory(tenantId, session_id)

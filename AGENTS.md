@@ -111,3 +111,9 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - **agent_tasks leases**: claim = UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) with lease_expires_at; the dispatcher iterates tenants (tenants_all op) and claims per-tenant — tasks are RLS-scoped, there is no global view.
 - **Skills as markdown** (apps/ai/skills/*.md) load into the system prompt at boot (loadSkills()); tests cover the loader. The live model cited current values and refused a no-op proposal — the evidence rule holds with a real LLM.
 - **Sandbox traps re-confirmed**: JS template literals in patch scripts must escape \` and \${ (a raw newline inside a single-quoted JS string is a syntax error that kills the script silently); heredoc-to-file + line-splice surgery is the robust patch pattern. Long-held non-streaming Next requests still get killed — retry loops are mandatory for live checks.
+
+## Phase 7 (2026-09-11, observability)
+- **/metrics is AGGREGATE-ONLY** (BFF + AI, hand-rolled Prometheus text format, zero deps): never label metrics by tenant — a scrape surface must not leak identities. Route labels are router paths with ids normalized.
+- **/health/deep** is the uptime-monitor contract (db+ai+predictions + latencies). Tests for it assert STRUCTURE, not specific up/down values — live sandbox services make value-coupled tests flaky.
+- **PostHog is opt-in by construction**: capture() without POSTHOG_API_KEY makes no network call. Server-side events only (suggestion_accepted/rejected).
+- **Patch-script lesson**: an off-by-one in a findIndex anchor (L[i+3] vs L[i+2]) silently no-op'd twice while looking like the revert hazard — always print the located line number from the patch script, and prefer heredoc-to-file + `node file.cjs` so failures show in stderr.

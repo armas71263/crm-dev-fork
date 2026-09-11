@@ -8,6 +8,7 @@ import { createAuthVerifier } from './auth.js'
 import { registerCrmRoutes } from './crm.js'
 import { registerInternalRoutes } from './internal.js'
 import { incCounter, observeDuration, renderMetrics } from './metrics.js'
+import { capture } from './posthog.js'
 
 export { createAuthVerifier }
 
@@ -673,8 +674,10 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
         `UPDATE ${target.table} SET ${sug.field} = $1 WHERE id = $2 RETURNING id`, [sug.proposed_value, sug.entity_id])
       if (!upd.rows.length) return reply.code(404).send({ error: 'target record not found in this tenant' })
       await writeAudit(req, 'suggestion_accept', target.table, String(sug.entity_id), { suggestion_id: id, field: sug.field, value: sug.proposed_value })
+      capture(req.auth?.userId || 'anonymous', 'suggestion_accepted', { entity_type: sug.entity_type, field: sug.field })
     } else {
       await writeAudit(req, 'suggestion_reject', 'ai_suggestions', String(id), {})
+      capture(req.auth?.userId || 'anonymous', 'suggestion_rejected', { entity_type: sug.entity_type, field: sug.field })
     }
     await tenantQuery(req,
       `UPDATE ai_suggestions SET status=$1, resolved_at=now(), resolved_by=$2 WHERE id=$3`,
