@@ -32,6 +32,18 @@ const pool = DB_SESSION_POOLER
       password: process.env.PG_PASSWORD || 'apppass',
     })
 
+// Readonly pool: app_readonly login role for model-written SQL (internal gateway).
+const DB_READONLY_POOLER = process.env.SUPABASE_DB_READONLY_POOLER_URL
+const readonlyPool = DB_READONLY_POOLER
+  ? new pg.Pool({ connectionString: DB_READONLY_POOLER, max: 3, ssl: supabaseSsl(DB_READONLY_POOLER) })
+  : new pg.Pool({
+      host: process.env.PG_HOST || 'postgres',
+      port: 5432,
+      database: process.env.PG_DATABASE || 'rubbertrack',
+      user: process.env.PG_READONLY_USER || 'app_readonly',
+      password: process.env.PG_READONLY_PASSWORD || 'readonlypass',
+    })
+
 // Admin pool: postgres.<ref> (table owner / control plane) for /tenants endpoints.
 const DB_ADMIN_POOLER = process.env.SUPABASE_DB_ADMIN_POOLER_URL
 const adminPool = DB_ADMIN_POOLER
@@ -71,7 +83,7 @@ if (process.env.SUPABASE_URL) {
   console.warn('BFF running in DEV AUTH mode (x-tenant-id header) — never use in production')
 }
 
-const fastify = await buildApp({ pool, customerPool, adminPool, aiServiceUrl: AI_SERVICE_URL, predictionsServiceUrl: PREDICTIONS_SERVICE_URL, auth })
+const fastify = await buildApp({ pool, customerPool, adminPool, readonlyPool, aiServiceUrl: AI_SERVICE_URL, predictionsServiceUrl: PREDICTIONS_SERVICE_URL, auth })
 
 const start = async () => {
   try {

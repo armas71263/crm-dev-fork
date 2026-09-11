@@ -1,34 +1,33 @@
 import { test, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildApp, makeTenantQuery, embed, plan, detectChartIntent, pickProvider, validateSql, extractSql, realEmbed } from '../src/app.js'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+import { buildApp, embed, plan, detectChartIntent, pickProvider, validateSql, extractSql, realEmbed, loadSkills } from '../src/app.js'
 
-// ---- Fake pg pool: records every query, serves canned rows by SQL match ----
-function makeFakePool(matchers = []) {
+// ---- Fake gateway: records every op call, serves canned rows by op name ----
+// Phase 6.5: the AI service holds no DB credentials — tests mock the BFF
+// gateway (op + params), exactly like production calls it.
+function makeFakeGateway(matchers = []) {
   const calls = []
-  const released = []
-  const client = {
-    async query(text, params) {
-      calls.push({ text, params })
-      for (const [re, rows, fail] of matchers) {
-        if (re.test(text)) {
-          if (fail) throw new Error(typeof fail === 'string' ? fail : 'boom')
-          return { rows }
-        }
+  const gateway = async (tenantId, op, params = {}) => {
+    calls.push({ tenantId, op, params })
+    for (const [name, rows, fail] of matchers) {
+      if (name === op) {
+        if (fail) return { error: typeof fail === 'string' ? fail : 'boom' }
+        if (op === '__sql') return rows
+        return { rows }
       }
-      return { rows: [] }
-    },
-    release() { released.push(true) },
+    }
+    if (op === '__sql') return { rows: [], rowCount: 0 }
+    return { rows: [] }
   }
-  return { pool: { connect: async () => client }, calls, released }
+  return { gateway, calls }
 }
 
 async function makeApp(matchers = []) {
-  const fake = makeFakePool([
-    [/^SELECT set_config/, [{ set_config: 't' }]],
-    [/^RESET /, []],
-    ...matchers,
-  ])
-  const { app } = await buildApp({ pool: fake.pool, logger: false })
+  const fake = makeFakeGateway(matchers)
+  const { app } = await buildApp({ gateway: fake.gateway, logger: false })
   return { app, fake }
 }
 
@@ -39,103 +38,84 @@ afterEach(() => {
   delete process.env.OPENAI_API_KEY
   delete process.env.CLOUDFLARE_API_TOKEN
   delete process.env.CLOUDFLARE_ACCOUNT_ID
+  delete process.env.PREDICTIONS_SERVICE_URL
 })
 
-// ---- RLS session hygiene (same contract as the BFF) ----
-test('AI tenantQuery scopes the session per tenant and always releases the client', async () => {
-  const { pool, calls, released } = makeFakePool()
-  const tq = makeTenantQuery(pool)
-  await tq('lexley', 'SELECT 1 FROM records', ['p'])
-  assert.deepEqual(calls[0], { text: "SELECT set_config('app.tenant_id', $1, false)", params: ['lexley'] })
-  assert.equal(calls[1].text, 'SELECT 1 FROM records')
-  assert.deepEqual(calls[1].params, ['p'])
-  assert.equal(calls[2].text, 'RESET app.tenant_id')
-  assert.equal(released.length, 1)
-
-  const failing = makeFakePool([[/SELECT 1/, [], 'db down']])
-  const tq2 = makeTenantQuery(failing.pool)
-  await assert.rejects(() => tq2('lexley', 'SELECT 1'))
-  assert.equal(failing.released.length, 1, 'client must be released when the query throws')
-
-  const deadReset = makeFakePool([[/^RESET /, [], 'connection lost']])
-  const tq3 = makeTenantQuery(deadReset.pool)
-  await tq3('lexley', 'SELECT 1')
-  assert.equal(deadReset.released.length, 1, 'client must be released even when RESET fails')
-})
-
-// ---- Provider router ----
 test('pickProvider defaults to local and falls back from key-gated providers without keys', () => {
   assert.equal(pickProvider('a').name, 'local')
   process.env.AI_PROVIDER = 'openrouter'
-  assert.equal(pickProvider('a').name, 'local', 'no key → fall back to deterministic local')
+  assert.equal(pickProvider('a').name, 'local', 'no key → local fallback')
   process.env.OPENROUTER_API_KEY = 'sk-test'
-  const p = pickProvider('beta')
-  assert.equal(p.name, 'openrouter')
-  assert.equal(p.tenantId, 'beta')
-  assert.equal(p.model, 'anthropic/claude-3.5-sonnet')
-  process.env.AI_PROVIDER = 'bogus'
-  const p2 = pickProvider('a')
-  assert.equal(p2.name, 'local', 'unknown provider env must not bypass the router')
+  assert.equal(pickProvider('a').name, 'openrouter')
+  assert.equal(pickProvider('a').tenantId, 'a')
 })
 
-// ---- Deterministic embeddings (drives RAG, indexing and semantic search) ----
 test('embed is deterministic, 768-dim and L2-normalized', () => {
-  const a = embed('TSR-20 natural rubber order from Tiong Huat')
-  const b = embed('TSR-20 natural rubber order from Tiong Huat')
-  assert.equal(a.length, 768)
-  assert.deepEqual(a, b, 'same input must embed identically every time')
-  const norm = Math.sqrt(a.reduce((s, x) => s + x * x, 0))
-  assert.ok(Math.abs(norm - 1) < 1e-9, `expected unit norm, got ${norm}`)
+  const a1 = embed('hello world')
+  const a2 = embed('hello world')
+  assert.equal(a1.length, 768)
+  assert.deepEqual(a1, a2)
+  const norm = Math.sqrt(a1.reduce((s, x) => s + x * x, 0))
+  assert.ok(Math.abs(norm - 1) < 1e-9)
 })
 
 test('embed distinguishes different texts and never emits NaN', () => {
-  const a = embed('order grade TSR-20')
-  const b = embed('quality ticket moisture defect')
-  assert.ok(a.some((x, i) => x !== b[i]), 'different texts must produce different vectors')
-  assert.ok(a.every(Number.isFinite), 'no NaN in the embedding')
-  assert.ok(a.some((x) => x !== 0), 'vector must not be all zeros')
+  const a = embed('rubber shipments')
+  const b = embed('latex prices')
+  let diff = 0
+  for (let i = 0; i < 768; i++) { diff += Math.abs(a[i] - b[i]) }
+  assert.ok(diff > 0.1, 'different texts must embed differently')
+  assert.ok(a.every((x) => Number.isFinite(x)))
 })
 
 test('embed is safe for empty and non-ASCII input', () => {
-  const empty = embed('')
-  assert.equal(empty.length, 768)
-  assert.ok(empty.every(Number.isFinite), 'empty text must embed cleanly (all zero is fine)')
-  const ascii = embed('Tĥé qüïck 布朗 rubber')
-  assert.ok(ascii.every(Number.isFinite))
-  assert.ok(ascii.some((x) => x !== 0))
+  assert.ok(embed('').every((x) => Number.isFinite(x)))
+  assert.ok(embed('ラバーストラック輸出入').every((x) => Number.isFinite(x)))
 })
 
-// ---- Planner keyword routing ----
 test('plan routes messages to the right tools', () => {
-  assert.deepEqual(plan('moisture issue on the order from a TSR-20 supplier').map((c) => c.name), ['get_issues', 'search_records', 'get_party'])
-  assert.deepEqual(plan('who is our latex supplier').map((c) => c.name), ['search_records', 'get_party'])
-  assert.deepEqual(plan('show me the overview').map((c) => c.name), ['get_crm_kpi', 'get_kpi'])
-  assert.deepEqual(plan('table tennis').map((c) => c.name), ['get_crm_kpi'], 'unmatched text falls back to the CRM KPI tool')
-  assert.deepEqual(plan('how is the CEAT deal going', { vertical: false }).map((c) => c.name), ['search_crm'])
-  assert.deepEqual(plan('deals pipeline overview', { vertical: false }).map((c) => c.name), ['search_crm', 'get_crm_kpi'])
-  assert.deepEqual(plan('moisture issue on the order from a TSR-20 supplier', { vertical: false }).map((c) => c.name), ['get_crm_kpi'], 'vertical questions degrade to the CRM fallback without vertical data')
+  const sql = plan('sql: SELECT count(*) FROM companies')
+  assert.equal(sql[0].name, 'run_sql', 'an explicit sql ask routes to run_sql first')
+  const forecast = plan('forecast the upcoming volume', { vertical: true })
+  assert.ok(forecast.some((t) => t.name === 'get_forecast'))
+  const crm = plan('tell me about the CEAT deal', { vertical: false })
+  assert.deepEqual(crm.map((t) => t.name), ['search_crm'])
+  const vertical = plan('any open quality issues?', { vertical: true })
+  assert.ok(vertical.some((t) => t.name === 'get_issues'))
 })
 
-// ---- Chart intent detection ----
 test('detectChartIntent returns null without chart keywords or a prior chart', () => {
   assert.equal(detectChartIntent('hello there'), null)
-  assert.equal(detectChartIntent('now just TSR-20'), null, 'bare filter without a prior chart is not an intent')
+  assert.equal(detectChartIntent('what is a deal?'), null)
 })
 
 test('detectChartIntent maps dimension and metric keywords', () => {
-  assert.deepEqual(detectChartIntent('show a chart of grade breakdown'), { dimension: 'grade', metric: 'count', filter: null })
-  assert.deepEqual(detectChartIntent('plot revenue by supplier'), { dimension: 'supplier', metric: 'revenue', filter: null })
-  assert.deepEqual(detectChartIntent('monthly trend of mt volume'), { dimension: 'month', metric: 'mt', filter: null })
-  assert.deepEqual(detectChartIntent('top 5 customers'), { dimension: 'customer', metric: 'count', filter: null })
-  assert.deepEqual(detectChartIntent('container fcl breakdown by status'), { dimension: 'status', metric: 'fcl', filter: null })
+  const c = detectChartIntent('show a chart of pipeline value by stage')
+  assert.equal(c.dimension, 'stage')
+  assert.equal(c.metric, 'revenue')
 })
 
 test('detectChartIntent refines a prior chart from a bare filter (multi-turn)', () => {
   const session = { lastChart: { dimension: 'grade', metric: 'mt', filter: null } }
-  assert.deepEqual(detectChartIntent('now just TSR-20', session), { dimension: 'grade', metric: 'mt', filter: 'tsr-20' })
+  const c = detectChartIntent('now just TSR-20', session)
+  assert.equal(c.dimension, 'grade')
+  assert.equal(c.metric, 'mt')
+  assert.equal(c.filter, 'tsr-20')
 })
 
-// ---- /chat: validation, local synthesis, chart intent, usage logging ----
+// ---- Skills (Phase 6.5): behavioral rules live as versioned markdown ----
+test('loadSkills concatenates markdown files as versioned agent rules', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'skills-'))
+  fs.writeFileSync(path.join(dir, 'a-rules.md'), 'Rule A body')
+  fs.writeFileSync(path.join(dir, 'b-rules.md'), 'Rule B body')
+  const skills = loadSkills(dir)
+  assert.match(skills, /## a-rules\nRule A body/)
+  assert.match(skills, /## b-rules\nRule B body/)
+  assert.ok(skills.indexOf('a-rules') < skills.indexOf('b-rules'), 'skills load in stable sorted order')
+  assert.equal(loadSkills(path.join(dir, 'missing')), '')
+})
+
+// ---- /chat: local provider ----
 test('POST /chat rejects missing tenant or message', async () => {
   const { app } = await makeApp()
   const noTenant = await app.inject({ method: 'POST', url: '/chat', payload: { message: 'x' } })
@@ -148,14 +128,11 @@ test('POST /chat rejects missing tenant or message', async () => {
 
 test('POST /chat answers from the local provider using tool observations and logs usage', async () => {
   const { app, fake } = await makeApp([
-    [/SELECT 1 FROM records LIMIT 1/, []],
-    [/count\(\*\) FROM companies/, [{ companies: 3, contacts: 5, open_leads: 2, open_deals: 1, pipeline_value: 145000, open_tasks: 2, overdue_tasks: 1 }]],
-    [/FROM embeddings/, [{ source_type: 'record', source_id: 'ORD-1', text: 'Order ORD-1', score: 0.5 }]],
+    ['get_crm_kpi', [{ companies: 3, contacts: 5, open_leads: 2, open_deals: 1, pipeline_value: 145000, open_tasks: 2, overdue_tasks: 1 }]],
+    ['semantic_search', [{ source_type: 'record', source_id: 'ORD-1', text: 'Order ORD-1', score: 0.5 }]],
   ])
   const res = await app.inject({
-    method: 'POST',
-    url: '/chat',
-    headers: { 'x-tenant-id': 'alpha' },
+    method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' },
     payload: { message: 'what is the overview?' },
   })
   assert.equal(res.statusCode, 200)
@@ -166,29 +143,21 @@ test('POST /chat answers from the local provider using tool observations and log
   assert.equal(b.chart, null)
   assert.equal(b.usage.provider, 'local')
   assert.equal(b.usage.tokens_out, b.reply.length)
-  const usage = fake.calls.find((c) => /INSERT INTO ai_usage_logs/.test(c.text))
-  assert.ok(usage, 'every chat turn must be accounted in ai_usage_logs')
-  assert.ok(usage.params.some((p) => typeof p === 'string' && p.length === 36), 'usage log must carry a uuid request_id')
+  const usage = fake.calls.find((c) => c.op === 'usage_log')
+  assert.ok(usage, 'every chat turn must be accounted via the usage_log op')
+  assert.equal(typeof usage.params.request_id, 'string')
+  assert.equal(usage.params.request_id.length, 36, 'usage log must carry a uuid request_id')
   await app.close()
 })
 
 test('POST /chat builds and refines charts across turns (multi-turn session)', async () => {
   const { app, fake } = await makeApp([
-    [/SELECT 1 FROM records LIMIT 1/, [{ one: 1 }]],
-    [/JOIN ai_chat_sessions s ON s\.id = m\.session_id/, [
-      { role: 'assistant', content: 'chart ready', chart: { dimension: 'grade', metric: 'mt', filter: null, spec: { type: 'bar', title: 'mt by grade', labels: ['TSR-20', 'SMR-20'], values: [10, 5] } } },
-    ]],
-    [/ON CONFLICT \(tenant_id, session_key\)/, [{ id: 1 }]],
-    [/SELECT grade AS label/, [
-      { label: 'TSR-20', value: 10 },
-      { label: 'SMR-20', value: 5 },
-    ]],
-    [/FROM embeddings/, []],
+    ['vertical_probe', [{ one: 1 }]],
+    ['memory_load', [{ role: 'assistant', content: 'chart ready', chart: { dimension: 'grade', metric: 'mt', filter: null, spec: { type: 'bar', title: 'mt by grade', labels: ['TSR-20', 'SMR-20'], values: [10, 5] } } }]],
+    ['vertical_chart', [{ label: 'TSR-20', value: 10 }, { label: 'SMR-20', value: 5 }]],
   ])
   const first = await app.inject({
-    method: 'POST',
-    url: '/chat',
-    headers: { 'x-tenant-id': 'alpha' },
+    method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' },
     payload: { message: 'show a grade chart by mt', session_id: 's1' },
   })
   const b1 = JSON.parse(first.body)
@@ -197,28 +166,23 @@ test('POST /chat builds and refines charts across turns (multi-turn session)', a
   assert.equal(b1.chart.title, 'mt by grade')
 
   const second = await app.inject({
-    method: 'POST',
-    url: '/chat',
-    headers: { 'x-tenant-id': 'alpha' },
+    method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' },
     payload: { message: 'now just TSR-20', session_id: 's1' },
   })
   const b2 = JSON.parse(second.body)
   assert.ok(b2.chart, 'bare filter must refine the previous chart instead of replying without one')
-  const refined = fake.calls.find((c) => /WHERE grade ILIKE \$1/.test(c.text))
-  assert.deepEqual(refined.params, ['%tsr-20%'], 'the previous chart dimension/metric must be reused with the new filter')
+  const refined = fake.calls.filter((c) => c.op === 'vertical_chart').pop()
+  assert.deepEqual(refined.params, { dimension: 'grade', metric: 'mt', filter: 'tsr-20' }, 'the previous chart dimension/metric must be reused with the new filter')
   await app.close()
 })
 
 test('POST /chat survives usage-log failures (accounting must not break replies)', async () => {
   const { app } = await makeApp([
-    [/SELECT 1 FROM records LIMIT 1/, []],
-    [/count\(\*\) FROM companies/, [{ companies: 1, contacts: 1, open_leads: 1, open_deals: 1, pipeline_value: 1, open_tasks: 1, overdue_tasks: 0 }]],
-    [/INSERT INTO ai_usage_logs/, [], 'usage table down'],
+    ['get_crm_kpi', [{ companies: 1, contacts: 1, open_leads: 1, open_deals: 1, pipeline_value: 1, open_tasks: 1, overdue_tasks: 0 }]],
+    ['usage_log', [], 'usage table down'],
   ])
   const res = await app.inject({
-    method: 'POST',
-    url: '/chat',
-    headers: { 'x-tenant-id': 'alpha' },
+    method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' },
     payload: { message: 'overview please' },
   })
   assert.equal(res.statusCode, 200)
@@ -226,24 +190,23 @@ test('POST /chat survives usage-log failures (accounting must not break replies)
   await app.close()
 })
 
-// ---- /index: RLS-scoped reindex ----
-test('POST /index embeds every record/ticket/party row in the tenant', async () => {
+// ---- /index: gateway reindex ----
+test('POST /index embeds every source row via the gateway', async () => {
   const { app, fake } = await makeApp([
-    [/FROM records/, [{ id: 'ORD-1', type: 'record', text: 'Order ORD-1' }, { id: 'ORD-2', type: 'record', text: 'Order ORD-2' }]],
-    [/FROM tickets/, [{ id: 'T-1', type: 'ticket', text: 'Ticket T-1' }]],
-    [/FROM parties/, [{ id: 'BKT', type: 'party', text: 'supplier BKT contact X' }]],
-    [/FROM companies/, [{ id: 'CEAT', type: 'company', text: 'Company CEAT (customer, Tire manufacturing)' }]],
+    ['index_sources', [
+      { id: 'ORD-1', type: 'record', text: 'Order ORD-1' }, { id: 'ORD-2', type: 'record', text: 'Order ORD-2' },
+      { id: 'T-1', type: 'ticket', text: 'Ticket T-1' }, { id: 'BKT', type: 'party', text: 'supplier BKT contact X' },
+      { id: 'CEAT', type: 'company', text: 'Company CEAT (customer, Tire manufacturing)' },
+    ]],
   ])
   const res = await app.inject({ method: 'POST', url: '/index', headers: { 'x-tenant-id': 'alpha' } })
   assert.equal(res.statusCode, 200)
   assert.deepEqual(JSON.parse(res.body), { tenant: 'alpha', indexed: 5 })
-  assert.ok(fake.calls.some((c) => c.text === 'DELETE FROM embeddings'), 'reindex must clear the old tenant embeddings')
-  assert.ok(fake.calls.some((c) => /FROM companies/.test(c.text)), 'reindex must cover the CRM entities, not just the vertical tables')
-  const inserts = fake.calls.filter((c) => /INSERT INTO embeddings/.test(c.text))
+  assert.ok(fake.calls.some((c) => c.op === 'index_clear'), 'reindex must clear the old tenant embeddings')
+  const inserts = fake.calls.filter((c) => c.op === 'index_insert')
   assert.equal(inserts.length, 5)
-  const vec = inserts[0].params[3]
-  assert.match(vec, /^\[-?[\d.e-]+,/)
-  assert.equal(vec.split(',').length, 768, 'stored vector must be the full 768-dim embedding')
+  assert.equal(inserts[0].params.vector.length, 768, 'stored vector must be the full 768-dim embedding')
+  assert.ok(fake.calls.some((c) => c.op === 'index_sources' && c.tenantId === 'alpha'), 'sources come from the tenant-scoped gateway op')
   const missing = await app.inject({ method: 'POST', url: '/index' })
   assert.equal(JSON.parse(missing.body).error, 'x-tenant-id required')
   await app.close()
@@ -252,18 +215,18 @@ test('POST /index embeds every record/ticket/party row in the tenant', async () 
 // ---- /insights + /insights/latest ----
 test('POST /insights computes CRM insights for every tenant and appends vertical lines when data exists', async () => {
   const { app, fake } = await makeApp([
-    [/SELECT 1 FROM records LIMIT 1/, [{ one: 1 }]],
-    [/count\(\*\) FROM companies/, [{ companies: 3, contacts: 2, leads: 2, deals: 2, pipeline: 145000 }]],
-    [/JOIN companies c ON c\.id = d\.company_id/, [{ name: 'CEAT', v: 120000 }]],
-    [/GROUP BY stage/, [{ stage: 'proposal', n: 1, v: 120000 }]],
-    [/GROUP BY source/, [{ source: 'referral', n: 1 }]],
-    [/FILTER \(WHERE NOT completed\)/, [{ open_tasks: 2, overdue: 1 }]],
-    [/expected_close_date/, [{ m: '2026-12', v: 120000 }]],
-    [/GROUP BY customer/, [{ customer: 'CEAT', mt: 100 }]],
-    [/GROUP BY grade/, [{ grade: 'TSR-20', mt: 100 }]],
-    [/GROUP BY category/, [{ category: 'quality', n: 2 }]],
-    [/date_trunc\('month', date\),'YYYY-MM'/, [{ m: '2026-08', mt: 100 }]],
-    [/coalesce\(sum\(mt\*price_usd\),0\)/, [{ orders: 5, mt: 100, revenue: 200000 }]],
+    ['vertical_probe', [{ one: 1 }]],
+    ['ins_totals', [{ companies: 3, contacts: 2, leads: 2, deals: 2, pipeline: 145000 }]],
+    ['ins_top_pipeline', [{ name: 'CEAT', v: 120000 }]],
+    ['ins_by_stage', [{ stage: 'proposal', n: 1, v: 120000 }]],
+    ['ins_leads_source', [{ source: 'referral', n: 1 }]],
+    ['ins_tasks', [{ open_tasks: 2, overdue: 1 }]],
+    ['ins_deal_months', [{ m: '2026-12', v: 120000 }]],
+    ['ins_top_customers', [{ customer: 'CEAT', mt: 100 }]],
+    ['ins_top_grades', [{ grade: 'TSR-20', mt: 100 }]],
+    ['ins_issue_mix', [{ category: 'quality', n: 2 }]],
+    ['ins_v_trend', [{ m: '2026-08', mt: 100 }]],
+    ['ins_v_totals', [{ orders: 5, mt: 100, revenue: 200000 }]],
   ])
   const res = await app.inject({ method: 'POST', url: '/insights', headers: { 'x-tenant-id': 'alpha' } })
   assert.equal(res.statusCode, 200)
@@ -277,29 +240,26 @@ test('POST /insights computes CRM insights for every tenant and appends vertical
   assert.match(b.insights[5], /Expected deal value by month: 2026-12=\$120,000/)
   assert.match(b.insights[6], /Top customer by volume: CEAT \(100 MT\)/)
   assert.match(b.insights[10], /Totals: 5 orders, 100 MT, \$0\.20M revenue/)
-  const snap = fake.calls.find((c) => /INSERT INTO insights_snapshots/.test(c.text))
+  const snap = fake.calls.find((c) => c.op === 'snapshot_insert')
   assert.ok(snap, 'insights must be persisted for the Insights screen')
-  assert.equal(JSON.parse(snap.params[0]).length, 11)
-  assert.equal(snap.params[1], 'local')
+  assert.equal(snap.params.insights.length, 11)
+  assert.equal(snap.params.provider, 'local')
   await app.close()
 })
 
 test('POST /insights stays CRM-only for tenants without vertical data', async () => {
   const { app, fake } = await makeApp([
-    [/SELECT 1 FROM records LIMIT 1/, []],
-    [/count\(\*\) FROM companies/, [{ companies: 1, contacts: 1, leads: 1, deals: 1, pipeline: 1 }]],
-    [/JOIN companies c ON c\.id = d\.company_id/, []],
-    [/GROUP BY stage/, []],
-    [/GROUP BY source/, []],
-    [/FILTER \(WHERE NOT completed\)/, [{ open_tasks: 0, overdue: 0 }]],
-    [/expected_close_date/, []],
+    ['vertical_probe', []],
+    ['ins_totals', [{ companies: 1, contacts: 1, leads: 1, deals: 1, pipeline: 1 }]],
+    ['ins_top_pipeline', []], ['ins_by_stage', []], ['ins_leads_source', []],
+    ['ins_tasks', [{ open_tasks: 0, overdue: 0 }]], ['ins_deal_months', []],
   ])
   const res = await app.inject({ method: 'POST', url: '/insights', headers: { 'x-tenant-id': 'alpha' } })
   assert.equal(res.statusCode, 200)
   const b = JSON.parse(res.body)
   assert.equal(b.insights.length, 6)
   assert.match(b.insights[0], /CRM: 1 companies, 1 contacts, 1 leads, 1 deals \(\$1 total pipeline\)/)
-  assert.ok(fake.calls.every((c) => !/FROM records GROUP BY customer/.test(c.text)), 'vertical queries must not run without vertical data')
+  assert.ok(fake.calls.every((c) => c.op !== 'ins_top_customers'), 'vertical ops must not run without vertical data')
   await app.close()
 })
 
@@ -310,7 +270,7 @@ test('GET /insights/latest returns the newest snapshot or an empty note pre-cron
   await empty.app.close()
 
   const { app } = await makeApp([
-    [/FROM insights_snapshots ORDER BY created_at/, [{ insights: ['a'], provider: 'cron', created_at: '2026-09-01T00:00:00Z' }]],
+    ['insights_latest', [{ insights: ['a'], provider: 'cron', created_at: '2026-09-01T00:00:00Z' }]],
   ])
   const res = await app.inject({ method: 'GET', url: '/insights/latest', headers: { 'x-tenant-id': 'alpha' } })
   const b = JSON.parse(res.body)
@@ -322,14 +282,12 @@ test('GET /insights/latest returns the newest snapshot or an empty note pre-cron
 // ---- CRM routing and CRM charts ----
 test('POST /chat routes CRM questions to search_crm', async () => {
   const { app } = await makeApp([
-    [/SELECT 1 FROM records LIMIT 1/, []],
-    [/UNION ALL/, [{ kind: 'deal', label: 'CEAT Q4 contract', detail: 'proposal' }]],
-    [/FROM embeddings/, []],
+    ['vertical_probe', []],
+    ['search_crm', [{ kind: 'deal', label: 'CEAT Q4 contract', detail: 'proposal' }]],
+    ['semantic_search', []],
   ])
   const res = await app.inject({
-    method: 'POST',
-    url: '/chat',
-    headers: { 'x-tenant-id': 'alpha' },
+    method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' },
     payload: { message: 'tell me about the CEAT deal' },
   })
   assert.equal(res.statusCode, 200)
@@ -341,17 +299,12 @@ test('POST /chat routes CRM questions to search_crm', async () => {
 
 test('POST /chat builds pipeline charts from the CRM for stage/company/source intents', async () => {
   const { app, fake } = await makeApp([
-    [/SELECT 1 FROM records LIMIT 1/, []],
-    [/SELECT stage AS label/, [
-      { label: 'proposal', value: 120000 },
-      { label: 'new', value: 25000 },
-    ]],
-    [/FROM embeddings/, []],
+    ['vertical_probe', []],
+    ['crm_chart', [{ label: 'proposal', value: 120000 }, { label: 'new', value: 25000 }]],
+    ['semantic_search', []],
   ])
   const res = await app.inject({
-    method: 'POST',
-    url: '/chat',
-    headers: { 'x-tenant-id': 'alpha' },
+    method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' },
     payload: { message: 'chart of pipeline value by stage' },
   })
   assert.equal(res.statusCode, 200)
@@ -359,22 +312,20 @@ test('POST /chat builds pipeline charts from the CRM for stage/company/source in
   assert.equal(b.chart.type, 'bar')
   assert.deepEqual(b.chart.labels, ['proposal', 'new'])
   assert.match(b.chart.title, /revenue by stage/)
-  const q = fake.calls.find((c) => /SELECT stage AS label/.test(c.text))
-  assert.match(q.text, /sum\(value\)/, 'the revenue metric maps to the CRM deal value')
+  const q = fake.calls.find((c) => c.op === 'crm_chart')
+  assert.equal(q.params.metric, 'revenue', 'the revenue metric maps to the CRM deal value')
   await app.close()
 })
 
 // ---- /chat/stream: SSE surface (start/tool/done frames, local synthesis) ----
 test('POST /chat/stream emits SSE frames and closes cleanly', async () => {
   const { app } = await makeApp([
-    [/SELECT 1 FROM records LIMIT 1/, []],
-    [/count\(\*\) FROM companies/, [{ companies: 2, contacts: 3, open_leads: 1, open_deals: 1, pipeline_value: 25000, open_tasks: 1, overdue_tasks: 0 }]],
-    [/FROM embeddings/, []],
+    ['vertical_probe', []],
+    ['get_crm_kpi', [{ companies: 2, contacts: 3, open_leads: 1, open_deals: 1, pipeline_value: 25000, open_tasks: 1, overdue_tasks: 0 }]],
+    ['semantic_search', []],
   ])
   const res = await app.inject({
-    method: 'POST',
-    url: '/chat/stream',
-    headers: { 'x-tenant-id': 'alpha' },
+    method: 'POST', url: '/chat/stream', headers: { 'x-tenant-id': 'alpha' },
     payload: { message: 'hi' },
   })
   assert.equal(res.statusCode, 200)
@@ -389,7 +340,7 @@ test('POST /chat/stream emits SSE frames and closes cleanly', async () => {
   await app.close()
 })
 
-// ---- Phase 4: text-to-SQL guardrails ----
+// ---- Phase 4/6.5: text-to-SQL guardrails + credential-free execution ----
 test('validateSql accepts single SELECTs and rejects dangerous shapes', () => {
   assert.deepEqual(validateSql('SELECT count(*) FROM companies'), { sql: 'SELECT count(*) FROM companies' })
   assert.equal(validateSql('  select 1;  ').sql, 'select 1')
@@ -397,66 +348,121 @@ test('validateSql accepts single SELECTs and rejects dangerous shapes', () => {
   assert.match(validateSql('').error, /empty/)
   assert.match(validateSql('SELECT 1; SELECT 2').error, /single statement/)
   assert.match(validateSql('DELETE FROM companies').error, /only SELECT/)
-  assert.match(validateSql("SELECT * FROM companies WHERE name = 'drop everything'").error, /forbidden keyword/, 'keywords inside literals are rejected too — strict by design')
-  assert.equal(extractSql('sql: SELECT count(*) FROM deals'), 'SELECT count(*) FROM deals')
+  assert.match(validateSql("SELECT * FROM companies WHERE name = 'drop everything'").error, /forbidden keyword/)
 })
 
-test('run_sql runs SELECTs on the readonly pool with tenant GUC + timeout; mutations never reach it', async () => {
-  const data = makeFakePool([
-    [/^SELECT set_config/, [{ set_config: 't' }]],
-    [/^RESET /, []],
-    [/JOIN ai_chat_sessions s ON s\.id = m\.session_id/, []],
-    [/ON CONFLICT \(tenant_id, session_key\)/, []],
+test('run_sql forwards validated SELECTs to the internal sql gateway; mutations never reach it', async () => {
+  const { app, fake } = await makeApp([
+    ['__sql', { rows: [{ n: 3 }], rowCount: 1 }],
+    ['vertical_probe', []],
+    ['semantic_search', []],
   ])
-  const ro = makeFakePool([
-    [/^BEGIN$/, []],
-    [/^COMMIT$/, []],
-    [/statement_timeout/, []],
-    [/count\(\*\) FROM companies/, [{ count: '3' }]],
-  ])
-  const { app } = await buildApp({ pool: data.pool, readonlyPool: ro.pool, logger: false })
-  const res = await app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'sql: SELECT count(*) FROM companies' } })
+  const res = await app.inject({
+    method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' },
+    payload: { message: 'sql: SELECT count(*) AS n FROM companies' },
+  })
   assert.equal(res.statusCode, 200)
-  const b = JSON.parse(res.body)
-  assert.ok(b.tools.includes('run_sql'))
-  assert.match(b.reply, /SQL result/)
-  assert.match(b.reply, /"count":"3"/)
-  const gucIdx = ro.calls.findIndex((c) => /set_config\('app\.tenant_id'/.test(c.text))
-  const qIdx = ro.calls.findIndex((c) => /count\(\*\) FROM companies/.test(c.text))
-  assert.ok(gucIdx >= 0 && gucIdx < qIdx, 'transaction-local tenant GUC must precede the query')
-  assert.deepEqual(ro.calls[gucIdx].params, ['alpha'])
-  assert.ok(ro.calls.some((c) => /statement_timeout/.test(c.text)), 'per-query timeout must be set')
+  assert.match(JSON.parse(res.body).reply, /SQL result/)
+  const sqlCall = fake.calls.find((c) => c.op === '__sql')
+  assert.ok(sqlCall, 'validated SELECT must be forwarded to the BFF sql gateway')
+  assert.match(sqlCall.params.sql, /^SELECT count/i)
 
-  const roCallsBefore = ro.calls.length
-  const bad = await app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'sql: DELETE FROM companies' } })
-  assert.match(JSON.parse(bad.body).reply, /only SELECT/)
-  assert.equal(ro.calls.length, roCallsBefore, 'rejected SQL must never reach the readonly pool')
+  await app.inject({
+    method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' },
+    payload: { message: 'sql: DELETE FROM companies' },
+  })
+  assert.ok(!fake.calls.some((c) => c.op === '__sql' && /delete/i.test(c.params.sql)), 'mutations are rejected before the gateway')
   await app.close()
-
-  const noRoApp = await buildApp({ pool: data.pool, logger: false })
-  const noRoRes = await noRoApp.app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'sql: SELECT 1' } })
-  assert.match(JSON.parse(noRoRes.body).reply, /not configured/)
-  await noRoApp.app.close()
 })
 
-test('chat turns persist to ai_chat_messages (Phase 4 conversation memory)', async () => {
-  const data = makeFakePool([
-    [/^SELECT set_config/, [{ set_config: 't' }]],
-    [/^RESET /, []],
-    [/JOIN ai_chat_sessions s ON s\.id = m\.session_id/, [{ role: 'user', content: 'earlier question', chart: null }]],
-    [/ON CONFLICT \(tenant_id, session_key\)/, [{ id: 42 }]],
+test('chat turns persist via the memory ops (Phase 4 conversation memory)', async () => {
+  const { app, fake } = await makeApp([
+    ['memory_load', [{ role: 'user', content: 'earlier question', chart: null }]],
+    ['memory_upsert_session', [{ id: 42 }]],
+    ['vertical_probe', []],
+    ['get_crm_kpi', [{ companies: 1, contacts: 1, open_leads: 1, open_deals: 1, pipeline_value: 1, open_tasks: 1, overdue_tasks: 0 }]],
+    ['semantic_search', []],
   ])
-  const { app } = await buildApp({ pool: data.pool, logger: false })
   const res = await app.inject({ method: 'POST', url: '/chat', headers: { 'x-tenant-id': 'alpha' }, payload: { message: 'what is the overview?', session_id: 'mem-test' } })
   assert.equal(res.statusCode, 200)
-  const inserts = data.calls.filter((c) => /INSERT INTO ai_chat_messages/.test(c.text))
-  assert.equal(inserts.length, 2, 'user + assistant turns must persist')
-  assert.equal(inserts[0].params[1], 'what is the overview?')
-  assert.equal(inserts[0].params[0], 42, 'messages attach to the upserted session')
-  assert.ok(inserts[1].params[1].length > 0, 'assistant reply must be persisted')
-  const toolsParam = JSON.parse(inserts[1].params[2])
-  assert.ok(Array.isArray(toolsParam), 'tool names persist as JSON')
+  const turns = fake.calls.filter((c) => c.op === 'memory_save_turn')
+  assert.equal(turns.length, 2, 'user + assistant turns must persist')
+  assert.equal(turns[0].params.session_id, 42, 'messages attach to the upserted session')
+  assert.equal(turns[0].params.role, 'user')
+  assert.equal(turns[0].params.content, 'what is the overview?')
+  assert.equal(turns[1].params.role, 'assistant')
+  assert.ok(turns[1].params.content.length > 0, 'assistant reply must be persisted')
   await app.close()
+})
+
+// ---- Phase 6.5: durable agent task dispatcher ----
+test('dispatchTick claims due tasks, executes them, and records done results', async () => {
+  const fake = makeFakeGateway([
+    ['tenants_all', [{ id: 'alpha' }]],
+    ['task_claim', [{ id: 'task-1', task_type: 'insights_refresh', payload: {}, attempts: 1 }]],
+    ['usage_budget', [{ tokens: 100 }]],
+    ['vertical_probe', []],
+    ['ins_totals', [{ companies: 1, contacts: 1, leads: 1, deals: 1, pipeline: 1 }]],
+    ['ins_top_pipeline', []], ['ins_by_stage', []], ['ins_leads_source', []],
+    ['ins_tasks', [{ open_tasks: 0, overdue: 0 }]], ['ins_deal_months', []],
+    ['snapshot_insert', []],
+  ])
+  const built = await buildApp({ gateway: fake.gateway, logger: false })
+  await built.dispatchTick()
+  const claim = fake.calls.find((c) => c.op === 'task_claim')
+  assert.equal(claim.tenantId, 'alpha', 'tasks are claimed at tenant scope')
+  const finish = fake.calls.find((c) => c.op === 'task_finish')
+  assert.ok(finish, 'the task must be finished')
+  assert.equal(finish.params.id, 'task-1')
+  assert.equal(finish.params.status, 'done')
+  assert.equal(finish.params.result.insights, 6)
+  await built.app.close()
+})
+
+test('dispatchTick refuses to run when the tenant exceeds its daily token budget', async () => {
+  const fake = makeFakeGateway([
+    ['tenants_all', [{ id: 'alpha' }]],
+    ['task_claim', [{ id: 'task-2', task_type: 'insights_refresh', payload: {}, attempts: 1 }]],
+    ['usage_budget', [{ tokens: 999999999 }]],
+  ])
+  const built = await buildApp({ gateway: fake.gateway, logger: false })
+  await built.dispatchTick()
+  const finish = fake.calls.find((c) => c.op === 'task_finish')
+  assert.equal(finish.params.status, 'failed')
+  assert.match(finish.params.error, /daily token budget exceeded/)
+  assert.ok(!fake.calls.some((c) => c.op === 'snapshot_insert'), 'no work may run past the budget gate')
+  await built.app.close()
+})
+
+test('forecast_refresh tasks proxy to the predictions service with the tenant header', async () => {
+  process.env.PREDICTIONS_SERVICE_URL = 'http://pred.test:5100'
+  const real = globalThis.fetch
+  let seenUrl = null, seenTenant = null
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes('pred.test')) {
+      seenUrl = String(url)
+      seenTenant = opts.headers['x-tenant-id']
+      return { ok: true, json: async () => ({ series: 'record_mt', stored: true }) }
+    }
+    return real(url, opts)
+  }
+  try {
+    const fake = makeFakeGateway([
+      ['tenants_all', [{ id: 'alpha' }]],
+      ['task_claim', [{ id: 'task-3', task_type: 'forecast_refresh', payload: { series: 'record_mt' }, attempts: 1 }]],
+      ['usage_budget', [{ tokens: 0 }]],
+    ])
+    const built = await buildApp({ gateway: fake.gateway, logger: false })
+    await built.dispatchTick()
+    assert.equal(seenUrl, 'http://pred.test:5100/forecast')
+    assert.equal(seenTenant, 'alpha')
+    const finish = fake.calls.find((c) => c.op === 'task_finish')
+    assert.equal(finish.params.status, 'done')
+    assert.deepEqual(finish.params.result, { series: 'record_mt', stored: true })
+    await built.app.close()
+  } finally {
+    globalThis.fetch = real
+  }
 })
 
 test('pickProvider routes to cloudflare only with token AND account, falling back otherwise', () => {

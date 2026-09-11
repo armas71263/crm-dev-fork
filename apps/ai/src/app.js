@@ -1,5 +1,8 @@
 import Fastify from 'fastify'
 import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import { streamText, generateText, tool as sdkTool, jsonSchema, stepCountIs } from 'ai'
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 
@@ -207,20 +210,35 @@ export function extractSql(text) {
   return m ? m[1].trim() : String(text || '')
 }
 
-export async function buildApp({ pool, readonlyPool, logger = true }) {
+// Versioned skills (Phase 6.5): the agent's behavioral rules live as markdown
+// files in apps/ai/skills — reviewable and diffable like any other source.
+export function loadSkills(dir) {
+  const skillsDir = dir || path.join(path.dirname(fileURLToPath(import.meta.url)), '../skills')
+  try {
+    return fs.readdirSync(skillsDir).filter((f) => f.endsWith('.md')).sort()
+      .map((f) => `## ${f.replace(/\.md$/, '')}\n${fs.readFileSync(path.join(skillsDir, f), 'utf8').trim()}`).join('\n\n')
+  } catch { return '' }
+}
+
+export async function buildApp({ gateway, logger = true }) {
   const fastify = Fastify({ logger })
-  const tenantQuery = makeTenantQuery(pool)
+  // Credential-free agent (Phase 6.5): every DB touch is a named op executed
+  // by the BFF's internal gateway (token-authed, RLS-scoped, SQL defined
+  // server-side). This service holds NO database credentials at all.
+  const gw = async (tid, op, params = {}) => {
+    const r = await gateway(tid, op, params)
+    if (r.error) throw new Error(r.error)
+    return r.rows || []
+  }
+  const skills = loadSkills()
+  const systemPrompt = (tenantId) => `You are a B2B CRM + operations assistant for tenant "${tenantId}". Answer grounded in the tenant's data using the provided tools. Be concise and specific. Prefer the dedicated search/KPI tools; only use run_sql for questions they cannot answer (a single read-only SELECT). Once you have relevant results, answer immediately — do not repeat similar tool calls. If the tools don't contain the answer, say so.\n\n${skills}`
 
   // ---- Conversation memory (Phase 4): turns persist in Postgres, RLS-scoped
   // ---- per tenant. A DB hiccup degrades to no-history — chat never breaks.
   async function loadMemory(tenantId, sessionKey) {
     const key = sessionKey || 'default'
     try {
-      const r = await tenantQuery(tenantId,
-        `SELECT m.role, m.content, m.chart FROM ai_chat_messages m
-         JOIN ai_chat_sessions s ON s.id = m.session_id
-         WHERE s.session_key = $1 ORDER BY m.id DESC LIMIT 10`, [key])
-      const rows = r.rows.reverse()
+      const rows = (await gw(tenantId, 'memory_load', { session_key: key })).reverse()
       const lastChart = [...rows].reverse().find((x) => x.chart)?.chart || null
       return { history: rows.map((x) => ({ role: x.role, text: x.content })), lastChart }
     } catch (e) {
@@ -232,18 +250,10 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
   async function saveTurn(tenantId, sessionKey, { userText, assistantText, tools, chart }) {
     const key = sessionKey || 'default'
     try {
-      const s = await tenantQuery(tenantId,
-        `INSERT INTO ai_chat_sessions (tenant_id, session_key) VALUES (app.current_tenant(), $1)
-         ON CONFLICT (tenant_id, session_key) DO UPDATE SET updated_at = now() RETURNING id`, [key])
-      const sid = s.rows[0]?.id
+      const sid = (await gw(tenantId, 'memory_upsert_session', { session_key: key }))[0]?.id
       if (!sid) return
-      await tenantQuery(tenantId,
-        `INSERT INTO ai_chat_messages (tenant_id, session_id, role, content, tools, chart)
-         VALUES (app.current_tenant(), $1, 'user', $2, '[]'::jsonb, NULL)`, [sid, userText])
-      await tenantQuery(tenantId,
-        `INSERT INTO ai_chat_messages (tenant_id, session_id, role, content, tools, chart)
-         VALUES (app.current_tenant(), $1, 'assistant', $2, $3::jsonb, $4::jsonb)`,
-        [sid, assistantText, JSON.stringify(tools || []), chart ? JSON.stringify(chart) : null])
+      await gw(tenantId, 'memory_save_turn', { session_id: sid, role: 'user', content: userText })
+      await gw(tenantId, 'memory_save_turn', { session_id: sid, role: 'assistant', content: assistantText, tools: tools || [], chart })
     } catch (e) {
       fastify.log.warn({ err: e.message }, 'chat memory save failed — turn not persisted')
     }
@@ -251,23 +261,9 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
 
   // ---- Text-to-SQL execution: app_readonly pool, transaction-local tenant
   // ---- GUC + statement timeout. Any error fails closed with a message.
-  async function runReadonly(tenantId, sql) {
-    if (!readonlyPool) return { error: 'text-to-SQL is not configured (no readonly pool)' }
-    const client = await readonlyPool.connect()
-    try {
-      await client.query('BEGIN')
-      await client.query("SELECT set_config('app.tenant_id', $1, true)", [tenantId])
-      await client.query("SET LOCAL statement_timeout = '5s'")
-      const r = await client.query(sql)
-      await client.query('COMMIT')
-      return { rows: r.rows.slice(0, 50), rowCount: r.rowCount }
-    } catch (e) {
-      try { await client.query('ROLLBACK') } catch { /* already aborted */ }
-      return { error: `query failed: ${e.message.slice(0, 160)}` }
-    } finally {
-      client.release()
-    }
-  }
+  // Model-written SQL goes through the BFF's /internal/sql (validateSql +
+  // app_readonly pool live THERE now — the authoritative wall).
+  const runReadonly = (tenantId, sql) => gateway(tenantId, '__sql', { sql })
 
   // Vertical (rubber-trading) data is template-specific; the CRM schema is
   // universal. Vertical tools run only for tenants whose vertical tables
@@ -277,7 +273,7 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     const hit = VERTICAL_CACHE.get(tenantId)
     if (hit && Date.now() - hit.ts < 60000) return hit.has
     let has = false
-    try { has = (await tenantQuery(tenantId, 'SELECT 1 FROM records LIMIT 1')).rows.length > 0 } catch { has = false }
+    try { has = (await gw(tenantId, 'vertical_probe')).length > 0 } catch { has = false }
     VERTICAL_CACHE.set(tenantId, { ts: Date.now(), has })
     return has
   }
@@ -286,10 +282,7 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
   // and swallowed so an accounting hiccup never breaks a chat reply.
   async function logUsage(tenantId, { requestId, provider, model, tool, tokensIn = 0, tokensOut = 0, costUsd = 0, latencyMs = 0 }) {
     try {
-      await tenantQuery(tenantId,
-        `INSERT INTO ai_usage_logs (tenant_id, request_id, provider, model, tool, tokens_in, tokens_out, cost_usd, latency_ms)
-         VALUES (app.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8)`,
-        [requestId, provider, model, tool, tokensIn, tokensOut, costUsd, latencyMs])
+      await gw(tenantId, 'usage_log', { request_id: requestId, provider, model, tool, tokens_in: tokensIn, tokens_out: tokensOut, cost_usd: costUsd, latency_ms: latencyMs })
     } catch (e) { fastify.log.warn({ msg: 'usage log failed', err: e.message }) }
   }
 
@@ -297,99 +290,30 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
 
   // ---- Agent tools — each returns tenant-scoped structured data ----
   const TOOLS = {
-    search_records: async (tenantId, { q }) => {
-      const like = `%${q}%`
-      const r = await tenantQuery(tenantId,
-        `SELECT order_id, customer, supplier, grade, mt, fcl, price_usd, status FROM records
-         WHERE customer ILIKE $1 OR supplier ILIKE $1 OR order_id ILIKE $1 OR grade ILIKE $1
-         ORDER BY created_at DESC LIMIT 5`, [like])
-      return r.rows
-    },
-    get_kpi: async (tenantId) => {
-      const r = await tenantQuery(tenantId, `SELECT
-        count(*)::int AS open_orders, coalesce(sum(mt),0)::float AS active_mt,
-        count(DISTINCT supplier)::int AS suppliers, count(DISTINCT customer)::int AS customers
-        FROM records`)
-      return r.rows[0]
-    },
-    get_issues: async (tenantId) => {
-      const r = await tenantQuery(tenantId, `SELECT ticket_id, category, status, description FROM tickets WHERE status<>'Resolved' ORDER BY created_at DESC LIMIT 5`)
-      return r.rows
-    },
-    get_party: async (tenantId, { q }) => {
-      const r = await tenantQuery(tenantId, `SELECT name, type, contact FROM parties WHERE name ILIKE $1 LIMIT 5`, [`%${q}%`])
-      return r.rows
-    },
-    // suggest_chart: aggregates the data and returns a chart spec the UI renders inline.
+    search_records: async (tenantId, { q }) => gw(tenantId, 'search_records', { q }),
+    get_kpi: async (tenantId) => (await gw(tenantId, 'get_kpi'))[0] || {},
+    get_issues: async (tenantId) => gw(tenantId, 'get_issues'),
+    get_party: async (tenantId, { q }) => gw(tenantId, 'get_party', { q }),
+    // suggest_chart: aggregates via the BFF gateway (dimension/metric are
+    // whitelisted keys server-side — no SQL fragments cross the wire).
     suggest_chart: async (tenantId, { dimension, metric = 'count', title, filter }) => {
-      // Dimension-to-table map: category lives on tickets, not records.
-      const SPECS = {
-        grade: { from: 'records', dim: 'grade' },
-        customer: { from: 'records', dim: 'customer' },
-        supplier: { from: 'records', dim: 'supplier' },
-        status: { from: 'records', dim: 'status' },
-        category: { from: 'tickets', dim: 'category' },
-        month: { from: 'records', dim: "to_char(date_trunc('month', date), 'YYYY-MM')" },
-      }
-      const METRICS = { mt: 'sum(mt)', fcl: 'sum(fcl)', count: 'count(*)', revenue: 'sum(mt*price_usd)', avg_price: 'avg(price_usd)' }
-      const spec = SPECS[dimension] || SPECS.customer
-      const met = METRICS[metric] || METRICS.count
-      let where = '', params = []
-      if (filter && spec.from === 'records') { where = 'WHERE grade ILIKE $1 OR customer ILIKE $1 OR supplier ILIKE $1'; params = [`%${filter}%`] }
-      const r = await tenantQuery(tenantId,
-        `SELECT ${spec.dim} AS label, ${met}::float AS value FROM ${spec.from} ${where} GROUP BY 1 ORDER BY ${dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 20`, params)
-      return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) } }
+      const rows = await gw(tenantId, 'vertical_chart', { dimension, metric, filter })
+      return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: rows.map(x => x.label), values: rows.map(x => x.value) } }
     },
 
     // ---- Generic CRM tools (companies/contacts/leads/deals/activities) ----
-    search_crm: async (tenantId, { q }) => {
-      const like = `%${q}%`
-      const r = await tenantQuery(tenantId, `
-        SELECT * FROM (
-          (SELECT 'company' AS kind, name::text AS label, coalesce(type,'') AS detail FROM companies WHERE name ILIKE $1 OR coalesce(industry,'') ILIKE $1 LIMIT 3)
-          UNION ALL (SELECT 'contact', full_name, coalesce(title,'') FROM contacts WHERE full_name ILIKE $1 OR coalesce(email,'') ILIKE $1 LIMIT 3)
-          UNION ALL (SELECT 'lead', name, coalesce(company_name,'') FROM leads WHERE name ILIKE $1 OR coalesce(company_name,'') ILIKE $1 LIMIT 3)
-          UNION ALL (SELECT 'deal', name, coalesce(stage,'') FROM deals WHERE name ILIKE $1 LIMIT 3)
-          UNION ALL (SELECT 'activity', subject, coalesce(type,'') FROM activities WHERE subject ILIKE $1 OR coalesce(detail,'') ILIKE $1 LIMIT 3)
-        ) sub LIMIT 9`, [like])
-      return r.rows
-    },
-    get_crm_kpi: async (tenantId) => {
-      const r = await tenantQuery(tenantId, `SELECT
-        (SELECT count(*) FROM companies)::int AS companies,
-        (SELECT count(*) FROM contacts)::int AS contacts,
-        (SELECT count(*) FROM leads WHERE status NOT IN ('won','lost','converted','disqualified','closed'))::int AS open_leads,
-        (SELECT count(*) FROM deals WHERE status='open')::int AS open_deals,
-        (SELECT coalesce(sum(value),0) FROM deals WHERE status='open')::float AS pipeline_value,
-        (SELECT count(*) FROM activities WHERE type='task' AND NOT completed)::int AS open_tasks,
-        (SELECT count(*) FROM activities WHERE type='task' AND NOT completed AND due_at < now())::int AS overdue_tasks`)
-      return r.rows[0]
-    },
-    // suggest_crm_chart: aggregates the generic CRM and returns a chart spec.
+    search_crm: async (tenantId, { q }) => gw(tenantId, 'search_crm', { q }),
+    get_crm_kpi: async (tenantId) => (await gw(tenantId, 'get_crm_kpi'))[0] || {},
     suggest_crm_chart: async (tenantId, { dimension, metric = 'count', title, filter }) => {
-      const SPECS = {
-        stage: { from: 'deals', dim: 'stage' },
-        company: { from: 'deals d JOIN companies c ON c.id = d.company_id', dim: 'c.name' },
-        source: { from: 'leads', dim: `coalesce(source,'n/a')` },
-        status: { from: 'leads', dim: 'status' },
-        type: { from: 'activities', dim: 'type' },
-        month: { from: 'deals', dim: "to_char(date_trunc('month', coalesce(expected_close_date, created_at)), 'YYYY-MM')" },
-      }
-      const spec = SPECS[dimension] || SPECS.stage
-      const met = metric === 'value' || metric === 'revenue' ? 'sum(value)' : metric === 'avg_value' || metric === 'avg_price' ? 'avg(value)' : 'count(*)'
-      let where = '', params = []
-      if (filter) { where = `WHERE ${spec.dim} ILIKE $1`; params = [`%${filter}%`] }
-      const r = await tenantQuery(tenantId,
-        `SELECT ${spec.dim} AS label, ${met}::float AS value FROM ${spec.from} ${where} GROUP BY 1 ORDER BY ${dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 20`, params)
-      return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) } }
+      const rows = await gw(tenantId, 'crm_chart', { dimension, metric, filter })
+      return { chart: { type: dimension === 'month' ? 'line' : 'bar', title: title || `${metric} by ${dimension}`, labels: rows.map(x => x.label), values: rows.map(x => x.value) } }
     },
 
     // get_forecast: reads the tenant's stored forecast (predictions table).
     get_forecast: async (tenantId, { series = 'record_mt' }) => {
-      const r = await tenantQuery(tenantId,
-        'SELECT series, model, horizon, history, forecast, generated_at FROM predictions WHERE series = $1', [series])
-      if (!r.rows.length) return { error: 'no stored forecast for this series - generate one from the Dashboard forecast panel first' }
-      return r.rows[0]
+      const rows = await gw(tenantId, 'get_forecast', { series })
+      if (!rows.length) return { error: 'no stored forecast for this series - generate one from the Dashboard forecast panel first' }
+      return rows[0]
     },
 
     // run_sql: LLM- or user-written SELECT, executed behind the guardrails.
@@ -397,6 +321,25 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
       const check = validateSql(sql || extractSql(q))
       if (check.error) return { error: check.error }
       return runReadonly(tenantId, check.sql)
+    },
+
+    // ---- Phase 6.5 trust tools: the agent may observe and propose, never write ----
+    record_observation: async (tenantId, { source = 'assistant', entityType, entityId = null, observationType, observed }) => {
+      if (!entityType || !observationType) return { error: 'entityType and observationType are required' }
+      const rows = await gw(tenantId, 'observation_insert', { source, entity_type: entityType, entity_id: entityId, observation_type: observationType, observed })
+      return { recorded: true, observation_id: rows[0]?.id || null }
+    },
+    propose_change: async (tenantId, { entityType, entityId, field, currentValue = null, proposedValue, evidence = '' }) => {
+      if (!entityType || !entityId || !field || proposedValue === undefined || proposedValue === null) {
+        return { error: 'entityType, entityId, field and proposedValue are required' }
+      }
+      const rows = await gw(tenantId, 'suggestion_insert', { entity_type: entityType, entity_id: entityId, field, current_value: currentValue, proposed_value: proposedValue, evidence })
+      return { proposed: true, suggestion_id: rows[0]?.id || null, note: 'queued for human review — the record itself was not changed' }
+    },
+    schedule_task: async (tenantId, { taskType, dueAt, payload = {} }) => {
+      if (!taskType) return { error: 'taskType is required' }
+      const rows = await gw(tenantId, 'task_insert', { task_type: taskType, due_at: dueAt, payload })
+      return { scheduled: true, task_id: rows[0]?.id || null, due_at: rows[0]?.due_at, status: rows[0]?.status }
     },
   }
 
@@ -437,6 +380,18 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
         d: 'Run a read-only SQL query (a single SELECT or WITH...SELECT statement only) against the tenant database, for questions the other tools cannot answer.',
         s: { type: 'object', properties: { sql: { type: 'string', description: 'the SELECT statement to run' } }, required: ['sql'] },
       },
+      record_observation: {
+        d: 'Record something you directly observed (never an inference): a document field you read, a signature block, an explicit statement by the user. Observations are evidence, not facts — humans decide.',
+        s: { type: 'object', properties: { source: { type: 'string', description: "where you observed it, e.g. 'assistant', 'doc-checker'" }, entityType: { type: 'string', description: 'company | contact | lead | deal' }, entityId: { type: 'string', description: 'the record id, when known' }, observationType: { type: 'string', description: 'short slug, e.g. signature-block, user-statement' }, observed: { type: 'object', description: 'the raw observation payload — what was actually seen' } }, required: ['entityType', 'observationType', 'observed'] },
+      },
+      propose_change: {
+        d: 'Propose a field change on a CRM record for human review. NEVER claims to change anything — it queues a suggestion that a person accepts or rejects. Use for any update/write the user requests.',
+        s: { type: 'object', properties: { entityType: { type: 'string', description: 'company | contact | lead | deal' }, entityId: { type: 'string' }, field: { type: 'string', description: 'the record field to change' }, currentValue: { type: 'string', description: 'the current value, if known' }, proposedValue: { type: 'string', description: 'the proposed new value' }, evidence: { type: 'string', description: 'what was observed that supports this change' } }, required: ['entityType', 'entityId', 'field', 'proposedValue'] },
+      },
+      schedule_task: {
+        d: 'Schedule a background task: insights_refresh (recompute insights snapshot) or forecast_refresh (retrain the volume forecast). Use when the user asks for follow-up or recurring work.',
+        s: { type: 'object', properties: { taskType: { type: 'string', description: 'insights_refresh | forecast_refresh' }, dueAt: { type: 'string', description: 'ISO timestamp; defaults to now' }, payload: { type: 'object', description: 'task-specific params, e.g. {series: "record_mt"}' } }, required: ['taskType'] },
+      },
     }
     const out = {}
     for (const [name, { d, s }] of Object.entries(defs)) {
@@ -449,39 +404,9 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
   fastify.post('/index', async (req) => {
     const tenantId = req.headers['x-tenant-id']
     if (!tenantId) return { error: 'x-tenant-id required' }
-    const sources = []
-    const recs = await tenantQuery(tenantId,
-      `SELECT order_id AS id, 'record' AS type,
-              'Order '||order_id||': '||customer||' buying '||mt||' MT of '||grade||' from '||supplier||' at $'||price_usd||'/MT, status '||status AS text
-       FROM records`)
-    sources.push(...recs.rows)
-    const tix = await tenantQuery(tenantId,
-      `SELECT ticket_id AS id, 'ticket' AS type,
-              'Ticket '||ticket_id||' ('||category||', '||status||'): '||description AS text
-       FROM tickets`)
-    sources.push(...tix.rows)
-    const parties = await tenantQuery(tenantId,
-      `SELECT name AS id, 'party' AS type,
-              type||' '||name||' contact '||coalesce(contact->>'name', contact::text, 'n/a') AS text
-       FROM parties`)
-    sources.push(...parties.rows)
+    const sources = await gw(tenantId, 'index_sources')
 
-    // Generic CRM entities — indexed for every tenant (the product's core data).
-    const crmSources = await Promise.all([
-      tenantQuery(tenantId, `SELECT name AS id, 'company' AS type,
-              'Company '||name||' ('||type||coalesce(', '||industry,'')||')' AS text FROM companies`),
-      tenantQuery(tenantId, `SELECT full_name AS id, 'contact' AS type,
-              'Contact '||full_name||coalesce(', '||title,'') AS text FROM contacts`),
-      tenantQuery(tenantId, `SELECT name AS id, 'lead' AS type,
-              'Lead '||name||' for '||coalesce(company_name,'n/a')||' worth $'||coalesce(value,0) AS text FROM leads`),
-      tenantQuery(tenantId, `SELECT name AS id, 'deal' AS type,
-              'Deal '||name||' at stage '||stage||' worth $'||coalesce(value,0) AS text FROM deals`),
-      tenantQuery(tenantId, `SELECT subject AS id, 'activity' AS type,
-              initcap(type)||': '||subject||coalesce(' — '||left(detail,120),'') AS text FROM activities`),
-    ])
-    for (const q of crmSources) sources.push(...q.rows)
-
-    await tenantQuery(tenantId, 'DELETE FROM embeddings')
+    await gw(tenantId, 'index_clear')
     let indexed = 0
     // Real embeddings (bge-base 768-d) when configured — one batched call;
     // deterministic hash embedder otherwise.
@@ -490,10 +415,7 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     catch (e) { fastify.log.warn({ err: e.message }, 'real embeddings unavailable — hash fallback') }
     for (const [i, s] of sources.entries()) {
       const vec = vectors ? vectors[i] : embed(s.text)
-      await tenantQuery(tenantId,
-        `INSERT INTO embeddings (tenant_id, source_type, source_id, metadata, vector)
-         VALUES (app.current_tenant(), $1, $2, $3::jsonb, $4::vector)`,
-        [s.type, String(s.id), JSON.stringify({ text: s.text }), `[${vec.join(',')}]`])
+      await gw(tenantId, 'index_insert', { type: s.type, id: String(s.id), text: s.text, vector: vec })
       indexed++
     }
     return { tenant: tenantId, indexed }
@@ -544,10 +466,8 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     let semantic = []
     if (provider.name === 'local') {
       const vec = await embedQuery(message)
-      const hits = await tenantQuery(tenantId,
-        `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
-         FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
-      semantic = hits.rows.filter((r) => r.score > 0)
+      const hits = await gw(tenantId, 'semantic_search', { vector: `[${vec.join(',')}]` })
+      semantic = hits.filter((r) => r.score > 0)
     }
 
     // 4) Synthesize. Real provider calls OpenRouter with the gathered context;
@@ -588,7 +508,7 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
       try {
         const result = await generateText({
           model: makeSdkModel(provider),
-          system: `You are a B2B CRM + operations assistant for tenant "${tenantId}". Answer grounded in the tenant's data using the provided tools. Be concise and specific. Prefer the dedicated search/KPI tools; only use run_sql for questions they cannot answer (a single read-only SELECT). Once you have relevant results, answer immediately — do not repeat similar tool calls. If the tools don't contain the answer, say so.`,
+          system: systemPrompt(tenantId),
           messages: [...mem.history.slice(-8).map((t) => ({ role: t.role, content: t.text })), { role: 'user', content: message }],
           tools: sdkTools(tenantId),
           stopWhen: stepCountIs(8),
@@ -683,10 +603,8 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     let semantic = []
     if (provider.name === 'local') {
       const vec = await embedQuery(message)
-      const hits = await tenantQuery(tenantId,
-        `SELECT source_type, source_id, metadata->>'text' AS text, 1 - (vector <=> $1::vector) AS score
-         FROM embeddings ORDER BY vector <=> $1::vector LIMIT 4`, [`[${vec.join(',')}]`])
-      semantic = hits.rows.filter((r) => r.score > 0)
+      const hits = await gw(tenantId, 'semantic_search', { vector: `[${vec.join(',')}]` })
+      semantic = hits.filter((r) => r.score > 0)
     }
 
     // Synthesize and stream token-by-token (word chunks for the local provider).
@@ -715,7 +633,7 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
       try {
         const stream = streamText({
           model: makeSdkModel(provider),
-          system: `You are a B2B CRM + operations assistant for tenant "${tenantId}". Answer grounded in the tenant's data using the provided tools. Be concise and specific. Prefer the dedicated search/KPI tools; only use run_sql for questions they cannot answer (a single read-only SELECT). Once you have relevant results, answer immediately — do not repeat similar tool calls. If the tools don't contain the answer, say so.`,
+          system: systemPrompt(tenantId),
           messages: [...mem.history.slice(-8).map((t) => ({ role: t.role, content: t.text })), { role: 'user', content: message }],
           tools: sdkTools(tenantId),
           stopWhen: stepCountIs(8),
@@ -766,56 +684,37 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
   // lines are appended only when the tenant actually holds vertical rows.
   async function computeInsights(tenantId, vertical) {
     const [totals, topPipeline, byStage, bySource, tasks, months] = await Promise.all([
-      tenantQuery(tenantId, `SELECT
-        (SELECT count(*) FROM companies)::int AS companies, (SELECT count(*) FROM contacts)::int AS contacts,
-        (SELECT count(*) FROM leads)::int AS leads, (SELECT count(*) FROM deals)::int AS deals,
-        (SELECT coalesce(sum(value),0) FROM deals)::float AS pipeline`),
-      tenantQuery(tenantId, `SELECT c.name AS name, coalesce(sum(d.value),0)::float AS v
-        FROM deals d JOIN companies c ON c.id = d.company_id WHERE d.status='open'
-        GROUP BY 1 ORDER BY v DESC LIMIT 1`),
-      tenantQuery(tenantId, `SELECT stage, count(*)::int AS n, coalesce(sum(value),0)::float AS v
-        FROM deals WHERE status='open' GROUP BY stage ORDER BY v DESC LIMIT 5`),
-      tenantQuery(tenantId, `SELECT source, count(*)::int AS n FROM leads
-        GROUP BY source ORDER BY n DESC LIMIT 3`),
-      tenantQuery(tenantId, `SELECT count(*) FILTER (WHERE NOT completed)::int AS open_tasks,
-        count(*) FILTER (WHERE NOT completed AND due_at < now())::int AS overdue
-        FROM activities WHERE type='task'`),
-      tenantQuery(tenantId, `SELECT to_char(date_trunc('month', coalesce(expected_close_date, created_at)),'YYYY-MM') AS m,
-        coalesce(sum(value),0)::float AS v FROM deals GROUP BY 1 ORDER BY 1`),
+      gw(tenantId, 'ins_totals'), gw(tenantId, 'ins_top_pipeline'), gw(tenantId, 'ins_by_stage'),
+      gw(tenantId, 'ins_leads_source'), gw(tenantId, 'ins_tasks'), gw(tenantId, 'ins_deal_months'),
     ])
     const usd = (x) => `$${Math.round(x).toLocaleString('en-US')}`
     const crm = [
-      `CRM: ${totals.rows[0].companies} companies, ${totals.rows[0].contacts} contacts, ${totals.rows[0].leads} leads, ${totals.rows[0].deals} deals (${usd(totals.rows[0].pipeline)} total pipeline).`,
-      `Top open pipeline: ${topPipeline.rows[0]?.name || 'n/a'} (${usd(topPipeline.rows[0]?.v || 0)}).`,
-      `Open pipeline by stage: ${byStage.rows.map((r) => `${r.stage}=${usd(r.v)} (${r.n})`).join(', ') || 'none'}.`,
-      `Leads by source: ${bySource.rows.map((r) => `${r.source}=${r.n}`).join(', ') || 'none'}.`,
-      `Tasks: ${tasks.rows[0].open_tasks} open, ${tasks.rows[0].overdue} overdue.`,
-      `Expected deal value by month: ${months.rows.map((r) => `${r.m}=${usd(r.v)}`).join(' → ') || 'n/a'}.`,
+      `CRM: ${totals[0].companies} companies, ${totals[0].contacts} contacts, ${totals[0].leads} leads, ${totals[0].deals} deals (${usd(totals[0].pipeline)} total pipeline).`,
+      `Top open pipeline: ${topPipeline[0]?.name || 'n/a'} (${usd(topPipeline[0]?.v || 0)}).`,
+      `Open pipeline by stage: ${byStage.map((r) => `${r.stage}=${usd(r.v)} (${r.n})`).join(', ') || 'none'}.`,
+      `Leads by source: ${bySource.map((r) => `${r.source}=${r.n}`).join(', ') || 'none'}.`,
+      `Tasks: ${tasks[0].open_tasks} open, ${tasks[0].overdue} overdue.`,
+      `Expected deal value by month: ${months.map((r) => `${r.m}=${usd(r.v)}`).join(' → ') || 'n/a'}.`,
     ]
     if (!vertical) return crm
 
     const [topCust, topGrade, issueMix, trend, vTotals] = await Promise.all([
-      tenantQuery(tenantId, `SELECT customer, sum(mt)::float AS mt FROM records GROUP BY customer ORDER BY mt DESC LIMIT 3`),
-      tenantQuery(tenantId, `SELECT grade, sum(mt)::float AS mt FROM records GROUP BY grade ORDER BY mt DESC LIMIT 3`),
-      tenantQuery(tenantId, `SELECT category, count(*)::int AS n FROM tickets GROUP BY category ORDER BY n DESC`),
-      tenantQuery(tenantId, `SELECT to_char(date_trunc('month', date),'YYYY-MM') AS m, sum(mt)::float AS mt FROM records GROUP BY 1 ORDER BY 1`),
-      tenantQuery(tenantId, `SELECT count(*)::int AS orders, coalesce(sum(mt),0)::float AS mt, coalesce(sum(mt*price_usd),0)::float AS revenue FROM records`),
+      gw(tenantId, 'ins_top_customers'), gw(tenantId, 'ins_top_grades'), gw(tenantId, 'ins_issue_mix'),
+      gw(tenantId, 'ins_v_trend'), gw(tenantId, 'ins_v_totals'),
     ])
     return [...crm,
-      `Top customer by volume: ${topCust.rows[0]?.customer || 'n/a'} (${topCust.rows[0]?.mt || 0} MT).`,
-      `Top grade: ${topGrade.rows[0]?.grade || 'n/a'} (${topGrade.rows[0]?.mt || 0} MT).`,
-      `Open issues by category: ${issueMix.rows.map((r) => `${r.category}=${r.n}`).join(', ') || 'none'}.`,
-      `Monthly volume trend: ${trend.rows.map((r) => `${r.m}=${r.mt}MT`).join(' → ') || 'n/a'}.`,
-      `Totals: ${vTotals.rows[0].orders} orders, ${vTotals.rows[0].mt} MT, $${(vTotals.rows[0].revenue / 1e6).toFixed(2)}M revenue.`,
+      `Top customer by volume: ${topCust[0]?.customer || 'n/a'} (${topCust[0]?.mt || 0} MT).`,
+      `Top grade: ${topGrade[0]?.grade || 'n/a'} (${topGrade[0]?.mt || 0} MT).`,
+      `Open issues by category: ${issueMix.map((r) => `${r.category}=${r.n}`).join(', ') || 'none'}.`,
+      `Monthly volume trend: ${trend.map((r) => `${r.m}=${r.mt}MT`).join(' → ') || 'n/a'}.`,
+      `Totals: ${vTotals[0].orders} orders, ${vTotals[0].mt} MT, $${(vTotals[0].revenue / 1e6).toFixed(2)}M revenue.`,
     ]
   }
 
   async function storeSnapshot(tenantId, provider) {
     const vertical = await hasVerticalData(tenantId)
     const insights = await computeInsights(tenantId, vertical)
-    await tenantQuery(tenantId,
-      `INSERT INTO insights_snapshots (tenant_id, insights, provider) VALUES (app.current_tenant(), $1::jsonb, $2)`,
-      [JSON.stringify(insights), provider])
+    await gw(tenantId, 'snapshot_insert', { insights, provider })
     return insights
   }
 
@@ -834,22 +733,18 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
   fastify.get('/insights/latest', async (req) => {
     const tenantId = req.headers['x-tenant-id']
     if (!tenantId) return { error: 'x-tenant-id required' }
-    const r = await tenantQuery(tenantId,
-      `SELECT insights, provider, created_at FROM insights_snapshots ORDER BY created_at DESC LIMIT 1`)
-    if (!r.rows.length) return { tenant: tenantId, insights: [], note: 'no snapshot yet — call POST /insights' }
-    return { tenant: tenantId, insights: r.rows[0].insights, generated_at: r.rows[0].created_at, provider: r.rows[0].provider }
+    const rows = await gw(tenantId, 'insights_latest')
+    if (!rows.length) return { tenant: tenantId, insights: [], note: 'no snapshot yet — call POST /insights' }
+    return { tenant: tenantId, insights: rows[0].insights, generated_at: rows[0].created_at, provider: rows[0].provider }
   })
 
   // ---- Nightly insights snapshots (cron) ----
   // Compute a snapshot for every active tenant so the Insights screen auto-loads.
   async function snapshotAllTenants() {
     try {
-      const client = await pool.connect()
-      let tenants = []
-      try {
-        const r = await client.query('SELECT id FROM app.tenants WHERE status=$1', ['active'])
-        tenants = r.rows.map((t) => t.id)
-      } finally { client.release() }
+      // app.tenants has no tenant-RLS (it IS the registry); the gateway needs
+      // some tenant for the session GUC — the value is irrelevant here.
+      const tenants = (await gw('system', 'tenants_all', { status: 'active' })).map((t) => t.id)
       for (const t of tenants) {
         try { await storeSnapshot(t, 'cron') } catch (e) { fastify.log.warn({ msg: `snapshot failed for ${t}`, err: e.message }) }
       }
@@ -857,5 +752,54 @@ export async function buildApp({ pool, readonlyPool, logger = true }) {
     } catch (e) { fastify.log.error('snapshotAllTenants failed', e) }
   }
 
-  return { app: fastify, snapshotAllTenants }
+
+  // ---- Phase 6.5: durable agent task dispatcher ----
+  // Claims due/expired-lease rows via FOR UPDATE SKIP LOCKED (the op runs in
+  // the BFF); budget-gated against the tenant's 24h AI usage; runs on its own
+  // schedule, independent of any request.
+  const DAILY_BUDGET = parseInt(process.env.AGENT_DAILY_TOKEN_BUDGET || '200000', 10)
+  const TASK_HANDLERS = {
+    insights_refresh: async (tenantId) => {
+      const insights = await storeSnapshot(tenantId, 'agent-task')
+      return { insights: insights.length }
+    },
+    forecast_refresh: async (tenantId, payload) => {
+      const res = await fetch(`${process.env.PREDICTIONS_SERVICE_URL || 'http://localhost:5100'}/forecast`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-tenant-id': tenantId },
+        body: JSON.stringify({ series: payload?.series || 'record_mt' }),
+      })
+      if (!res.ok) throw new Error(`predictions service ${res.status}`)
+      return await res.json()
+    },
+  }
+  async function runOneTask(tenantId) {
+    const claimed = await gw(tenantId, 'task_claim', { lease_seconds: 300 })
+    const task = claimed[0]
+    if (!task) return false
+    try {
+      const spent = (await gw(tenantId, 'usage_budget'))[0]?.tokens || 0
+      if (spent > DAILY_BUDGET) throw new Error(`daily token budget exceeded (${spent}/${DAILY_BUDGET})`)
+      const handler = TASK_HANDLERS[task.task_type]
+      if (!handler) throw new Error(`unknown task_type ${task.task_type}`)
+      const result = await handler(tenantId, task.payload || {})
+      await gw(tenantId, 'task_finish', { id: task.id, status: 'done', result })
+    } catch (e) {
+      await gw(tenantId, 'task_finish', { id: task.id, status: 'failed', error: e.message }).catch(() => {})
+    }
+    return true
+  }
+  async function dispatchTick() {
+    try {
+      const tenants = (await gw('system', 'tenants_all', { status: 'active' })).map((t) => t.id)
+      for (const id of tenants) {
+        for (let i = 0; i < 5; i++) { if (!await runOneTask(id)) break }
+      }
+    } catch (e) { fastify.log.warn({ err: e.message }, 'task dispatch tick failed') }
+  }
+  const dispatchTimer = setInterval(dispatchTick, 30000)
+  if (dispatchTimer.unref) dispatchTimer.unref()
+  fastify.addHook('onClose', () => clearInterval(dispatchTimer))
+
+  return { app: fastify, snapshotAllTenants, dispatchTick }
 }

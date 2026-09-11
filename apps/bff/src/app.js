@@ -6,6 +6,7 @@ import pg from 'pg'
 import * as XLSX from 'xlsx'
 import { createAuthVerifier } from './auth.js'
 import { registerCrmRoutes } from './crm.js'
+import { registerInternalRoutes } from './internal.js'
 
 export { createAuthVerifier }
 
@@ -17,7 +18,7 @@ export { createAuthVerifier }
 // `aiServiceUrl` is where the AI service lives; `auth` is a Supabase
 // JWT verifier — when absent the BFF runs in explicit dev mode (x-tenant-id
 // header), which production boots never do (see src/index.js).
-export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, predictionsServiceUrl, auth, logger = true } = {}) {
+export async function buildApp({ pool, customerPool, adminPool, readonlyPool, aiServiceUrl, predictionsServiceUrl, auth, logger = true } = {}) {
   const fastify = Fastify({ logger })
   const AI_SERVICE_URL = aiServiceUrl || 'http://localhost:5000'
   const PREDICTIONS_SERVICE_URL = predictionsServiceUrl || 'http://localhost:5100'
@@ -44,8 +45,12 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, pr
   // x-tenant-id header is ignored entirely. Dev mode (no verifier injected)
   // keeps the legacy header behavior for local compose/preview runs.
   const PUBLIC_PATHS = new Set(['/health'])
+  // Internal gateway routes carry their own shared-secret token check; the
+  // JWT preHandler must not touch them (the AI service has no user token).
+  const INTERNAL_PREFIX = '/internal/'
   fastify.addHook('preHandler', async (req, reply) => {
     if (PUBLIC_PATHS.has(req.url.split('?')[0])) return
+    if (req.url.startsWith(INTERNAL_PREFIX)) return
     if (!auth) {
       req.tenantId = req.headers['x-tenant-id'] || 'rubbertrack'
       return
@@ -115,6 +120,28 @@ export async function buildApp({ pool, customerPool, adminPool, aiServiceUrl, pr
   }
 
   registerCrmRoutes(fastify, { tenantQuery, writeAudit })
+
+  // ---- Internal gateway (Phase 6.5): named ops + guarded SQL for the AI service,
+  // ---- which holds no DB credentials. Model-written SQL runs on the app_readonly
+  // ---- pool behind validateSql; everything else is registry-only.
+  const runReadonly = async (tenantId, sql) => {
+    if (!readonlyPool) return { error: 'text-to-SQL is not configured (no readonly pool)' }
+    const client = await readonlyPool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query("SELECT set_config('app.tenant_id', $1, true)", [tenantId])
+      await client.query("SET LOCAL statement_timeout = '5s'")
+      const r = await client.query(sql)
+      await client.query('COMMIT')
+      return { rows: r.rows.slice(0, 50), rowCount: r.rowCount }
+    } catch (e) {
+      try { await client.query('ROLLBACK') } catch { /* already aborted */ }
+      return { error: `query failed: ${e.message.slice(0, 160)}` }
+    } finally {
+      client.release()
+    }
+  }
+  registerInternalRoutes(fastify, { staffQuery, runReadonly })
 
   // ---- Data endpoints (RLS-enforced) ----
   // Module presence: the web nav shows the vertical (template) screens only

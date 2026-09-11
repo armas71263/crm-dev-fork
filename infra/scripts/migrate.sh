@@ -24,6 +24,7 @@ MIGRATIONS=(
   "007_chat_memory|infra/migrations/007_chat_memory.sql"
   "008_predictions|infra/migrations/008_predictions.sql"
   "009_bi_isolation|infra/migrations/009_bi_isolation.sql"
+  "010_agent_trust|infra/migrations/010_agent_trust.sql"
 )
 
 psql "$DSN" -v ON_ERROR_STOP=1 <<SQL
