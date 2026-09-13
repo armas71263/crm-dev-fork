@@ -562,7 +562,17 @@ export async function buildApp({ gateway, logger = true }) {
 
     reply.send({
       reply: replyText,
-      chart,
+    // Phase 6.7: the chart travels with its intent so the web app can pin
+    // the QUERY (live widget) instead of the rendered data.
+    chart: chart ? {
+      ...chart,
+      intent: {
+        scope: (CRM_CHART_DIMS.has(chartIntent.dimension) || !vertical) ? 'crm' : 'vertical',
+        dimension: chartIntent.dimension,
+        metric: chartIntent.metric,
+        filter: chartIntent.filter ?? null,
+      },
+    } : null,
       tools: toolNames,
       sources: semantic.map((r) => ({ type: r.source_type, id: r.source_id, score: +r.score.toFixed(3) })),
       usage: { provider: provider.name, model: provider.model, latency_ms: latency, request_id: requestId, tokens_in: tokensIn, tokens_out: tokensOut },
@@ -613,7 +623,7 @@ export async function buildApp({ gateway, logger = true }) {
         send('tool', { name: chartTool })
         const res = await TOOLS[chartTool](tenantId, chartIntent)
         chart = res.chart
-        send('chart', chart)
+        send('chart', { ...chart, intent: { scope: chartTool === 'suggest_crm_chart' ? 'crm' : 'vertical', dimension: chartIntent.dimension, metric: chartIntent.metric, filter: chartIntent.filter ?? null } })
       } catch (e) {
         fastify.log.warn({ err: e.message }, 'chart tool failed — continuing without a chart')
         chart = null
