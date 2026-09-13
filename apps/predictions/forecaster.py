@@ -13,7 +13,7 @@ def _chronos_available():
     if os.environ.get("PREDICTIONS_USE_CHRONOS") != "1":
         return False
     try:
-        import autogluon.timeseries  # noqa: F401
+        from chronos import ChronosBoltPipeline  # noqa: F401  (direct package, not AutoGluon)
         return True
     except Exception:
         return False
@@ -32,22 +32,14 @@ def forecast_arima(history):
 
 
 def forecast_chronos(history):
-    """Chronos-Bolt via AutoGluon TimeSeriesPredictor (zero-shot). Wrapped so
-    any failure falls back to the damped-ETS model."""
-    import pandas as pd
-    from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
+    """Chronos-Bolt zero-shot via the direct chronos-forecasting package.
+    Wrapped so any failure falls back to the verified damped-ETS model."""
+    import torch
+    from chronos import ChronosBoltPipeline
 
-    df = TimeSeriesDataFrame.from_data_frame(pd.DataFrame({
-        "item_id": ["series"] * len(history),
-        "timestamp": pd.date_range("2000-01-01", periods=len(history), freq="MS"),
-        "target": history,
-    }))
-    pred = TimeSeriesPredictor(prediction_length=HORIZON, verbosity=0)
-    pred.fit(df, hyperparameters={"Chronos": {"model_path": "bolt_base"}},
-             skip_model_selection=True)
-    out = pred.predict(df)
-    vals = out.loc["series"]["mean"].tolist()
-    return [round(float(v), 2) for v in vals]
+    pipe = ChronosBoltPipeline.from_pretrained("amazon/chronos-bolt-base", dtype=torch.float32)
+    fc = pipe.predict(torch.tensor(history, dtype=torch.float32), prediction_length=HORIZON)
+    return [round(float(v), 2) for v in fc.tolist()[0]]
 
 
 def run_forecast(history):

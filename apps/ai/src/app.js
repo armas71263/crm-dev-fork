@@ -757,10 +757,38 @@ export async function buildApp({ gateway, logger = true }) {
     ]
   }
 
+  // Phase 5 completion: AI commentary over the DETERMINISTIC computed lines.
+  // The lines are the source of truth — commentary may only cite them.
+  async function generateCommentary(providerObj, tenantId, insights) {
+    const model = makeSdkModel(providerObj)
+    if (!model) return null // local provider: deterministic lines only
+    // Reasoning models sometimes emit reasoning-only output (empty text) —
+    // steer hard and retry once; lines-only is the graceful fallback.
+    const system = `You are writing a short business commentary for tenant "${tenantId}". Write 2-3 sentences. ONLY use numbers that appear verbatim in the given insight lines — never compute or introduce new numbers. If a line is ambiguous, skip it. No bullet points. Answer immediately with the commentary — no preamble, no thinking aloud.`
+    const prompt = `Insight lines:
+${insights.slice(0, 6).map((l) => '- ' + l).join('\n')}
+
+Write the commentary now.`
+    try {
+      const run = () => generateText({ model, system, prompt, abortSignal: AbortSignal.timeout(110000) })
+      const _t0 = Date.now()
+      let r = await run()
+      fastify.log.warn({ msg: 'commentary attempt', ms: Date.now() - _t0, finish: r.finishReason, textLen: (r.text || '').length, parts: (r.content || []).map((x) => x.type), reasoningLen: (r.reasoning || '').length })
+      if (!r.text) r = await run() // empty first try (reasoning-only) — one retry
+      return r.text || null
+    } catch (e) {
+      fastify.log.warn({ err: e.message }, 'commentary generation failed — snapshot stores lines only')
+      return null
+    }
+  }
+
   async function storeSnapshot(tenantId, provider) {
     const vertical = await hasVerticalData(tenantId)
     const insights = await computeInsights(tenantId, vertical)
-    await gw(tenantId, 'snapshot_insert', { insights, provider })
+    const providerObj = pickProvider(tenantId)
+    // commentary for every path — generateCommentary no-ops for the local provider
+    const commentary = await generateCommentary(providerObj, tenantId, insights)
+    await gw(tenantId, 'snapshot_insert', { insights, provider, commentary })
     return insights
   }
 
@@ -781,7 +809,7 @@ export async function buildApp({ gateway, logger = true }) {
     if (!tenantId) return { error: 'x-tenant-id required' }
     const rows = await gw(tenantId, 'insights_latest')
     if (!rows.length) return { tenant: tenantId, insights: [], note: 'no snapshot yet — call POST /insights' }
-    return { tenant: tenantId, insights: rows[0].insights, generated_at: rows[0].created_at, provider: rows[0].provider }
+    return { tenant: tenantId, insights: rows[0].insights, generated_at: rows[0].created_at, provider: rows[0].provider, commentary: rows[0].commentary || null }
   })
 
   // ---- Nightly insights snapshots (cron) ----

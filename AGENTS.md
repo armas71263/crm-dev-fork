@@ -117,3 +117,12 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - **/health/deep** is the uptime-monitor contract (db+ai+predictions + latencies). Tests for it assert STRUCTURE, not specific up/down values — live sandbox services make value-coupled tests flaky.
 - **PostHog is opt-in by construction**: capture() without POSTHOG_API_KEY makes no network call. Server-side events only (suggestion_accepted/rejected).
 - **Patch-script lesson**: an off-by-one in a findIndex anchor (L[i+3] vs L[i+2]) silently no-op'd twice while looking like the revert hazard — always print the located line number from the patch script, and prefer heredoc-to-file + `node file.cjs` so failures show in stderr.
+
+## Phase 6.7 + Phase 5 close (2026-09-13)
+- **Certified metrics**: metric_definitions (RLS, per-tenant); the same stored SQL runs via /data/metrics/:key/run AND the internal metric_run op — the number is identical on every surface. Drafts never run (404).
+- **Dashboard widgets pin the QUERY, not the data**: chart intents travel in the chat/stream chart payloads ({scope, dimension, metric, filter}); the dashboard re-runs them live via /data/chart. A stale screenshot is impossible by construction.
+- **Next.js relative-import depth for /api route files: COMPUTE IT** (path.relative) — manual ../ counting misfired three times; dynamic-route folders each add a level.
+- **Reasoning-model one-shot generation is high-variance**: the same prompt returns text in 8-32s standalone but can time out at 60s or return EMPTY text (reasoning-only parts) in-app. Pattern: hard steering ("answer immediately"), a retry on empty text, generous budget, and a deterministic fallback (commentary optional; lines always stored).
+- **uv venvs have NO pip module** — install with `uv pip install --python .venv/bin/python ...`.
+- **Patch-script lessons re-confirmed**: converting an object property to a standalone const leaves a stray trailing comma ("Unexpected token try" two lines later); always node --check after structural patches; heredoc-to-file + node file.cjs with stderr visible.
+- **Chronos in a 0.25-CPU sandbox**: package + torch install fine; HF weight download + torch inference hangs silently — timebox the attempt, verify on real hardware, never claim it.

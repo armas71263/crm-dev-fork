@@ -20,6 +20,12 @@ export default async function InsightsPage() {
         <GenerateButton />
       </header>
 
+      {snap.commentary && (
+        <div className="border-l-2 border-leaf pl-4 text-[15px] leading-relaxed">
+          {snap.commentary}
+        </div>
+      )}
+
       {snap.insights?.length ? (
         <div className="border border-line bg-white divide-y divide-line">
           {snap.insights.map((line, i) => (

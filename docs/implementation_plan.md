@@ -104,6 +104,14 @@ Tests: BFF 70/70, AI 28/28 (gateway mocks).
 3. Fallback if spike fails: extend the assistant's text-to-SQL into a lightweight dashboard feature (no new dependency).
 - **Verify:** spike isolation report; embedded UI walkthrough.
 
+### Phase 6.7 — BI completion (2026-09-13, COMPLETE + live-verified)
+Closes the real capability gap identified vs. WrenAI — built on our own stack, zero new infrastructure:
+- **Certified metrics registry** (migration 011: metric_definitions, 10 seeded metrics/tenant): each metric defined once; the assistant (get_metric tool), dashboards and metric cards all execute the same stored SQL through the staff pool. Live: pipeline_value=430000 identical on every surface; the real model prefers get_metric per the metrics skill; drafts rejected 404.
+- **Self-serve dashboard builder**: dashboard_widgets store the QUERY (pin-the-intent, never rendered data) — chart intents ride in chat/stream payloads; BFF /data/chart + widgets CRUD (whitelisted specs); DashboardWidgets grid (live metric cards + chart widgets, add-metric picker, reorder, remove); Pin-to-dashboard in the Assistant. Live: model chart → pin → dashboard re-run reproduces the streamed data exactly.
+### Phase 5 completion (2026-09-13, COMPLETE + live-verified)
+- **Win-probability model**: statsmodels Logit on the deal_history corpus (migration 011, 150 synthetic rows with baked-in logistic signal). Interpretable coefficients; 71.3% accuracy; real-deal prediction grounded (biggest deal + 1 activity → 23.7%); BFF proxies + get_win_probability assistant tool.
+- **AI insights commentary**: deterministic computed lines stay the source of truth; the LLM writes 2-3 grounded sentences (only-cite-given-numbers rule, retry on reasoning-only output, graceful lines-only fallback). Live: commentary stored, served, rendered on the Insights screen.
+- **Chronos-Bolt**: honest status — chronos-forecasting + torch installed in the venv; forecaster rewritten from the never-installed AutoGluon path to the correct direct ChronosBoltPipeline API; damped-ETS remains the verified default; END-TO-END INFERENCE NOT VERIFIED IN THIS SANDBOX (weight download/inference hangs at 0.25 CPU — timeboxed, documented). Production can enable via PREDICTIONS_USE_CHRONOS=1 and verify on real hardware.
 ### Phase 7 — Observability (2–3 days)
 > Status (2026-09-11): DONE for everything runnable here — zero-dependency Prometheus /metrics on BFF + AI (aggregate only, no tenant data), /health/deep service matrix (the uptime-monitor endpoint), /ops staff screen, PostHog Cloud server events (env-gated no-op without key). SigNoz (needs ~8GB) and Uptime Kuma are production deployments — exact steps in docs/observability.md; our scrape format is SigNoz/Prometheus-native. Tests: BFF 72/72, AI 29/29.
 1. SigNoz compose profile; OTel SDK in BFF/AI/predictions (Node + Python instrumentation).
