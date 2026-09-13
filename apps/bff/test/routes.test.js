@@ -887,3 +887,48 @@ test('internal gateway runs certified metrics via the metric_run op', async () =
   delete process.env.BFF_INTERNAL_TOKEN
   await app.close()
 })
+
+// ---- Phase 6.7: dashboard widgets (pin the QUERY, never rendered data) ----
+test('dashboard widgets CRUD: pin, list own, reorder, delete', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT coalesce\(max\(position\),0\)\+1/, [{ next: 1 }]],
+    [/INSERT INTO dashboard_widgets/, [{ id: 7, position: 1, spec: { source: 'metric', metricKey: 'pipeline_value', title: 'Pipeline value' } }]],
+    [/SELECT id, position, spec FROM dashboard_widgets/, [{ id: 7, position: 1, spec: { source: 'metric', metricKey: 'pipeline_value' } }]],
+    [/UPDATE dashboard_widgets SET position/, [{ id: 7 }]],
+    [/DELETE FROM dashboard_widgets/, [{ id: 7 }]],
+  ])
+  const pin = await app.inject({
+    method: 'POST', url: '/data/dashboard-widgets', headers: { 'x-tenant-id': 'rubbertrack' },
+    payload: { spec: { source: 'metric', metricKey: 'pipeline_value', title: 'Pipeline value' } },
+  })
+  assert.equal(pin.statusCode, 200)
+  assert.equal(JSON.parse(pin.body).id, 7)
+
+  const list = await app.inject({ method: 'GET', url: '/data/dashboard-widgets', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(JSON.parse(list.body).widgets.length, 1)
+
+  const bad = await app.inject({
+    method: 'POST', url: '/data/dashboard-widgets', headers: { 'x-tenant-id': 'rubbertrack' },
+    payload: { spec: { source: 'chart', dimension: 'stage', metric: 'revenue', chartType: 'pie' } },
+  })
+  assert.equal(bad.statusCode, 400, 'non-whitelisted chart types must be rejected')
+  await app.close()
+})
+
+test('chart aggregation endpoint runs the dimension builders through the staff pool', async () => {
+  const { app } = await makeApp([
+    [/SELECT stage AS label/, [{ label: 'proposal', value: 120000 }]],
+  ])
+  const res = await app.inject({
+    method: 'POST', url: '/data/chart', headers: { 'x-tenant-id': 'rubbertrack' },
+    payload: { scope: 'crm', dimension: 'stage', metric: 'revenue' },
+  })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { labels: ['proposal'], values: [120000] })
+  const bad = await app.inject({
+    method: 'POST', url: '/data/chart', headers: { 'x-tenant-id': 'rubbertrack' },
+    payload: { scope: 'nope', dimension: 'stage' },
+  })
+  assert.equal(bad.statusCode, 400)
+  await app.close()
+})

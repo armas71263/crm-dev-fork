@@ -3,6 +3,7 @@ import StatusDot from '../../../components/StatusDot.jsx'
 import BarChart from '../../../components/BarChart.jsx'
 import GenerateForecastButton from '../../../components/GenerateForecastButton.jsx'
 import AskDataCard from '../../../components/AskDataCard.jsx'
+import DashboardWidgets from '../../../components/DashboardWidgets.jsx'
 
 const usd = (n) => '$' + Math.round(Number(n) || 0).toLocaleString('en-US')
 const date = (d) => (d ? String(d).slice(0, 10) : '—')
@@ -31,6 +32,8 @@ export default async function DashboardPage() {
         <h1 className="text-[24px] font-semibold tracking-tight">Dashboard</h1>
         <p className="text-[14px] text-steel mt-1">Live view of your workspace.</p>
       </header>
+
+      <DashboardWidgets />
 
       <div className="kpi-strip grid grid-cols-2 md:grid-cols-6">
         {kpis.map(([label, value]) => (

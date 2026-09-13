@@ -241,3 +241,6 @@ export function registerInternalRoutes(fastify, { staffQuery, runReadonly }) {
     return runReadonly(tenantId, check.sql)
   })
 }
+
+// Phase 6.7: the staff /data/chart endpoint reuses these aggregation builders.
+export { vChartSql, cChartSql }

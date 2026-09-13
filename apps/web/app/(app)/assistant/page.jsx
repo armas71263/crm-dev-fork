@@ -10,6 +10,29 @@ import BarChart from '../../../components/BarChart.jsx'
 const HINTS = ['Pipeline overview', 'Open tasks', 'Deals by company', 'Chart of pipeline by stage']
 
 export default function AssistantPage() {
+  const [pinnedCharts, setPinnedCharts] = useState([])
+
+  // Phase 6.7: pin the chart QUERY (intent) — the dashboard re-runs it live.
+  async function pinChart(m) {
+    const intent = m.chart?.intent
+    if (!intent || busy) return
+    const key = intent.dimension + '|' + intent.metric
+    if (pinnedCharts.includes(key)) return
+    const res = await fetch('/api/dashboard-widgets', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ spec: {
+        source: 'chart',
+        scope: intent.scope,
+        dimension: intent.dimension,
+        metric: intent.metric,
+        filter: intent.filter || null,
+        chartType: m.chart.type || 'bar',
+        title: m.chart.title,
+      } }),
+    })
+    if (res.ok) setPinnedCharts((p) => [...p, key])
+  }
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -111,6 +134,15 @@ export default function AssistantPage() {
                 <div className="mt-3 border-t border-line pt-3">
                   <div className="text-[13px] font-medium mb-2">{m.chart.title}</div>
                   <BarChart labels={m.chart.labels} values={m.chart.values} />
+                  <div className="mt-2">
+                    <button
+                      onClick={() => pinChart(m)}
+                      disabled={!m.chart.intent || pinnedCharts.includes(m.chart.intent.dimension + '|' + m.chart.intent.metric)}
+                      className="text-[12px] text-leaf font-medium hover:text-leaf-deep disabled:opacity-50"
+                    >
+                      {!m.chart.intent ? 'Pin unavailable' : pinnedCharts.includes(m.chart.intent.dimension + '|' + m.chart.intent.metric) ? 'Pinned ✓ (on your dashboard)' : 'Pin to dashboard'}
+                    </button>
+                  </div>
                 </div>
               )}
               {m.usage && (

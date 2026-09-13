@@ -6,7 +6,7 @@ import pg from 'pg'
 import * as XLSX from 'xlsx'
 import { createAuthVerifier } from './auth.js'
 import { registerCrmRoutes } from './crm.js'
-import { registerInternalRoutes } from './internal.js'
+import { registerInternalRoutes, vChartSql, cChartSql } from './internal.js'
 import { incCounter, observeDuration, renderMetrics } from './metrics.js'
 import { capture } from './posthog.js'
 
@@ -655,6 +655,62 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
     if (!r.rows.length) return reply.code(404).send({ error: 'unknown or non-certified metric' })
     const out = await tenantQuery(req, r.rows[0].sql)
     return { key, value: out.rows[0]?.value ?? null }
+  })
+
+  // ---- Phase 6.7: self-serve dashboard (pin the QUERY, never rendered data) ----
+  const CHART_SCOPES = { crm: cChartSql, vertical: vChartSql }
+  fastify.post('/data/chart', async (req, reply) => {
+    const { scope = 'crm', dimension, metric = 'count', filter } = req.body || {}
+    const build = CHART_SCOPES[scope]
+    if (!build || !dimension) return reply.code(400).send({ error: 'scope (crm|vertical) and dimension required' })
+    const { text, params } = build({ dimension, metric, filter })
+    const r = await tenantQuery(req, text, params)
+    return { labels: r.rows.map((x) => x.label), values: r.rows.map((x) => x.value) }
+  })
+
+  fastify.get('/data/dashboard-widgets', async (req) => {
+    const r = await tenantQuery(req,
+      `SELECT id, position, spec FROM dashboard_widgets WHERE user_id IS NOT DISTINCT FROM $1 ORDER BY position, id`,
+      [req.auth?.userId ?? null])
+    return { widgets: r.rows }
+  })
+
+  fastify.post('/data/dashboard-widgets', async (req, reply) => {
+    const { spec } = req.body || {}
+    if (!spec || typeof spec !== 'object') return reply.code(400).send({ error: 'spec required' })
+    const CHART_TYPES = new Set(['bar', 'line'])
+    if (spec.source === 'metric') {
+      if (!spec.metricKey || typeof spec.metricKey !== 'string') return reply.code(400).send({ error: 'metricKey required' })
+    } else if (spec.source === 'chart') {
+      if (!spec.dimension || !spec.metric || !CHART_TYPES.has(spec.chartType)) {
+        return reply.code(400).send({ error: 'dimension, metric and chartType (bar|line) required' })
+      }
+    } else return reply.code(400).send({ error: 'spec.source must be metric or chart' })
+    const pos = await tenantQuery(req,
+      `SELECT coalesce(max(position),0)+1 AS next FROM dashboard_widgets WHERE user_id IS NOT DISTINCT FROM $1`,
+      [req.auth?.userId ?? null])
+    const r = await tenantQuery(req,
+      `INSERT INTO dashboard_widgets (tenant_id, user_id, position, spec) VALUES (app.current_tenant(), $1, $2, $3::jsonb) RETURNING id, position, spec`,
+      [req.auth?.userId ?? null, pos.rows[0].next, JSON.stringify(spec)])
+    return r.rows[0]
+  })
+
+  fastify.patch('/data/dashboard-widgets/:id', async (req, reply) => {
+    const { position } = req.body || {}
+    if (typeof position !== 'number') return reply.code(400).send({ error: 'position (number) required' })
+    const r = await tenantQuery(req,
+      `UPDATE dashboard_widgets SET position=$1 WHERE id=$2 AND user_id IS NOT DISTINCT FROM $3 RETURNING id`,
+      [position, req.params.id, req.auth?.userId ?? null])
+    if (!r.rows.length) return reply.code(404).send({ error: 'widget not found' })
+    return { ok: true }
+  })
+
+  fastify.delete('/data/dashboard-widgets/:id', async (req, reply) => {
+    const r = await tenantQuery(req,
+      `DELETE FROM dashboard_widgets WHERE id=$1 AND user_id IS NOT DISTINCT FROM $2 RETURNING id`,
+      [req.params.id, req.auth?.userId ?? null])
+    if (!r.rows.length) return reply.code(404).send({ error: 'widget not found' })
+    return { ok: true }
   })
 
   // ---- Phase 6.5: suggestions (human settlement of AI-proposed changes) ----
