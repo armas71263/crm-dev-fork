@@ -179,6 +179,21 @@ export function registerInternalRoutes(fastify, { staffQuery, runReadonly }) {
   // tenants_all needs its param; patch it through a dedicated entry.
   OPS.tenants_all = [(p) => [p.status || 'active'], 'SELECT id FROM app.tenants WHERE status=$1']
 
+  // Custom ops: multi-query executors (checked before the fixed-SQL registry).
+  const CUSTOM_OPS = {
+    // Phase 6.7: certified metrics — the assistant runs the SAME SQL as
+    // dashboards, so the number is identical on every surface.
+    metric_run: async (tenantId, params) => {
+      const def = await staffQuery({ tenantId }, `SELECT sql, unit FROM metric_definitions WHERE key=$1 AND status='certified'`, [params.key])
+      if (!def.rows.length) return { error: `unknown or non-certified metric ${params.key}` }
+      const out = await staffQuery({ tenantId }, def.rows[0].sql)
+      // unit travels INSIDE the row — the AI gateway returns only rows
+      return { rows: [{ value: out.rows[0]?.value ?? null, unit: def.rows[0].unit }] }
+    },
+    metric_list: async (tenantId) => ({
+      rows: (await staffQuery({ tenantId }, `SELECT key, label, description, unit FROM metric_definitions WHERE status='certified' ORDER BY key`)).rows,
+    }),
+  }
   const requireToken = (req, reply) => {
     const expected = process.env.BFF_INTERNAL_TOKEN
     if (!expected) { reply.code(503).send({ error: 'internal gateway not configured' }); return false }
@@ -197,6 +212,7 @@ export function registerInternalRoutes(fastify, { staffQuery, runReadonly }) {
     const { op, params = {} } = req.body || {}
     const tenantId = req.headers['x-tenant-id']
     if (!tenantId || !/^[a-z0-9-]{1,40}$/.test(tenantId)) return reply.code(400).send({ error: 'valid x-tenant-id required' })
+    if (CUSTOM_OPS[op]) return await CUSTOM_OPS[op](tenantId, params)
     const def = OPS[op]
     if (!def) return reply.code(404).send({ error: `unknown op ${op}` })
     const [pick, sql] = def

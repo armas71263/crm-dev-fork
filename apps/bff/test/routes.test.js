@@ -836,3 +836,54 @@ test('GET /health/deep reports per-service status and aggregates correctly', asy
   assert.equal(b.checks.db.status, 'up', 'db uses the app pool and must be up in this test')
   await app.close()
 })
+
+// ---- Phase 6.7: certified metrics registry ----
+test('GET /data/metrics lists certified metrics tenant-scoped', async () => {
+  const { app } = await makeApp([
+    [/FROM metric_definitions/, [
+      { key: 'pipeline_value', label: 'Pipeline value', description: 'Total value of open deals.', unit: 'USD' },
+    ]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/metrics', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.metrics.length, 1)
+  assert.equal(b.metrics[0].key, 'pipeline_value')
+  await app.close()
+})
+
+test('running a certified metric executes its stored SQL; drafts are rejected', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT sql FROM metric_definitions WHERE key=\$1 AND status='certified'/, [{ sql: 'SELECT coalesce(sum(value),0)::float AS value FROM deals WHERE status=\'open\'' }]],
+    [/coalesce\(sum\(value\),0\)::float AS value FROM deals/, [{ value: 430000 }]],
+  ])
+  const ok = await app.inject({ method: 'POST', url: '/data/metrics/pipeline_value/run', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(ok.statusCode, 200)
+  assert.deepEqual(JSON.parse(ok.body), { key: 'pipeline_value', value: 430000 })
+  await app.close()
+
+  const draft = await makeApp([
+    [/SELECT sql FROM metric_definitions WHERE key=\$1 AND status='certified'/, []],
+  ])
+  const res = await draft.app.inject({ method: 'POST', url: '/data/metrics/secret_metric/run', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 404, 'non-certified metrics must never run')
+  await draft.app.close()
+})
+
+test('internal gateway runs certified metrics via the metric_run op', async () => {
+  process.env.BFF_INTERNAL_TOKEN = 'secret-token'
+  const data = tenantScoped([
+    [/SELECT sql, unit FROM metric_definitions WHERE key=\$1/, [{ sql: 'SELECT count(*)::int AS value FROM companies', unit: '' }]],
+    [/count\(\*\)::int AS value FROM companies/, [{ value: 3 }]],
+  ])
+  const app = await buildApp({ pool: data.pool, adminPool: makeFakePool().pool, logger: false })
+  const res = await app.inject({
+    method: 'POST', url: '/internal/data',
+    headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' },
+    payload: { op: 'metric_run', params: { key: 'companies_count' } },
+  })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { rows: [{ value: 3, unit: '' }] })
+  delete process.env.BFF_INTERNAL_TOKEN
+  await app.close()
+})

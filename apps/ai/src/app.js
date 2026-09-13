@@ -325,6 +325,14 @@ export async function buildApp({ gateway, logger = true }) {
     },
 
     // run_sql: LLM- or user-written SELECT, executed behind the guardrails.
+    // Phase 6.7: certified metrics — same SQL as dashboards/KPI cards.
+    get_metric: async (tenantId, { key }) => {
+      const rows = await gw(tenantId, 'metric_run', { key })
+      if (!rows.length || rows[0]?.value === undefined || rows[0]?.value === null) {
+        return { error: `metric ${key} returned no value` }
+      }
+      return { key, value: rows[0].value, unit: rows[0].unit || "" }
+    },
     run_sql: async (tenantId, { q, sql }) => {
       const check = validateSql(sql || extractSql(q))
       if (check.error) return { error: check.error }
@@ -384,7 +392,10 @@ export async function buildApp({ gateway, logger = true }) {
         d: 'Read the stored forecast for a time series (record_mt = monthly order volume forecast, deal_value = monthly deal value forecast). Includes history and the predicted next months.',
         s: { type: 'object', properties: { series: { type: 'string', description: 'series key: record_mt or deal_value' } } },
       },
-      run_sql: {
+      get_metric: {
+        d: 'Run a CERTIFIED business metric (pipeline_value, open_deals_count, open_leads_count, companies_count, order_volume_mt, revenue_total, open_tasks_count, overdue_tasks_count, open_issues_count...). Certified metrics are the single source of truth — prefer this over recomputing numbers in SQL.',
+        s: { type: 'object', properties: { key: { type: 'string', description: 'the metric key' } }, required: ['key'] },
+      },      run_sql: {
         d: 'Run a read-only SQL query (a single SELECT or WITH...SELECT statement only) against the tenant database, for questions the other tools cannot answer.',
         s: { type: 'object', properties: { sql: { type: 'string', description: 'the SELECT statement to run' } }, required: ['sql'] },
       },

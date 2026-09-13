@@ -641,6 +641,22 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
     return dump
   })
 
+  // ---- Phase 6.7: certified metrics registry (the governed semantic layer) ----
+  // Each certified metric is defined once; assistant, dashboards and KPI
+  // cards all execute the same stored SQL through the staff pool (RLS).
+  fastify.get('/data/metrics', async (req) => {
+    const r = await tenantQuery(req, `SELECT key, label, description, unit FROM metric_definitions WHERE status='certified' ORDER BY key`)
+    return { metrics: r.rows }
+  })
+
+  fastify.post('/data/metrics/:key/run', async (req, reply) => {
+    const { key } = req.params
+    const r = await tenantQuery(req, `SELECT sql FROM metric_definitions WHERE key=$1 AND status='certified'`, [key])
+    if (!r.rows.length) return reply.code(404).send({ error: 'unknown or non-certified metric' })
+    const out = await tenantQuery(req, r.rows[0].sql)
+    return { key, value: out.rows[0]?.value ?? null }
+  })
+
   // ---- Phase 6.5: suggestions (human settlement of AI-proposed changes) ----
   // Accept applies ONE whitelisted field through the staff pool (RLS); the
   // agent itself can never write. Reject only marks. Table/field names come
