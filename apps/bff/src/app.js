@@ -657,6 +657,24 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
     return { key, value: out.rows[0]?.value ?? null }
   })
 
+  // ---- Phase 5 completion: win-probability (deal outcome prediction) ----
+  fastify.post('/data/win-probability', async (req, reply) => {
+    const res = await fetch(`${PREDICTIONS_SERVICE_URL}/win-probability`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
+      body: JSON.stringify(req.body || {}),
+    })
+    reply.code(res.status)
+    reply.send(await res.text())
+  })
+
+  fastify.get('/data/win-probability/model', async (req, reply) => {
+    const res = await fetch(`${PREDICTIONS_SERVICE_URL}/win-probability/model`, {
+      headers: { 'x-tenant-id': req.tenantId },
+    })
+    reply.code(res.status)
+    reply.send(await res.text())
+  })
   // ---- Phase 6.7: self-serve dashboard (pin the QUERY, never rendered data) ----
   const CHART_SCOPES = { crm: cChartSql, vertical: vChartSql }
   fastify.post('/data/chart', async (req, reply) => {

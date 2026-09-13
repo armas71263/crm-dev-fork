@@ -74,3 +74,74 @@ def forecast(body: dict, x_tenant_id: str = Header(None)):
             "label": SERIES[series]["label"], "model": result["model"],
             "horizon": HORIZON, "history": rows, "forecast": forecast_rows,
             "generated_at": date.today().isoformat()}
+
+
+# ---- Phase 5 completion: win-probability (deal outcome) ----
+from winprob import train as train_winprob, predict as predict_winprob  # noqa: E402
+
+_WINPROB_CACHE = {}
+
+
+def _trained(tenant):
+    """Train (and cache per process) on the tenant's deal_history corpus."""
+    if tenant not in _WINPROB_CACHE:
+        history = tenant_query(
+            tenant,
+            "SELECT value, stage, company_type, source, days_open, activities_count, won "
+            "FROM deal_history",
+        )
+        _WINPROB_CACHE[tenant] = train_winprob(history)
+    return _WINPROB_CACHE[tenant]
+
+
+@app.get("/win-probability/model")
+def win_probability_model(x_tenant_id: str = Header(None)):
+    if not x_tenant_id:
+        raise HTTPException(status_code=400, detail="x-tenant-id required")
+    t = _trained(x_tenant_id)
+    if not t["ok"]:
+        return t
+    return {
+        "ok": True,
+        "n": t["n"],
+        "accuracy": round(t["accuracy"], 4),
+        "pseudo_r2": round(t["pseudo_r2"], 4),
+        "coef": dict(zip(t["feature_names"], [round(c, 4) for c in t["coef"]])),
+    }
+
+
+@app.post("/win-probability")
+def win_probability(body: dict, x_tenant_id: str = Header(None)):
+    tenant = x_tenant_id or body.get("tenant")
+    deal_id = body.get("deal_id")
+    if not tenant or not deal_id:
+        raise HTTPException(status_code=400, detail="x-tenant-id and deal_id required")
+    t = _trained(tenant)
+    if not t["ok"]:
+        return {"ok": False, "error": t["error"]}
+    deals = tenant_query(
+        tenant,
+        """SELECT d.name, d.value::float AS value, d.stage,
+                  coalesce(c.type, '') AS company_type,
+                  coalesce(l.source, 'outbound') AS source,
+                  extract(epoch from (now() - d.created_at))::int / 86400 AS days_open,
+                  (SELECT count(*) FROM activities a
+                     WHERE a.entity = 'deal' AND a.entity_id = d.id)::int AS activities_count
+           FROM deals d
+           LEFT JOIN companies c ON c.id = d.company_id
+           LEFT JOIN leads l ON l.id = d.lead_id
+           WHERE d.id = %s""",
+        (deal_id,),
+    )
+    if not deals:
+        return {"ok": False, "error": "deal not found in this tenant"}
+    p = predict_winprob(deals[0], t)
+    if not p["ok"]:
+        return p
+    return {
+        "ok": True,
+        "deal": deals[0]["name"],
+        "deal_id": deal_id,
+        "probability": p["probability"],
+        "model": {"n": t["n"], "accuracy": round(t["accuracy"], 4)},
+    }
