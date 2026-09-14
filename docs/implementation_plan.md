@@ -119,6 +119,12 @@ Closes the real capability gap identified vs. WrenAI — built on our own stack,
 3. PostHog Cloud: client events in Next.js, server events in BFF.
 - **Verify:** one trace visible end-to-end (BFF→AI→DB); uptime checks green; PostHog dashboard shows real events.
 
+### Phase 8 — metering + hardening (2026-09-14, COMPLETE + live-verified)
+- **Metering**: migration 012 — plans catalog (free 20k / starter 100k / pro 400k rolling-24h AI tokens, seats, modules, price) + per-tenant plan_key + tenant_usage_24h view. BFF cap guard on ALL four AI routes returns 429 with plan context; /data/usage/summary serves plan + rolling usage. Live drill: captest plan blocked (used 4156 vs cap 10), pro restored and passes. Root cause found live: plans had RLS with ZERO policies (silent deny-all — guard failed open); fixed with permissive app_role policy + security_invoker on the view.
+- **Backup → restore drill**: vendor backup endpoint verified on Supabase (190 rows / 10 tables); committed restore script (apps/bff/scripts/restore-tenant.mjs) restores into a NEW tenant, verifies per-table counts, drill mode self-cleans. Runbook: docs/backup-restore.md. Drill of record: PASS 10/10 tables.
+- **Invite flow**: confirmed already hardened in the productization pass — service-role Admin API + recovery-link first-login (no password ever set by the product); app_metadata (tenant/role/company) writable only via service role from the BFF. The predictable passwords in this repo belong to DEMO/TEST seeding only, not the product path.
+- **PostHog**: ACTIVATED — project key verified (capture 200 Ok) and a real suggestion_rejected event fired through the product path. Note: the key lives in the chat transcript → rotate eventually.
+BFF 80/80. Remaining from this phase's original list: DEPLOYMENT.md refresh is folded into docs/backup-restore.md + docs/observability.md (production runbooks).
 ### Phase 8 — Metering groundwork + hardening (2–3 days)
 1. `plans` table (modules, seats, AI-token caps) enforced by BFF middleware; usage views over `ai_usage_logs`.
 2. Supabase invite flow for users (app_metadata written via service-role from BFF only); delete predictable-password path.

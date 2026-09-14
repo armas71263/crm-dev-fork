@@ -126,3 +126,10 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - **uv venvs have NO pip module** — install with `uv pip install --python .venv/bin/python ...`.
 - **Patch-script lessons re-confirmed**: converting an object property to a standalone const leaves a stray trailing comma ("Unexpected token try" two lines later); always node --check after structural patches; heredoc-to-file + node file.cjs with stderr visible.
 - **Chronos in a 0.25-CPU sandbox**: package + torch install fine; HF weight download + torch inference hangs silently — timebox the attempt, verify on real hardware, never claim it.
+
+## Phase 8 (2026-09-14, metering + hardening)
+- **RLS with ZERO policies = deny-all for non-owners, SILENTLY**: the plans table had RLS enabled with no policy → app_role's SELECT grant was useless → the cap guard failed OPEN and /data/usage/summary returned null with no error. A grant is not visibility. Check relrowsecurity + pg_policies whenever a new table should be app_role-readable.
+- **Views run with OWNER privileges by default (GUC-independent, cross-tenant)**: set security_invoker = true on tenant-facing views (app.tenant_usage_24h) so they honor the caller's RLS + GUC.
+- **Cap guard fail-open on missing plan config is deliberate** (vendor config error must not brick tenants) — but the drill must set a REAL plan row to prove the block.
+- **app.tenants columns: id, label, template, tier, status, theme, created_at, plan_key** (NO name column) — restore scripts must copy label/template/tier when creating the registry row.
+- **Restore drills: quote every identifier** (hr_events has the reserved word `leave`), drop row ids (fresh bigserial), create the registry row FIRST (FK target), restore into a NEW tenant id never in place, verify per-table counts, self-clean.
