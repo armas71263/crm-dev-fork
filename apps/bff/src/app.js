@@ -801,8 +801,35 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
     return { forecast: r.rows[0] || null }
   })
 
+  // ---- Phase 8 metering: plan caps on rolling 24h AI tokens ----
+  // Enforced BEFORE forwarding to the AI service. Fails OPEN on missing plan
+  // config (a vendor config error must not brick tenants; usage stays visible
+  // on /data/usage/summary). Enforced per tenant via the staff pool + RLS.
+  async function aiCapExceeded(req) {
+    const r = await staffQuery(req, `SELECT p.name AS plan_name, p.ai_token_cap_24h AS cap,
+      (SELECT coalesce(sum(tokens_in + tokens_out), 0)::int FROM ai_usage_logs
+        WHERE created_at > now() - interval '24 hours') AS used
+      FROM app.tenants t JOIN plans p ON p.key = t.plan_key
+      WHERE t.id = app.current_tenant()`)
+    const row = r.rows[0]
+    if (!row) return null
+    if (row.used < row.cap) return null
+    return { error: 'plan limit reached — contact your account manager', plan: row.plan_name, used_24h: row.used, cap: row.cap }
+  }
+
+  fastify.get('/data/usage/summary', async (req) => {
+    const r = await staffQuery(req, `SELECT p.key AS plan_key, p.name AS plan_name, p.ai_token_cap_24h AS cap,
+      p.seats, p.price_usd, p.modules,
+      coalesce((SELECT tokens_24h FROM app.tenant_usage_24h WHERE tenant_id = app.current_tenant()), 0) AS used_24h,
+      coalesce((SELECT requests_24h FROM app.tenant_usage_24h WHERE tenant_id = app.current_tenant()), 0) AS requests_24h
+      FROM app.tenants t JOIN plans p ON p.key = t.plan_key WHERE t.id = app.current_tenant()`)
+    return r.rows[0] || { plan: null }
+  })
+
   // Proxy to AI service (approve the AI contexts)
   fastify.post('/ai/chat', async (req, reply) => {
+    const capped = await aiCapExceeded(req)
+    if (capped) return reply.code(429).send(capped)
     const res = await fetch(`${AI_SERVICE_URL}/chat`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
@@ -813,6 +840,8 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
 
   // Reindex the tenant's knowledge base (records/tickets/parties → embeddings).
   fastify.post('/ai/reindex', async (req, reply) => {
+    const capped = await aiCapExceeded(req)
+    if (capped) return reply.code(429).send(capped)
     const res = await fetch(`${AI_SERVICE_URL}/index`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
@@ -823,6 +852,8 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
 
   // Generate tenant insights (top customer/grade, issue mix, trend, totals).
   fastify.post('/ai/insights', async (req, reply) => {
+    const capped = await aiCapExceeded(req)
+    if (capped) return reply.code(429).send(capped)
     const res = await fetch(`${AI_SERVICE_URL}/insights`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
@@ -841,6 +872,8 @@ export async function buildApp({ pool, customerPool, adminPool, readonlyPool, ai
 
   // Streaming chat (SSE) — passthrough the ai-service event stream.
   fastify.post('/ai/chat/stream', async (req, reply) => {
+    const capped = await aiCapExceeded(req)
+    if (capped) return reply.code(429).send(capped)
     const res = await fetch(`${AI_SERVICE_URL}/chat/stream`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },

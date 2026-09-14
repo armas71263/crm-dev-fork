@@ -26,6 +26,7 @@ MIGRATIONS=(
   "009_bi_isolation|infra/migrations/009_bi_isolation.sql"
   "010_agent_trust|infra/migrations/010_agent_trust.sql"
   "011_semantic_layer|infra/migrations/011_semantic_layer.sql"
+  "012_plans|infra/migrations/012_plans.sql"
 )
 
 psql "$DSN" -v ON_ERROR_STOP=1 <<SQL

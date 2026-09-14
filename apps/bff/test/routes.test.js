@@ -932,3 +932,39 @@ test('chart aggregation endpoint runs the dimension builders through the staff p
   assert.equal(bad.statusCode, 400)
   await app.close()
 })
+
+// ---- Phase 8: plan caps (metering) ----
+test('AI routes are blocked with 429 when the rolling 24h cap is exceeded', async () => {
+  const { app } = await makeApp([
+    [/JOIN plans p ON p\.key = t\.plan_key/, [{ plan_name: 'Free', cap: 100, used: 5000 }]],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/ai/chat', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { message: 'hi' } })
+  assert.equal(res.statusCode, 429)
+  const b = JSON.parse(res.body)
+  assert.equal(b.cap, 100)
+  assert.equal(b.used_24h, 5000)
+  assert.match(b.error, /plan limit reached/)
+  await app.close()
+})
+
+test('AI routes pass the guard when under the cap', async () => {
+  const { app } = await makeApp([
+    [/JOIN plans p ON p\.key = t\.plan_key/, [{ plan_name: 'Pro', cap: 400000, used: 100 }]],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/ai/chat', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { message: 'hi' } })
+  assert.notEqual(res.statusCode, 429, 'under-cap requests must reach the (unreachable test) AI service, not the guard')
+  await app.close()
+})
+
+test('GET /data/usage/summary returns plan + rolling usage', async () => {
+  const { app } = await makeApp([
+    [/JOIN plans p ON p\.key = t\.plan_key/, [{ plan_key: 'pro', plan_name: 'Pro', cap: 400000, seats: 25, price_usd: 149, modules: [], used_24h: 1200, requests_24h: 4 }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/usage/summary', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.plan_key, 'pro')
+  assert.equal(b.used_24h, 1200)
+  assert.equal(b.requests_24h, 4)
+  await app.close()
+})
