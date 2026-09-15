@@ -42,7 +42,7 @@ register_field() {
 }
 
 echo "→ Registering collections..."
-for c in records parties tickets hr_events feed_items checklists files embeddings screen_configs; do
+for c in records parties tickets hr_events feed_items checklists files embeddings screen_configs companies contacts leads deals activities pipeline_stages audit_logs profiles; do
   register_collection "$c"
 done
 
@@ -71,6 +71,22 @@ register_field tickets  category string "Category"
 register_field tickets  status   string "Status"
 register_field feed_items title  string "Title"
 register_field feed_items category string "Category"
+register_field companies name     string "Name"
+register_field companies type     string "Type"
+register_field companies industry string "Industry"
+register_field companies status   string "Status"
+register_field contacts  full_name string "Full Name"
+register_field contacts  title     string "Title"
+register_field contacts  email     string "Email"
+register_field leads     name      string "Name"
+register_field leads     status    string "Status"
+register_field deals     name      string "Name"
+register_field deals     stage     string "Stage"
+register_field deals     value     float  "Value"
+register_field activities type    string "Type"
+register_field activities subject string "Subject"
+register_field audit_logs action  string "Action"
+register_field audit_logs entity  string "Entity"
 
 # ------------------------------------------------------------------
 # 2. RBAC: roles + policies + access + permission rules (Directus 12 model).
@@ -96,8 +112,8 @@ def api(method, path, body=None):
         print(f"  ! {method} {path}: {e.code} {body}")
         return {}
 
-ALL = ["records","parties","tickets","hr_events","feed_items","checklists","files","embeddings","screen_configs"]
-STAFF = ["records","parties","tickets","checklists","files","screen_configs"]
+ALL = ["records","parties","tickets","hr_events","feed_items","checklists","files","embeddings","screen_configs","companies","contacts","leads","deals","activities","pipeline_stages","audit_logs","profiles"]
+STAFF = ["records","parties","tickets","checklists","files","screen_configs","companies","contacts","leads","deals","activities","pipeline_stages","audit_logs","profiles"]
 
 # (name, description, admin_access, app_access, {action: [tables]})
 ROLES = [
@@ -148,7 +164,12 @@ for name, desc, admin, app, perms in ROLES:
             for action, tables in perms.items():
                 for t in tables:
                     api("POST", "/permissions", {"policy": policy_id, "collection": t,
-                        "action": action, "fields": ["*"], "permissions": {}, "validation": {}})
+                        "action": action, "fields": ["*"],
+                        # Real tenant filter (defense-in-depth under DB RLS):
+                        # the role only ever sees rows for its own tenant via
+                        # the directus_users.tenant_id binding added above.
+                        "permissions": {"tenant_id": {"_eq": "$CURRENT_USER.tenant_id"}},
+                        "validation": {}})
     print(f"  ✓ {name} → policy {policy_id[:8] if policy_id else '?'} ({sum(len(v) for v in perms.values())} rules)")
 PY
 

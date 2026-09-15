@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-paper text-ink font-plex antialiased;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* Hairline structure: divided strips, not floating cards */
+.kpi-strip {
+  @apply border border-line bg-white;
+}
+.kpi-cell {
+  @apply px-5 py-4 border-l border-line first:border-l-0;
+}
+
+.datatable th {
+  @apply text-left text-[13px] font-semibold text-steel px-4 py-2.5 border-b border-line bg-white;
+}
+.datatable td {
+  @apply px-4 py-2.5 border-b border-line bg-white text-[14px];
+}
+.datatable tr:last-child td {
+  @apply border-b-0;
+}
+
+input[type='text'], input[type='email'], input[type='password'] {
+  @apply w-full border border-line bg-white px-3 py-2 text-[14px] outline-none
+    focus:border-leaf transition-colors;
+}
+
+::selection {
+  @apply bg-leaf/20;
+}

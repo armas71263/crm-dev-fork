@@ -1,0 +1,156 @@
+# End-to-End Implementation Plan — Sellable Generic CRM + Analytics + AI Platform
+
+**Status:** Approved architecture, pre-implementation. Supersedes the phased plan in
+`build_handbook.md` (Phases 0–5 of the original build are complete; this plan covers the
+productization rebuild). All external dependencies license-verified from source as of
+2026-09-04. Produced via the grill-me design-tree protocol; every decision recorded below
+was explicitly settled with the product owner.
+
+---
+
+## 1. Settled architecture (all rounds of the design tree)
+
+| Layer | Decision |
+|---|---|
+| Control plane | Directus 12, **vendor-only** (no tenant logins). Tenant-admin features are built as product screens |
+| Database | Supabase cloud Postgres (pgvector), managed; free tier while building |
+| Auth | Supabase Auth (GoTrue) for all product users. BFF verifies JWTs (ES256/JWKS, iss+aud) and derives tenant/company/role from `app_metadata` claims (service-role key stays server-side only) |
+| Tenancy | Pooled RLS tier A retained: `app_role` non-superuser + `set_config('app.tenant_id', …, false)` + `RESET` in `finally`. Session-mode pooler connection (transaction pooler breaks the pattern; direct conn is IPv6-only) |
+| CRM | **Generic core**: companies, contacts, leads, deals (configurable pipeline stages), activities, tasks, custom fields via `extra` JSONB. Rubber-trading vertical becomes a template |
+| Analytics | Custom KPI engine kept + **WrenAI** embedded (Apache-2.0 core) for GenBI chat-with-data / AI dashboards; per-tenant project + restricted DB role + per-tenant views; 1–2 day isolation spike before commitment |
+| AI assistant | Real Vercel AI SDK v5 (`ai@5`) with tool calling; real 768-dim embeddings (nomic-embed-text-v1.5 local, keeps `VECTOR(768)`); RLS-guarded text-to-SQL via a dedicated read-only role; conversation history persisted (semantic memory deferred) |
+| Predictions | **Combo A**: AutoGluon (Apache-2.0) — TimeSeries with Chronos-Bolt (Apache-2.0 weights) + AutoARIMA fallback; Tabular with TabPFNMix (Apache-2.0 weights) + LightGBM. TabFM excluded: pretrained weights are non-commercial (`tabfm-non-commercial-v1.0`). TimesFM optional later |
+| Frontend | Real Next.js 14 + shadcn/ui + Refine headless app (`apps/web`); `preview/` SPA deleted after parity. No ORM anywhere: raw parameterized SQL behind `tenantQuery` in the BFF; Refine uses a REST data provider against the BFF |
+| Monitoring | SigNoz (MIT core, self-hosted) + Uptime Kuma (MIT); **PostHog Cloud free tier** for product analytics (self-hosted needs a dedicated 4vCPU/16GB box — deferred) |
+| Billing | Deferred until product works; metering groundwork (`plans` table, caps, `ai_usage_logs` views) built now |
+| ORM | **None** (rationale: RLS session state is the security mechanism; ORM abstraction is a liability on that path; small query surface) |
+
+## 2. Known constraints and fixes carried from the code audit
+
+- **G1** Directus must NOT connect as superuser (RLS bypass). On Supabase it gets a dedicated `BYPASSRLS` role; vendor-only usage.
+- **G2** `setup-directus.sh` creates permission presets with empty filters (`"permissions": {}`) — rewrite with real tenant filters (`$CURRENT_USER.tenant_id`).
+- **G3** Customer company-scoping is unenforced at DB level today (Test D only tested a WHERE clause). New `app_customer` role + company-dimension policies + `SET ROLE` in BFF for customer-role JWTs.
+- **G4** No `audit_logs` table exists (docs claimed it) — add tenant-scoped audit written by BFF mutation hook.
+- `onboard-tenant.sh` mints predictable passwords (`${TENANT_ID}1234`) — replaced by Supabase invite flow.
+- Text-to-SQL must not reuse `app_role` (it holds write grants) — new `app_readonly` role (SELECT only) + `statement_timeout` + row limits.
+- Supabase default privileges on `public` tables: as of the 2026-05-30 rollout, new projects do **not** expose new tables to the Data API without explicit grants. Migration checklist still verifies grants once (rollout timing).
+- Free tier: projects pause after ~7 days inactivity; 500MB; no PITR — upgrade before real customer data.
+- BFF pool: session pooler string (IPv4), `max: 5`.
+
+---
+
+## 3. Phases
+
+### Phase 0 — Baseline (0.5 day)
+- Branch from thread branch; update `AGENTS.md` learnings with the new decisions.
+- `.env.example`: add `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_SESSION_POOLER_URL`, `NEXT_PUBLIC_POSTHOG_KEY`.
+- **Verify:** env template documents which keys are server-only.
+
+### Phase 1 — Supabase foundation + real auth (1–1.5 weeks)
+1. Project setup checklist: Automatic RLS **on**; verify Data-API exposure default; `CREATE EXTENSION vector` in the project DB; save session-pooler URL + service key.
+2. Migration runner: numbered SQL under `infra/migrations/` + `scripts/migrate.sh` (psql + `schema_migrations` table). Apply `helper.sql` + `schema.sql` as migration 001/002. (Init-script-on-fresh-volume constraint no longer applies — everything goes through the runner.)
+3. New SQL: `public.profiles` synced from `auth.users` (display name, role); tenant/company/plan live in JWT `app_metadata` as source of truth.
+4. DB roles: keep `app_role`; add `app_readonly` (SELECT + statement_timeout) and `app_customer` (company-scoped policies on customer-facing tables: records, files, tickets, deals).
+5. BFF (`apps/bff/src/index.js`): `jose` JWKS verification; preHandler: verify → read claims → `set_config` tenant+company GUCs → `SET ROLE app_customer` for customer-role tokens; `RESET ROLE` + `RESET app.tenant_id` in `finally`. **Delete the `x-tenant-id` path.**
+6. Directus → Supabase: dedicated `BYPASSRLS` role, vendor-only; rewrite presets with real tenant filters (defense-in-depth even vendor-only).
+7. `audit_logs` table + BFF hook on every mutation.
+8. Rewrite `tests/isolation.sql`: true customer-role test (`SET ROLE app_customer`), readonly-role test, JWT-path integration script (two test users, cross-tenant attempt must 401/0-rows).
+- **Verify:** isolation suite green against Supabase; `curl` without token → 401; plan-limits hook placeholder in place.
+
+### Phase 2 — Generic CRM schema + templates (1 week)
+1. Tables: `companies, contacts, leads, deals, activities, tasks` — all tenant_id + RLS + FORCE + indexes; `extra` JSONB custom fields; `pipeline_stages` as per-tenant config.
+2. `module-registry.json`: add crm modules; map rubber template (`records` stays as the vertical module; rubber `parties` ↔ `companies`).
+3. Extend Excel import/export, screen-config editor, demo-reset to new tables.
+4. Seed: generic demo tenant + rubber demo tenant.
+- **Verify:** isolation tests extended to new tables; Excel round-trip test; new tenant onboarding script end-to-end.
+
+### Phase 3 — Real Next.js frontend (2–3 weeks)
+> Status (2026-09-09): COMPLETE — all Phase 3 screens live-verified (Dashboard, CRM + Tasks, vertical template screens incl. Attendance/Checklists, Search, Assistant SSE, Insights, AI usage, Screen-config editor, Branding, Users & Invites, vendor Tenants, customer Portal). `preview/` deleted; CSP tightened (script-src self, no inline attrs). Refine provider integration deferred — the BFF route factory serves the screens today.
+
+1. `apps/web`: supabase-js auth (PKCE, middleware), role-based routing.
+2. Screens: Dashboard (KPI), CRM modules (companies/contacts/leads/deals/activities/tasks), template modules (records/…), global Search, AI Assistant (SSE), Insights, Screen-config editor, Theme editor (tenant-admin), Users & Invites (tenant-admin), Tenants + usage (vendor).
+3. Refine REST data provider against BFF.
+4. helmet CSP: add Supabase/PostHog/WrenAI origins; remove `script-src-attr 'unsafe-inline'` once preview SPA dies.
+5. Parity checklist vs preview → then delete `preview/` + `@fastify/static`.
+- **Verify:** per-screen browser walkthrough (DOM evidence), PostHog events firing, SSE chat works through BFF.
+
+### Phase 4 — AI upgrade + conversation memory (1 week)
+> Status (2026-09-09): COMPLETE — items 1-4 done and live-verified. Cloudflare Workers AI via the AI Gateway is the real provider (qwen3.8-27b with native function calling through the OpenAI-compatible endpoint; ai SDK 7 + @ai-sdk/openai-compatible 3, requests tagged per tenant). Real bge-base-en-v1.5 embeddings (768-d) power RAG indexing + retrieval (35 sources reindexed). Multi-step agent loop with grounded streaming answers, step budget + guaranteed observation fallback; text-to-SQL verified under the real model (model-written SELECTs succeed, destructive SQL refused by both model and guardrail); conversation memory persists real replies. Deterministic local pipeline remains the no-key fallback.
+1. `apps/ai`: real Vercel AI SDK v5 (`streamText`, tool calling) replacing the hand-rolled planner.
+2. Real embeddings: nomic-embed-text-v1.5 (768-d) local (in the Python service or Ollama), NIM key-gated fallback; reindex migration (embeddings table stays `VECTOR(768)`).
+3. Text-to-SQL tool: `app_readonly` role + tenant GUC + statement timeout + SELECT-only validation — RLS-guarded by construction.
+4. `ai_chat_sessions` / `ai_chat_messages` (RLS) — **conversation memory v1**; semantic memory deferred (embeddings `source_type='memory'` slot reserved).
+- **Verify:** grounded answers cite tool observations; SQL tool mutation attempt fails; semantic search sanity check vs old hash embeddings.
+
+### Phase 5 — Predictions service (1 week)
+> Status (2026-09-10): COMPLETE (time-series core, live-verified) — apps/predictions FastAPI (uv venv) on :5100, supervised by dev.sh. Damped-trend Holt ETS (statsmodels) is the verified default forecaster (sane on spikes, unlike trend-ARIMA); Chronos-Bolt via AutoGluon is wired as an opt-in (PREDICTIONS_USE_CHRONOS=1). predictions table (migration 008, RLS) stores per-tenant forecasts idempotently; synthetic 24-month rubbertrack history seeds a learnable series. BFF POST /data/forecast + GET /data/forecast/:series (RLS-scoped); dashboard Volume-forecast panel with Generate button; get_forecast assistant tool. Verified live: forecast job + stored read, cold tenant (insufficient data), cross-tenant isolation, assistant grounded forecast table, panel rendering. Tabular win-probability (TabPFNMix/LightGBM) deferred.
+1. New `apps/predictions` FastAPI (Python 3.11): AutoGluon TimeSeries (Chronos-Bolt + AutoARIMA fallback) + Tabular (TabPFNMix + LightGBM); serves embeddings endpoint too.
+2. `predictions` table (RLS; model, horizon, generated_at, per-tenant); idempotent scheduled forecast job; cold-start (<N history) → AutoARIMA or explicit "insufficient data".
+3. BFF `/data/forecast`; dashboard forecast panel; `get_forecast` assistant tool.
+- **Verify:** forecast integration test on seeded history; cold tenant returns insufficient-data; predictions table isolation test.
+
+### Phase 6.5 — agentic trust layer (2026-09-11, COMPLETE + live-verified)
+Patterns adopted from Comp AI's design, rebuilt on our stack:
+- **Evidence ledger + suggestions**: the AI can observe and propose, never write. Migration 010 (ai_observations/ai_suggestions/agent_tasks, RLS); propose_change/record_observation tools; staff settlement endpoints (GET /data/suggestions, POST /data/suggestions/:id/resolve with a server-side field whitelist + audit); Suggestions screen. Live-verified: model proposed a website change (record untouched) → staff accepted → row updated + audit row written.
+- **Durable work queue**: agent_tasks with FOR UPDATE SKIP LOCKED leases, due_at scheduling, budget gate against 24h AI usage (AGENT_DAILY_TOKEN_BUDGET); dispatcher in the AI service (insights_refresh, forecast_refresh). Live-verified: task claimed + done + snapshot written.
+- **Credential-free agent**: the AI service holds NO DB credentials (no pg import). All access via the BFF internal gateway — named op registry (SQL server-side), /internal/sql behind validateSql + app_readonly pool, shared-secret token, tenant GUC applied server-side. Live-verified: 401/404 security matrix, real tenant data, mutation rejection. A GUC-nulling bug (staffQuery req-shape) was caught by live verification and fixed — RLS failed closed, zero rows, no leak.
+- **Versioned skills**: agent behavioral rules as markdown (apps/ai/skills: evidence, data-boundaries, proposing-changes) loaded into the system prompt. Observed live: the model refused to propose a no-op change citing current values.
+- **URL-as-state views**: companies/contacts/deals filters live in the query string (shareable links).
+Tests: BFF 70/70, AI 28/28 (gateway mocks).
+### Phase 6 — WrenAI embedding (spike 1–2 days, then ~1 week)
+> Status (2026-09-11): spike DONE and PASSED (live) — migration 009: per-tenant read-only views in schema `bi` (tenant hardcoded in the view WHERE, immune to GUC tampering) + restricted `bi_<tenant>` login roles; cross-tenant matrix verified against Supabase (own rows only; base tables + other tenants views permission-denied; GUC attack ineffective). Report: docs/spikes/wrenai-isolation.md. WrenAI runtime itself is infeasible in the 1.9GB dev sandbox (6 containers) — the plan-sanctioned fallback shipped instead: the Ask-the-data dashboard card (streaming, read-only SQL via the assistant). Production WrenAI path documented (bi_<tenant> connection profiles + Cloudflare LLM).
+1. Spike: per-tenant project + connection profile + restricted DB role scoped to per-tenant views; cross-tenant query attempt **must fail**.
+2. On success: compose service, MDL generation from module registry, embed UI in Next.js.
+3. Fallback if spike fails: extend the assistant's text-to-SQL into a lightweight dashboard feature (no new dependency).
+- **Verify:** spike isolation report; embedded UI walkthrough.
+
+### Phase 6.7 — BI completion (2026-09-13, COMPLETE + live-verified)
+Closes the real capability gap identified vs. WrenAI — built on our own stack, zero new infrastructure:
+- **Certified metrics registry** (migration 011: metric_definitions, 10 seeded metrics/tenant): each metric defined once; the assistant (get_metric tool), dashboards and metric cards all execute the same stored SQL through the staff pool. Live: pipeline_value=430000 identical on every surface; the real model prefers get_metric per the metrics skill; drafts rejected 404.
+- **Self-serve dashboard builder**: dashboard_widgets store the QUERY (pin-the-intent, never rendered data) — chart intents ride in chat/stream payloads; BFF /data/chart + widgets CRUD (whitelisted specs); DashboardWidgets grid (live metric cards + chart widgets, add-metric picker, reorder, remove); Pin-to-dashboard in the Assistant. Live: model chart → pin → dashboard re-run reproduces the streamed data exactly.
+### Phase 5 completion (2026-09-13, COMPLETE + live-verified)
+- **Win-probability model**: statsmodels Logit on the deal_history corpus (migration 011, 150 synthetic rows with baked-in logistic signal). Interpretable coefficients; 71.3% accuracy; real-deal prediction grounded (biggest deal + 1 activity → 23.7%); BFF proxies + get_win_probability assistant tool.
+- **AI insights commentary**: deterministic computed lines stay the source of truth; the LLM writes 2-3 grounded sentences (only-cite-given-numbers rule, retry on reasoning-only output, graceful lines-only fallback). Live: commentary stored, served, rendered on the Insights screen.
+- **Chronos-Bolt**: honest status — chronos-forecasting + torch installed in the venv; forecaster rewritten from the never-installed AutoGluon path to the correct direct ChronosBoltPipeline API; damped-ETS remains the verified default; END-TO-END INFERENCE NOT VERIFIED IN THIS SANDBOX (weight download/inference hangs at 0.25 CPU — timeboxed, documented). Production can enable via PREDICTIONS_USE_CHRONOS=1 and verify on real hardware.
+### Phase 7 — Observability (2–3 days)
+> Status (2026-09-11): DONE for everything runnable here — zero-dependency Prometheus /metrics on BFF + AI (aggregate only, no tenant data), /health/deep service matrix (the uptime-monitor endpoint), /ops staff screen, PostHog Cloud server events (env-gated no-op without key). SigNoz (needs ~8GB) and Uptime Kuma are production deployments — exact steps in docs/observability.md; our scrape format is SigNoz/Prometheus-native. Tests: BFF 72/72, AI 29/29.
+1. SigNoz compose profile; OTel SDK in BFF/AI/predictions (Node + Python instrumentation).
+2. Uptime Kuma for external uptime checks.
+3. PostHog Cloud: client events in Next.js, server events in BFF.
+- **Verify:** one trace visible end-to-end (BFF→AI→DB); uptime checks green; PostHog dashboard shows real events.
+
+### Phase 8 — metering + hardening (2026-09-14, COMPLETE + live-verified)
+- **Metering**: migration 012 — plans catalog (free 20k / starter 100k / pro 400k rolling-24h AI tokens, seats, modules, price) + per-tenant plan_key + tenant_usage_24h view. BFF cap guard on ALL four AI routes returns 429 with plan context; /data/usage/summary serves plan + rolling usage. Live drill: captest plan blocked (used 4156 vs cap 10), pro restored and passes. Root cause found live: plans had RLS with ZERO policies (silent deny-all — guard failed open); fixed with permissive app_role policy + security_invoker on the view.
+- **Backup → restore drill**: vendor backup endpoint verified on Supabase (190 rows / 10 tables); committed restore script (apps/bff/scripts/restore-tenant.mjs) restores into a NEW tenant, verifies per-table counts, drill mode self-cleans. Runbook: docs/backup-restore.md. Drill of record: PASS 10/10 tables.
+- **Invite flow**: confirmed already hardened in the productization pass — service-role Admin API + recovery-link first-login (no password ever set by the product); app_metadata (tenant/role/company) writable only via service role from the BFF. The predictable passwords in this repo belong to DEMO/TEST seeding only, not the product path.
+- **PostHog**: ACTIVATED — project key verified (capture 200 Ok) and a real suggestion_rejected event fired through the product path. Note: the key lives in the chat transcript → rotate eventually.
+BFF 80/80. Remaining from this phase's original list: DEPLOYMENT.md refresh is folded into docs/backup-restore.md + docs/observability.md (production runbooks).
+### Phase 8 — Metering groundwork + hardening (2–3 days)
+1. `plans` table (modules, seats, AI-token caps) enforced by BFF middleware; usage views over `ai_usage_logs`.
+2. Supabase invite flow for users (app_metadata written via service-role from BFF only); delete predictable-password path.
+3. Per-tenant logical backup adapted to Supabase + documented restore drill.
+4. `DEPLOYMENT.md` refresh; demo-reset for sales.
+- **Verify:** cap blocks overuse (test); backup → restore drill passes.
+
+**Total: ~7–10 weeks of focused build.** Dependency order: auth first (everything sits on it), schema second (frontend renders it), frontend third (the product becomes visible), AI/predictions on that base, WrenAI/observability/metering last (independent).
+
+---
+
+## 4. Risk register (carried forward)
+
+| Risk | Handling |
+|---|---|
+| WrenAI per-tenant isolation unvalidated at scale | Spike precedes commitment; fallback is in-house text-to-SQL dashboards |
+| Supabase pooler mode vs session-level `set_config` | Session pooler only; migration checklist asserts it |
+| AutoGluon image size (~2–3GB with torch) | Accepted; heaviest container, isolated service |
+| PostHog footprint | Cloud free tier during build; self-host decision at production |
+| Free-tier pauses / 500MB / no PITR | Unpause via dashboard; upgrade before real customer data |
+| Embeddings switch requires reindex | Migration + reindex job in Phase 4 |
+
+## 5. Explicitly out of scope (decided, not forgotten)
+
+- Live email sync (Gmail/IMAP), outreach sequences, telephony — later versions.
+- Long-term semantic AI memory — later (schema slot reserved).
+- Billing/payments integration — after the product works (metering built now).
+- Customer-hosted deployment tier — later (all bundle licenses already chosen to permit it).
+- Tier B (schema-per-tenant) / Tier C (db-per-tenant) escalation — retained in code, not exercised.

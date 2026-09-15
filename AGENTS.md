@@ -54,3 +54,82 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - **CSP pitfall**: default helmet CSP sets `script-src-attr 'none'` which silently blocks all inline `onclick=` handlers ā€” buttons look fine but never fire. The BFF now sets an explicit CSP allowing `scriptSrcAttr: 'unsafe-inline'` and `scriptSrc: 'self' + cdn.jsdelivr.net` (for echarts).
 - **TDZ pitfall**: calling `loadLiveData()` at the top of app.js threw a silent ReferenceError because it reads `let currentTenant` declared later ā€” the catch fell back to static data so it looked fine. Initial load must run at the END of app.js.
 - **Docker-in-docker networking**: start dockerd WITHOUT `--iptables=false` (breaks embedded DNS at 127.0.0.11 ā†’ inter-container name resolution fails with EAI_AGAIN). Build images with `docker build --network=host` to bypass buildkit DNS issues reaching npmjs.
+
+## Productization rebuild (see docs/implementation_plan.md)
+- **Auth**: Supabase Auth JWTs (ES256, `jose`, JWKS) verified in the BFF; tenant/company/role come from `app_metadata` (service-role-key-writable only). Production boots fail fast without `SUPABASE_URL`; dev header mode requires explicit `BFF_ALLOW_DEV_AUTH=1`.
+- **RLS policy TO-matching follows MEMBERSHIP, not inheritance** (uses `has_privs_of_role`): `GRANT app_customer TO app_role` + `ALTER ROLE app_role NOINHERIT` still applies the customer restrictive policy to every staff session (verified: staff count 7->0 via EXPLAIN's policy filter). Fix: NO memberships - one pg Pool per login role (`app_role` staff, `app_customer` portal, `app_readonly` future text-to-SQL); customer token without customer pool = 503, never staff fallback. Pinned by `apps/bff/test/auth.test.js` + live-DB matrix.
+- **Restrictive policies AND with permissive ones**: customer company isolation is `AS RESTRICTIVE FOR SELECT TO app_customer USING (customer = app.current_company())` - tenant INTERSECT company, not OR. Fail-closed when the company GUC is unset.
+- **Migrations** go through `infra/scripts/migrate.sh` (numbered SQL + `app.schema_migrations` tracking); init-script-on-fresh-volume semantics no longer apply. 001/002 are the original tenancy files, 003 adds roles/policies/profiles/audit_logs.
+- **Supabase**: use the SESSION pooler (transaction pooler breaks session-level `set_config`; direct conn is IPv6-only). Pool `max: 5`. **node-pg needs `ssl:{rejectUnauthorized:false}` for Supabase pooler DSNs** — psql/libpq negotiates TLS automatically, node-pg does not, and a plaintext connection to the pooler hangs forever (no error). Automatic RLS on (safety net; our migrations ENABLE+FORCE explicitly anyway). Custom-role pooler usernames are `role.PROJECT_REF`.
+- **Live e2e auth test**: `cd apps/bff && node test/e2e.live.mjs` — boots the BFF against the real Supabase project from `.env`, logs in the three test users (staff.rt/staff.lex/cust.ceat `@test.dev`, created via the Auth Admin API with app_metadata claims), and asserts cross-tenant + company isolation + all 401 fail-closed paths. Not part of `npm test` (needs live env).
+- **Unit tests**: `cd apps/bff && npm test` (36) / `cd apps/ai && npm test` (17), node built-in runner.
+
+## Productization progress (Phase 3, 2026-09-08)
+- Done + live-verified (ALL PASS via `node apps/web/scripts/verify-session.js` against live Supabase): Dashboard (CRM KPIs + pipeline-by-stage chart), CRM screens + Tasks (activities type=task view), global Search (CRM + vertical legs), AI Assistant (SSE via same-origin Next route-handler proxy `/api/ai/chat/stream`), Insights (+ on-demand regenerate), AI usage, customer Portal. Remaining Phase 3: template module screens, screen-config/theme editors, Users & Invites, vendor Tenants screen, preview parity + deletion.
+
+## Key learnings (productization, addendum)
+- **JS `String.replace` treats `$'`, `$&`, `` $` `` in the REPLACEMENT string specially** — replacement text containing e.g. SQL `worth $'||coalesce(...)` silently expands to "everything after the match", duplicating the file tail. For code patching always use `src.split(old).join(new)` or `.replace(old, () => new)` (literal). This bit both hand-rolled patchers and edit tooling.
+- **AI is dual-domain**: generic-CRM tools (search_crm / get_crm_kpi / suggest_crm_chart) always run; rubber-vertical tools run only when the tenant's vertical tables hold rows (`hasVerticalData` RLS-scoped probe, 60s cache — no app.tenants grant needed). Chart intents for stage/company/source (or CRM-only tenants) route to `suggest_crm_chart`. Insights: CRM lines for every tenant, vertical lines appended only when vertical data exists.
+- **Customer tokens are portal-scoped in the BFF preHandler (JWT mode)**: 403 on everything except `/portal/overview` and GET on the app_customer-granted, RESTRICTIVE-company-policy read routes (`/data/(orders|issues|parties)`, `/data/crm/(companies|contacts|leads|deals|activities)`). The AI proxy must NEVER serve customers — the AI service queries at tenant scope with no company GUC.
+- **`/portal/overview` uses the verified token's `companyId` claim** (JWT mode); the `x-customer` header is dev-mode-only.
+- **AI service needs the Supabase pooler DSN + TLS** like the BFF (`SUPABASE_DB_SESSION_POOLER_URL`, `ssl: { rejectUnauthorized: false }`) — see `apps/ai/src/index.js`.
+- **`./scripts/dev.sh` now supervises the AI service too** (port 5000) alongside BFF (4000) and Next (3000); without it the Assistant/Insights screens are dead endpoints.
+
+## Phase 3 close (2026-09-09)
+- `preview/` DELETED — apps/web is the only UI. CSP tightened accordingly (script-src 'self', script-src-attr 'none'; jsdelivr/unsafe-inline gone). Unported legacy demo screens (Doc Tools, Doc Checker) keep their BFF/AI endpoints; port on demand.
+```- Attendance (hr_events — mind the reserved-word "leave" column) and Checklists (active checklist_json) screens added; /data/attendance is new, /data/checklists existed.
+- Demo users in live Supabase: staff.rt/staff.lex (staff), cust.ceat (customer, company CEAT), vendor@test.dev (vendor — created via admin API; the invite flow only grants staff/customer). All have profiles rows now.
+- psql "$SUPABASE_DB_SESSION_POOLER_URL" works from the sandbox; set app.tenant_id per session or RLS hides everything.
+
+## Phase 4 (2026-09-09)
+- Text-to-SQL live: `/ai/chat` accepts `sql: SELECT ...`; runs on the `app_readonly` pool (SELECT-only grants, tenant-isolation RLS TO PUBLIC — fail-closed without the GUC, statement timeout). validateSql rejects multi-statement/mutation/forbidden keywords BEFORE the pool. Mutation attempts verified rejected live.
+- Conversation memory: migration 007 (ai_chat_sessions/ai_chat_messages, RLS) — the in-process session Map is gone; loadMemory/saveTurn persist turns + tool names + chart intents. Chart refinement survives service restarts (live-verified). Memory errors degrade to no-history, never break chat.
+- AI SDK v5 + real embeddings: deferred pending a provider key (OPENROUTER/NIM).
+
+## Phase 4 complete (2026-09-09, Cloudflare Workers AI)
+- Provider: `AI_PROVIDER=cloudflare` — qwen3.8-27b via the OpenAI-compatible endpoint (`/accounts/{id}/ai/v1`) routed through the AI Gateway (`cf-aig-gateway-id` header + per-tenant `cf-aig-metadata`); bge-base-en-v1.5 (768-d) embeddings via `/ai/run/{model}` (batch).
+- **ai SDK version pairing matters**: `ai@7` + `@ai-sdk/openai-compatible@3` (same spec). Mixing ai@5 with provider@3 fails with "Unsupported model version v4". In ai@7: `maxSteps` is GONE — use `stopWhen: stepCountIs(n)` (default stops at 1 step!); text deltas are `part.text` (not textDelta); usage is `.inputTokens`/`.outputTokens`.
+- **qwen3.8-27b is a reasoning model**: emits reasoning-* parts before text; with tools it may burn the whole step budget on retries — the routes synthesize a grounded fallback from tool observations when no final text arrives, so the user never gets silence.
+- Latent bug fixed: vertical suggest_chart mapped `type`/`category` dims onto records (no such columns) — now a per-dimension SPECS map (category→tickets) and both chart blocks are guarded (chart failure never 500s chat).
+- `.env` gotcha: AI_PROVIDER must exist as a line — an unset var silently means the `local` provider even when all CLOUDFLARE_* keys are present. Restart the whole dev.sh watchdog (it caches .env from ITS start time) after env changes.
+
+## Phase 5 (2026-09-10, predictions)
+- apps/predictions: FastAPI in a uv venv (python3.12 — pip needs a venv, PEP 668). dev.sh supervises :5100 with a health check. Connects as app_role via the session pooler with set_config(app.tenant_id) per connection (RLS boundary).
+- Forecaster: damped-trend Holt ETS (statsmodels) — deliberately NOT trend-ARIMA: a single outlying month made ARIMA extrapolate ~4x the level. Chronos-Bolt (AutoGluon) is opt-in via PREDICTIONS_USE_CHRONOS=1 (downloaded into the venv but unverified in this environment).
+- Migration 008: predictions table (RLS, app_role grants) + synthetic 24-month order history (ORD-HIST-* rows, idempotent) for the demo tenant. The series is a monthly AGGREGATE (~720 MT base).
+- Forecast flow: web Generate button -> /api/forecast proxy -> BFF POST /data/forecast -> predictions service (retrain + upsert) -> dashboard reads GET /data/forecast/:series; the assistant reads the stored row via the get_forecast tool (never fabricates).
+
+## Phase 6 (2026-09-11, BI isolation + Ask-the-data)
+- BI credentials are ISOLATED BY CONSTRUCTION: schema `bi` views hardcode `WHERE tenant_id = '<tenant>'` (NOT the app.tenant_id GUC — any session can SET that), and `bi_<tenant>` login roles get USAGE on `bi` + SELECT on their own views ONLY. A leaked BI credential cannot read another tenant even with GUC tampering (live-proven). Connect via pooler as `bi_<tenant>.<project_ref>`.
+- WrenAI (6 containers) cannot run in the 1.9GB dev sandbox; the dashboard "Ask the data" card is the plan-sanctioned fallback. Production path: per-tenant WrenAI project + connection profile on `bi_<tenant>` credentials, LLM = Cloudflare Workers AI OpenAI-compatible endpoint.
+- Long-held NON-STREAMING requests through the Next dev server get killed by the environment (connection severed mid-flight); the SSE streaming proxy is the reliable pattern — the AskDataCard streams via /api/ai/chat/stream.
+
+## Phase 6.5 (2026-09-11, agentic trust layer)
+- **The AI service holds NO DB credentials**: every DB touch is a named op in apps/bff/src/internal.js (op registry + /internal/sql), executed on the BFF pools with the tenant GUC set server-side from the validated x-tenant-id header; shared-secret auth via BFF_INTERNAL_TOKEN (timingSafeEqual with a length guard — it THROWS on length mismatch).
+- **staffQuery takes a req-SHAPED object** (reads .tenantId): passing a bare string nulls the GUC and RLS fails closed with 0 rows — silent, no error. Live verification is the only catcher; unit mocks ignore the shape.
+- **Suggestion accept whitelist is server-side** (SUGGESTION_TARGETS in bff/src/app.js): the agent can only queue suggestions; accept applies ONE whitelisted field through the staff pool + audit. The AI never writes CRM rows.
+- **agent_tasks leases**: claim = UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) with lease_expires_at; the dispatcher iterates tenants (tenants_all op) and claims per-tenant — tasks are RLS-scoped, there is no global view.
+- **Skills as markdown** (apps/ai/skills/*.md) load into the system prompt at boot (loadSkills()); tests cover the loader. The live model cited current values and refused a no-op proposal — the evidence rule holds with a real LLM.
+- **Sandbox traps re-confirmed**: JS template literals in patch scripts must escape \` and \${ (a raw newline inside a single-quoted JS string is a syntax error that kills the script silently); heredoc-to-file + line-splice surgery is the robust patch pattern. Long-held non-streaming Next requests still get killed — retry loops are mandatory for live checks.
+
+## Phase 7 (2026-09-11, observability)
+- **/metrics is AGGREGATE-ONLY** (BFF + AI, hand-rolled Prometheus text format, zero deps): never label metrics by tenant — a scrape surface must not leak identities. Route labels are router paths with ids normalized.
+- **/health/deep** is the uptime-monitor contract (db+ai+predictions + latencies). Tests for it assert STRUCTURE, not specific up/down values — live sandbox services make value-coupled tests flaky.
+- **PostHog is opt-in by construction**: capture() without POSTHOG_API_KEY makes no network call. Server-side events only (suggestion_accepted/rejected).
+- **Patch-script lesson**: an off-by-one in a findIndex anchor (L[i+3] vs L[i+2]) silently no-op'd twice while looking like the revert hazard — always print the located line number from the patch script, and prefer heredoc-to-file + `node file.cjs` so failures show in stderr.
+
+## Phase 6.7 + Phase 5 close (2026-09-13)
+- **Certified metrics**: metric_definitions (RLS, per-tenant); the same stored SQL runs via /data/metrics/:key/run AND the internal metric_run op — the number is identical on every surface. Drafts never run (404).
+- **Dashboard widgets pin the QUERY, not the data**: chart intents travel in the chat/stream chart payloads ({scope, dimension, metric, filter}); the dashboard re-runs them live via /data/chart. A stale screenshot is impossible by construction.
+- **Next.js relative-import depth for /api route files: COMPUTE IT** (path.relative) — manual ../ counting misfired three times; dynamic-route folders each add a level.
+- **Reasoning-model one-shot generation is high-variance**: the same prompt returns text in 8-32s standalone but can time out at 60s or return EMPTY text (reasoning-only parts) in-app. Pattern: hard steering ("answer immediately"), a retry on empty text, generous budget, and a deterministic fallback (commentary optional; lines always stored).
+- **uv venvs have NO pip module** — install with `uv pip install --python .venv/bin/python ...`.
+- **Patch-script lessons re-confirmed**: converting an object property to a standalone const leaves a stray trailing comma ("Unexpected token try" two lines later); always node --check after structural patches; heredoc-to-file + node file.cjs with stderr visible.
+- **Chronos in a 0.25-CPU sandbox**: package + torch install fine; HF weight download + torch inference hangs silently — timebox the attempt, verify on real hardware, never claim it.
+
+## Phase 8 (2026-09-14, metering + hardening)
+- **RLS with ZERO policies = deny-all for non-owners, SILENTLY**: the plans table had RLS enabled with no policy → app_role's SELECT grant was useless → the cap guard failed OPEN and /data/usage/summary returned null with no error. A grant is not visibility. Check relrowsecurity + pg_policies whenever a new table should be app_role-readable.
+- **Views run with OWNER privileges by default (GUC-independent, cross-tenant)**: set security_invoker = true on tenant-facing views (app.tenant_usage_24h) so they honor the caller's RLS + GUC.
+- **Cap guard fail-open on missing plan config is deliberate** (vendor config error must not brick tenants) — but the drill must set a REAL plan row to prove the block.
+- **app.tenants columns: id, label, template, tier, status, theme, created_at, plan_key** (NO name column) — restore scripts must copy label/template/tier when creating the registry row.
+- **Restore drills: quote every identifier** (hr_events has the reserved word `leave`), drop row ids (fresh bigserial), create the registry row FIRST (FK target), restore into a NEW tenant id never in place, verify per-table counts, self-clean.

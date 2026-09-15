@@ -4,23 +4,35 @@ import helmet from '@fastify/helmet'
 import multipart from '@fastify/multipart'
 import pg from 'pg'
 import * as XLSX from 'xlsx'
+import { createAuthVerifier } from './auth.js'
+import { registerCrmRoutes } from './crm.js'
+import { registerInternalRoutes, vChartSql, cChartSql } from './internal.js'
+import { incCounter, observeDuration, renderMetrics } from './metrics.js'
+import { capture } from './posthog.js'
+
+export { createAuthVerifier }
 
 // Build the BFF application with injected dependencies so it is testable
 // without a real Postgres or a listening socket. `pool` is the tenant-scoped
-// app_role pool; `adminPool` is the superuser pool used by the /tenants admin
-// endpoints; `aiServiceUrl` is where the AI service lives.
-export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } = {}) {
+// app_role pool; `customerPool` is the app_customer login-role pool for
+// customer-role requests (isolation boundary — see migration 003);
+// `adminPool` is the superuser pool used by the /tenants admin endpoints;
+// `aiServiceUrl` is where the AI service lives; `auth` is a Supabase
+// JWT verifier — when absent the BFF runs in explicit dev mode (x-tenant-id
+// header), which production boots never do (see src/index.js).
+export async function buildApp({ pool, customerPool, adminPool, readonlyPool, aiServiceUrl, predictionsServiceUrl, auth, logger = true } = {}) {
   const fastify = Fastify({ logger })
   const AI_SERVICE_URL = aiServiceUrl || 'http://localhost:5000'
+  const PREDICTIONS_SERVICE_URL = predictionsServiceUrl || 'http://localhost:5100'
 
   await fastify.register(cors, { origin: true })
-  // Preview SPA uses inline event handlers (onclick=...), so allow them in CSP.
+  // The preview SPA is gone: no inline event handlers and no CDN scripts are
+  // needed — the Next.js app is fully same-origin (BFF APIs only).
   await fastify.register(helmet, {
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", 'https://cdn.jsdelivr.net'],
-        scriptSrcAttr: ["'unsafe-inline'"],
+        scriptSrc: ["'self'"],
         styleSrc: ["'self'", 'https:', "'unsafe-inline'"],
         imgSrc: ["'self'", 'data:'],
         objectSrc: ["'none'"],
@@ -30,17 +42,163 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
   })
   await fastify.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } })
 
-  fastify.get('/health', async () => ({ ok: true, service: 'bff' }))
-
-  // Tenant-detection middleware.
-  // TODO: parse Directus JWT for real auth. For dev, x-tenant-id header selects the tenant.
-  fastify.addHook('preHandler', async (req) => {
-    req.tenantId = req.headers['x-tenant-id'] || 'rubbertrack'
+  // Auth hook — registered before any route so it covers every endpoint.
+  // JWT mode: tenant identity comes from the verified token only; the
+  // x-tenant-id header is ignored entirely. Dev mode (no verifier injected)
+  // keeps the legacy header behavior for local compose/preview runs.
+  const PUBLIC_PATHS = new Set(['/health', '/health/deep', '/metrics'])
+  // Internal gateway routes carry their own shared-secret token check; the
+  // JWT preHandler must not touch them (the AI service has no user token).
+  const INTERNAL_PREFIX = '/internal/'
+  fastify.addHook('preHandler', async (req, reply) => {
+    if (PUBLIC_PATHS.has(req.url.split('?')[0])) return
+    if (req.url.startsWith(INTERNAL_PREFIX)) return
+    if (!auth) {
+      req.tenantId = req.headers['x-tenant-id'] || 'rubbertrack'
+      return
+    }
+    const m = /^Bearer (.+)$/.exec(req.headers.authorization || '')
+    if (!m) return reply.code(401).send({ error: 'unauthorized' })
+    try {
+      req.auth = await auth.verify(m[1])
+      req.tenantId = req.auth.tenantId
+    } catch {
+      return reply.code(401).send({ error: 'unauthorized' })
+    }
+    // Customer tokens are portal-scoped: reads on the tables granted to
+    // app_customer (records/tickets/parties/companies/contacts/leads/deals/
+    // activities — each behind a RESTRICTIVE company policy, see migrations
+    // 003/004) plus the portal overview. Everything else (AI proxy, tenant
+    // registry, search, KPI, import/export, config, mutations) is staff
+    // territory — 403, never a silent pool fallback. The AI proxy especially:
+    // the AI service queries at tenant scope and knows nothing about company
+    // isolation.
+    if (req.auth.role === 'customer') {
+      const p = req.url.split('?')[0]
+      const allowed = p === '/portal/overview'
+        || (req.method === 'GET' && (
+          /^\/data\/(orders|issues|parties)$/.test(p)
+          || /^\/data\/crm\/(companies|contacts|leads|deals|activities)(\/.*)?$/.test(p)
+        ))
+      if (!allowed) return reply.code(403).send({ error: 'forbidden: customer role is portal-scoped' })
+    }
+    // The tenant registry is vendor territory: ordinary tenant staff get 403
+    // on /tenants* (their own branding is served by /data/theme instead).
+    if (req.auth.role !== 'vendor' && /^\/tenants/.test(req.url.split('?')[0])) {
+      return reply.code(403).send({ error: 'forbidden: tenant registry requires the vendor role' })
+    }
   })
 
-  const tenantQuery = makeTenantQuery(pool)
+  fastify.get('/health', async () => ({ ok: true, service: 'bff' }))
+
+  // ---- Phase 7 observability ----
+  // Aggregate request metrics (route + status + duration). No tenant data
+  // ever enters /metrics — a scrape must not leak identities.
+  fastify.addHook('onRequest', async (req) => { req._start = process.hrtime.bigint() })
+  fastify.addHook('onResponse', async (req, reply) => {
+    const secs = Number(process.hrtime.bigint() - (req._start || process.hrtime.bigint())) / 1e9
+    const route = req.routerPath || req.url.split('?')[0].replace(/[0-9a-f-]{8,}/g, ':id')
+    incCounter('http_requests_total', { route, status: String(reply.statusCode) })
+    observeDuration('http_request_duration_seconds', secs)
+  })
+
+  fastify.get('/metrics', async (_req, reply) => {
+    reply.header('content-type', 'text/plain; charset=utf-8')
+    return renderMetrics({ extra: { nodejs_heap_used_bytes: process.memoryUsage().heapUsed } })
+  })
+
+  // Deep health: the endpoint an uptime monitor (Uptime Kuma, Better Stack,
+  // SigNoz alerting) polls — one JSON answer for DB + AI + predictions.
+  fastify.get('/health/deep', async () => {
+    const checks = {}
+    const check = async (name, fn) => {
+      const t0 = Date.now()
+      try { await fn(); checks[name] = { status: 'up', latency_ms: Date.now() - t0 } }
+      catch (e) { checks[name] = { status: 'down', latency_ms: Date.now() - t0, error: String(e.message || e).slice(0, 120) } }
+    }
+    await Promise.all([
+      check('db', async () => { const r = await pool.query('SELECT 1 AS ok'); if (!r.rows.length) throw new Error('no rows') }),
+      check('ai', async () => { const res = await fetch(`${AI_SERVICE_URL}/health`, { signal: AbortSignal.timeout(3000) }); if (!res.ok) throw new Error(`HTTP ${res.status}`) }),
+      check('predictions', async () => { const res = await fetch(`${PREDICTIONS_SERVICE_URL}/health`, { signal: AbortSignal.timeout(3000) }); if (!res.ok) throw new Error(`HTTP ${res.status}`) }),
+    ])
+    const up = Object.values(checks).every((c) => c.status === 'up')
+    incCounter('health_checks_total', { status: up ? 'up' : 'down' })
+    return { status: up ? 'ok' : 'degraded', checks, uptime_seconds: Math.round(process.uptime()) }
+  })
+
+  const staffQuery = makeTenantQuery(pool)
+  const customerQuery = customerPool ? makeTenantQuery(customerPool) : null
+  // Customer requests run on the app_customer pool. Fail closed: a customer
+  // token without a configured customer pool is a config error (503), never a
+  // silent fallback to staff-level tenant scope.
+  const tenantQuery = (req, text, params = []) => {
+    if (req.auth?.role === 'customer') {
+      if (!customerQuery) {
+        const err = new Error('customer pool not configured')
+        err.statusCode = 503
+        throw err
+      }
+      return customerQuery(req, text, params)
+    }
+    return staffQuery(req, text, params)
+  }
+
+  // Audit trail: fire-and-forget on every CRM mutation; an audit failure must
+  // never fail the user's request.
+  const writeAudit = async (req, action, entity, entityId, detail = {}) => {
+    try {
+      await tenantQuery(req,
+        `INSERT INTO audit_logs (tenant_id, user_id, action, entity, entity_id, detail)
+         VALUES (app.current_tenant(), $1, $2, $3, $4, $5::jsonb)`,
+        [req.auth?.userId ?? null, action, entity, entityId, JSON.stringify(detail)])
+    } catch (e) {
+      fastify.log.warn({ err: e.message }, 'audit write failed')
+    }
+  }
+
+  registerCrmRoutes(fastify, { tenantQuery, writeAudit })
+
+  // ---- Internal gateway (Phase 6.5): named ops + guarded SQL for the AI service,
+  // ---- which holds no DB credentials. Model-written SQL runs on the app_readonly
+  // ---- pool behind validateSql; everything else is registry-only.
+  const runReadonly = async (tenantId, sql) => {
+    if (!readonlyPool) return { error: 'text-to-SQL is not configured (no readonly pool)' }
+    const client = await readonlyPool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query("SELECT set_config('app.tenant_id', $1, true)", [tenantId])
+      await client.query("SET LOCAL statement_timeout = '5s'")
+      const r = await client.query(sql)
+      await client.query('COMMIT')
+      return { rows: r.rows.slice(0, 50), rowCount: r.rowCount }
+    } catch (e) {
+      try { await client.query('ROLLBACK') } catch { /* already aborted */ }
+      return { error: `query failed: ${e.message.slice(0, 160)}` }
+    } finally {
+      client.release()
+    }
+  }
+  registerInternalRoutes(fastify, { staffQuery, runReadonly })
 
   // ---- Data endpoints (RLS-enforced) ----
+  // Module presence: the web nav shows the vertical (template) screens only
+  // when the tenant actually holds vertical rows — same probe logic as the
+  // AI service's hasVerticalData.
+  fastify.get('/data/modules', async (req) => {
+    const r = await tenantQuery(req, 'SELECT count(*)::int AS n FROM records')
+    return { vertical: r.rows[0].n > 0 }
+  })
+
+  fastify.get('/data/feed', async (req) => {
+    const r = await tenantQuery(req, 'SELECT category, title, description, priority, published_at FROM feed_items ORDER BY published_at DESC LIMIT 100')
+    return { feed: r.rows }
+  })
+
+  fastify.get('/data/attendance', async (req) => {
+    const r = await tenantQuery(req, 'SELECT id, employee, department, week, present, absent, late, "leave", created_at FROM hr_events ORDER BY week DESC, created_at DESC LIMIT 200')
+    return { attendance: r.rows }
+  })
+
   fastify.get('/data/dashboard', async (req) => {
     const records = await tenantQuery(req, 'SELECT order_id, customer, supplier, grade, mt, fcl, price_usd, status FROM records ORDER BY created_at DESC')
     const kpi = await tenantQuery(req, `SELECT
@@ -66,6 +224,12 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
   })
 
   fastify.get('/data/parties', async (req) => {
+    // ?full=1 returns row objects (web tables); the default name-list shape
+    // stays for the legacy preview SPA.
+    if (req.query.full === '1' || req.query.full === 'true') {
+      const r = await tenantQuery(req, "SELECT name, type, contact, tags FROM parties ORDER BY name")
+      return { parties: r.rows }
+    }
     const sup = await tenantQuery(req, "SELECT name FROM parties WHERE type='supplier' ORDER BY name")
     const cus = await tenantQuery(req, "SELECT name FROM parties WHERE type='customer' ORDER BY name")
     return { suppliers: sup.rows.map(r => r.name), customers: cus.rows.map(r => r.name) }
@@ -109,17 +273,28 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
   // against records (or any other table), so screen_configs charts need no new code.
   // ?dimension=grade&metric=mt&table=records&group_by=month&time_range=6
   fastify.get('/data/kpi/chart', async (req, reply) => {
-    const TABLES = { records: 'records', tickets: 'tickets', parties: 'parties', feed_items: 'feed_items' }
-    const DIMS = { grade: 'grade', customer: 'customer', supplier: 'supplier', status: 'status', category: 'category', type: 'type', month: "to_char(date_trunc('month', date), 'YYYY-MM')" }
-    const METRICS = { mt: 'sum(mt)', fcl: 'sum(fcl)', count: 'count(*)', revenue: 'sum(mt*price_usd)', avg_price: 'avg(price_usd)' }
-    const table = TABLES[req.query.table] || 'records'
-    const dim = DIMS[req.query.dimension]; const met = METRICS[req.query.metric]
-    if (!dim || !met) return reply.code(400).send({ error: 'bad dimension/metric', tables: Object.keys(TABLES), dims: Object.keys(DIMS), metrics: Object.keys(METRICS) })
+    // Allowlisted dims/metrics per table (the 400 response echoes them so the
+    // chart builder is self-documenting). CRM tables ship alongside the
+    // rubber-vertical ones so config-driven charts cover the generic CRM.
+    const TABLES = {
+      records: { time: "date", dims: { grade: "grade", customer: "customer", supplier: "supplier", status: "status", month: "to_char(date_trunc('month', date), 'YYYY-MM')" }, metrics: { mt: "sum(mt)", fcl: "sum(fcl)", count: "count(*)", revenue: "sum(mt*price_usd)", avg_price: "avg(price_usd)" } },
+      tickets: { time: null, dims: { category: "category", status: "status" }, metrics: { count: "count(*)" } },
+      parties: { time: null, dims: { type: "type" }, metrics: { count: "count(*)" } },
+      feed_items: { time: null, dims: { category: "category" }, metrics: { count: "count(*)" } },
+      companies: { time: null, dims: { type: "type", industry: "industry", status: "status" }, metrics: { count: "count(*)" } },
+      contacts: { time: null, dims: { status: "status" }, metrics: { count: "count(*)" } },
+      leads: { time: null, dims: { status: "status", source: "source" }, metrics: { count: "count(*)", value: "sum(value)" } },
+      deals: { time: null, dims: { stage: "stage", status: "status", company: "coalesce((SELECT c.name FROM companies c WHERE c.id = deals.company_id), 'n/a')", month: "to_char(date_trunc('month', coalesce(deals.expected_close_date, deals.created_at)), 'YYYY-MM')" }, metrics: { count: 'count(*)', value: 'sum(value)', avg_value: 'avg(value)' } },
+      activities: { time: null, dims: { type: "type", entity: "entity" }, metrics: { count: "count(*)" } },
+    }
+    const spec = TABLES[req.query.table] || TABLES.records
+    const dim = spec.dims[req.query.dimension]; const met = spec.metrics[req.query.metric]
+    if (!dim || !met) return reply.code(400).send({ error: 'bad dimension/metric', tables: Object.keys(TABLES), dims: Object.keys(spec.dims), metrics: Object.keys(spec.metrics) })
     let where = '', params = []
     const months = Math.min(parseInt(req.query.time_range || '0', 10), 36)
-    if (months > 0 && table === 'records') { where = `WHERE date >= date_trunc('month', current_date) - $1::interval`; params = [`${months} months`] }
-    const r = await tenantQuery(req, `SELECT ${dim} AS label, ${met}::float AS value FROM ${table} ${where} GROUP BY 1 ORDER BY ${req.query.dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 30`, params)
-    return { table, dimension: req.query.dimension, metric: req.query.metric, group_by: req.query.group_by || null, time_range: months || null, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) }
+    if (months > 0 && spec.time) { where = `WHERE ${spec.time} >= date_trunc('month', current_date) - $1::interval`; params = [`${months} months`] }
+    const r = await tenantQuery(req, `SELECT ${dim} AS label, ${met}::float AS value FROM ${req.query.table && TABLES[req.query.table] ? req.query.table : 'records'} ${where} GROUP BY 1 ORDER BY ${req.query.dimension === 'month' ? '1 ASC' : '2 DESC'} LIMIT 30`, params)
+    return { table: req.query.table && TABLES[req.query.table] ? req.query.table : 'records', dimension: req.query.dimension, metric: req.query.metric, group_by: req.query.group_by || null, time_range: months || null, labels: r.rows.map(x => x.label), values: r.rows.map(x => x.value) }
   })
 
   // ---- Real-time KPI stream (SSE) — pushes fresh KPI snapshots every N seconds ----
@@ -154,9 +329,9 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
   // the caller passes ?embedding=[...] (ai-service supplies query vectors). All RLS-scoped.
   fastify.get('/search', async (req) => {
     const q = (req.query.q || '').trim()
-    if (!q) return { q, records: [], parties: [], tickets: [], feed: [], semantic: [] }
+    if (!q) return { q, records: [], parties: [], tickets: [], feed: [], crm: { companies: [], contacts: [], leads: [], deals: [], activities: [] }, semantic: [] }
     const like = `%${q}%`
-    const [records, parties, tickets, feed] = await Promise.all([
+    const [records, parties, tickets, feed, companies, contacts, leads, deals, activities] = await Promise.all([
       tenantQuery(req, `
         SELECT order_id, customer, supplier, grade, mt, status,
           ts_rank(to_tsvector('english', coalesce(order_id,'')||' '||coalesce(customer,'')||' '||coalesce(supplier,'')||' '||coalesce(grade,'')), plainto_tsquery('english', $1)) AS rank
@@ -179,6 +354,11 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
         FROM feed_items
         WHERE title ILIKE $1 OR description ILIKE $1 OR category ILIKE $1
         LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, name, type FROM companies WHERE name ILIKE $1 OR coalesce(industry,'') ILIKE $1 LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, full_name, title FROM contacts WHERE full_name ILIKE $1 OR coalesce(email,'') ILIKE $1 LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, name, coalesce(company_name,'') AS company_name, value, status FROM leads WHERE name ILIKE $1 OR coalesce(company_name,'') ILIKE $1 LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, name, stage, value, status FROM deals WHERE name ILIKE $1 LIMIT 10`, [like]),
+      tenantQuery(req, `SELECT id, subject, type FROM activities WHERE subject ILIKE $1 OR coalesce(detail,'') ILIKE $1 LIMIT 10`, [like]),
     ])
     // Optional semantic leg: if the client supplies a query embedding, rank the
     // tenant's embeddings by cosine distance. (Empty table → empty result, safe.)
@@ -193,19 +373,26 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
         semantic = r.rows
       } catch { semantic = [] }
     }
-    return { q, records: records.rows, parties: parties.rows, tickets: tickets.rows, feed: feed.rows, semantic }
+    const crm = { companies: companies.rows, contacts: contacts.rows, leads: leads.rows, deals: deals.rows, activities: activities.rows }
+    return { q, records: records.rows, parties: parties.rows, tickets: tickets.rows, feed: feed.rows, crm, semantic }
   })
 
   // ---- Excel/CSV import & export (tenant-scoped via RLS) ----
-  const IMPORTABLE = ['records', 'parties', 'tickets', 'feed_items']
+  const IMPORTABLE = ['records', 'parties', 'tickets', 'feed_items',
+    'companies', 'contacts', 'leads', 'deals', 'activities']
   const EXPORT_FIELDS = {
     records: ['order_id', 'date', 'customer', 'supplier', 'grade', 'mt', 'fcl', 'price_usd', 'status'],
     parties: ['name', 'type', 'contact', 'tags'],
     tickets: ['ticket_id', 'customer', 'supplier', 'category', 'status', 'description'],
     feed_items: ['category', 'title', 'description', 'priority', 'published_at'],
+    companies: ['name', 'type', 'industry', 'website', 'phone', 'email', 'address', 'notes', 'status'],
+    contacts: ['company_id', 'full_name', 'first_name', 'last_name', 'title', 'email', 'phone', 'mobile', 'linkedin', 'status'],
+    leads: ['name', 'company_name', 'contact_name', 'email', 'phone', 'source', 'value', 'status'],
+    deals: ['name', 'company_id', 'contact_id', 'lead_id', 'stage', 'value', 'currency', 'expected_close_date', 'probability', 'status'],
+    activities: ['type', 'subject', 'detail', 'entity', 'entity_id', 'due_at', 'completed', 'user_id'],
   }
 
-  // Export a collection to xlsx. ?type=records|parties|tickets|feed_items
+  // Export a collection to xlsx. ?type=records|parties|tickets|feed_items|companies|contacts|leads|deals|activities
   fastify.get('/data/export', async (req, reply) => {
     const type = (req.query.type || 'records')
     if (!IMPORTABLE.includes(type)) return reply.code(400).send({ error: 'unsupported type' })
@@ -248,6 +435,7 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
   }).join(',')
     const sql = `INSERT INTO ${type} (${cols.join(',')}) VALUES ${placeholders}`
     await tenantQuery(req, sql, values)
+    await writeAudit(req, 'import', type, null, { count: rows.length })
     return { imported: rows.length, type }
   })
 
@@ -343,6 +531,70 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
     return { escalated: true, id, fromTier, toTier, isolation: toTier === 'B' ? `tenant_${id} schema` : `tenant_${id} database` }
   })
 
+  // ---- Users & invites (tenant-scoped) ----
+  // Profiles live in Postgres (RLS tenant_isolation, migration 003); creating
+  // auth users needs the Supabase service role — this is the only place that
+  // key ever reaches, and it never leaves the server.
+  fastify.get('/users', async (req) => {
+    const r = await tenantQuery(req, 'SELECT id, role, company_id, display_name, created_at FROM profiles ORDER BY created_at')
+    return { users: r.rows }
+  })
+
+  fastify.post('/users/invite', async (req, reply) => {
+    const { email, role = 'staff', companyId = null, displayName = null } = req.body || {}
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(email))) return reply.code(400).send({ error: 'valid email required' })
+    if (!['staff', 'customer'].includes(role)) return reply.code(400).send({ error: 'role must be staff or customer' })
+    if (role === 'customer' && !companyId) return reply.code(400).send({ error: 'customer invites need a companyId' })
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+    const base = process.env.SUPABASE_URL
+    if (!key || !base) return reply.code(503).send({ error: 'invites are not configured (missing service key)' })
+    const create = await fetch(`${base}/auth/v1/admin/users`, {
+      method: 'POST',
+      headers: { apikey: key, authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ email, app_metadata: { tenant_id: req.tenantId, role, company_id: companyId }, email_confirm: true }),
+    })
+    if (create.status === 422) return reply.code(409).send({ error: 'a user with this email already exists' })
+    if (!create.ok) {
+      fastify.log.warn({ status: create.status }, 'admin createUser failed')
+      return reply.code(502).send({ error: 'identity provider rejected the invite' })
+    }
+    const user = await create.json()
+    // Recovery link = the invitee sets their own password on first use (no
+    // email infrastructure in the loop yet).
+    let inviteUrl = null
+    try {
+      const link = await fetch(`${base}/auth/v1/admin/generate_link`, {
+        method: 'POST',
+        headers: { apikey: key, authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'recovery', email }),
+      })
+      if (link.ok) inviteUrl = (await link.json()).action_link || null
+    } catch { /* user exists; the link is a convenience, not a hard requirement */ }
+    await tenantQuery(req,
+      `INSERT INTO profiles (id, tenant_id, company_id, role, display_name) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET role=EXCLUDED.role, company_id=EXCLUDED.company_id, display_name=EXCLUDED.display_name`,
+      [user.id, req.tenantId, companyId, role, displayName])
+    await writeAudit(req, 'invite', 'profiles', user.id, { email, role })
+    return reply.code(201).send({ user: { id: user.id, email: user.email || email }, invite_url: inviteUrl })
+  })
+
+  // Per-tenant branding, self-scoped: staff and vendors read/write their own
+  // tenant's theme. The /tenants/:id/theme routes stay for vendor tooling.
+  fastify.get('/data/theme', async (req) => {
+    const r = await adminPool.query('SELECT theme, label FROM app.tenants WHERE id=$1', [req.tenantId])
+    if (!r.rows.length) return { tenant: req.tenantId, label: null, theme: {} }
+    return { tenant: req.tenantId, label: r.rows[0].label, theme: r.rows[0].theme || {} }
+  })
+
+  fastify.put('/data/theme', async (req, reply) => {
+    const { theme } = req.body || {}
+    if (!theme || typeof theme !== 'object' || Array.isArray(theme)) return reply.code(400).send({ error: 'theme object required' })
+    const r = await adminPool.query('UPDATE app.tenants SET theme=$1 WHERE id=$2 RETURNING theme, label', [JSON.stringify(theme), req.tenantId])
+    if (!r.rows.length) return reply.code(404).send({ error: 'tenant not found' })
+    await writeAudit(req, 'update', 'app.tenants', null, { keys: Object.keys(theme) })
+    return { tenant: req.tenantId, label: r.rows[0].label, theme: r.rows[0].theme }
+  })
+
   // Per-tenant branding (Phase 5a) — read/update the theme JSON stored in app.tenants.
   fastify.get('/tenants/:id/theme', async (req, reply) => {
     const { id } = req.params
@@ -364,7 +616,9 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
   // orders + issues within the tenant. Uses app_role + RLS (tenant) + a customer
   // filter (row-level scoping beyond RLS).
   fastify.get('/portal/overview', async (req) => {
-    const customer = req.headers['x-customer']
+    // JWT mode: the verified token's company claim is the only accepted source.
+    // The x-customer header remains for explicit dev mode (compose/preview).
+    const customer = req.auth?.companyId || req.headers['x-customer']
     if (!customer) return { error: 'x-customer header required' }
     const orders = await tenantQuery(req, 'SELECT order_id, grade, mt, fcl, price_usd, status, date FROM records WHERE customer=$1 ORDER BY date DESC', [customer])
     const issues = await tenantQuery(req, 'SELECT ticket_id, category, status, description FROM tickets WHERE customer=$1 ORDER BY created_at DESC', [customer])
@@ -387,8 +641,195 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
     return dump
   })
 
+  // ---- Phase 6.7: certified metrics registry (the governed semantic layer) ----
+  // Each certified metric is defined once; assistant, dashboards and KPI
+  // cards all execute the same stored SQL through the staff pool (RLS).
+  fastify.get('/data/metrics', async (req) => {
+    const r = await tenantQuery(req, `SELECT key, label, description, unit FROM metric_definitions WHERE status='certified' ORDER BY key`)
+    return { metrics: r.rows }
+  })
+
+  fastify.post('/data/metrics/:key/run', async (req, reply) => {
+    const { key } = req.params
+    const r = await tenantQuery(req, `SELECT sql FROM metric_definitions WHERE key=$1 AND status='certified'`, [key])
+    if (!r.rows.length) return reply.code(404).send({ error: 'unknown or non-certified metric' })
+    const out = await tenantQuery(req, r.rows[0].sql)
+    return { key, value: out.rows[0]?.value ?? null }
+  })
+
+  // ---- Phase 5 completion: win-probability (deal outcome prediction) ----
+  fastify.post('/data/win-probability', async (req, reply) => {
+    const res = await fetch(`${PREDICTIONS_SERVICE_URL}/win-probability`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
+      body: JSON.stringify(req.body || {}),
+    })
+    reply.code(res.status)
+    reply.send(await res.text())
+  })
+
+  fastify.get('/data/win-probability/model', async (req, reply) => {
+    const res = await fetch(`${PREDICTIONS_SERVICE_URL}/win-probability/model`, {
+      headers: { 'x-tenant-id': req.tenantId },
+    })
+    reply.code(res.status)
+    reply.send(await res.text())
+  })
+  // ---- Phase 6.7: self-serve dashboard (pin the QUERY, never rendered data) ----
+  const CHART_SCOPES = { crm: cChartSql, vertical: vChartSql }
+  fastify.post('/data/chart', async (req, reply) => {
+    const { scope = 'crm', dimension, metric = 'count', filter } = req.body || {}
+    const build = CHART_SCOPES[scope]
+    if (!build || !dimension) return reply.code(400).send({ error: 'scope (crm|vertical) and dimension required' })
+    const { text, params } = build({ dimension, metric, filter })
+    const r = await tenantQuery(req, text, params)
+    return { labels: r.rows.map((x) => x.label), values: r.rows.map((x) => x.value) }
+  })
+
+  fastify.get('/data/dashboard-widgets', async (req) => {
+    const r = await tenantQuery(req,
+      `SELECT id, position, spec FROM dashboard_widgets WHERE user_id IS NOT DISTINCT FROM $1 ORDER BY position, id`,
+      [req.auth?.userId ?? null])
+    return { widgets: r.rows }
+  })
+
+  fastify.post('/data/dashboard-widgets', async (req, reply) => {
+    const { spec } = req.body || {}
+    if (!spec || typeof spec !== 'object') return reply.code(400).send({ error: 'spec required' })
+    const CHART_TYPES = new Set(['bar', 'line'])
+    if (spec.source === 'metric') {
+      if (!spec.metricKey || typeof spec.metricKey !== 'string') return reply.code(400).send({ error: 'metricKey required' })
+    } else if (spec.source === 'chart') {
+      if (!spec.dimension || !spec.metric || !CHART_TYPES.has(spec.chartType)) {
+        return reply.code(400).send({ error: 'dimension, metric and chartType (bar|line) required' })
+      }
+    } else return reply.code(400).send({ error: 'spec.source must be metric or chart' })
+    const pos = await tenantQuery(req,
+      `SELECT coalesce(max(position),0)+1 AS next FROM dashboard_widgets WHERE user_id IS NOT DISTINCT FROM $1`,
+      [req.auth?.userId ?? null])
+    const r = await tenantQuery(req,
+      `INSERT INTO dashboard_widgets (tenant_id, user_id, position, spec) VALUES (app.current_tenant(), $1, $2, $3::jsonb) RETURNING id, position, spec`,
+      [req.auth?.userId ?? null, pos.rows[0].next, JSON.stringify(spec)])
+    return r.rows[0]
+  })
+
+  fastify.patch('/data/dashboard-widgets/:id', async (req, reply) => {
+    const { position } = req.body || {}
+    if (typeof position !== 'number') return reply.code(400).send({ error: 'position (number) required' })
+    const r = await tenantQuery(req,
+      `UPDATE dashboard_widgets SET position=$1 WHERE id=$2 AND user_id IS NOT DISTINCT FROM $3 RETURNING id`,
+      [position, req.params.id, req.auth?.userId ?? null])
+    if (!r.rows.length) return reply.code(404).send({ error: 'widget not found' })
+    return { ok: true }
+  })
+
+  fastify.delete('/data/dashboard-widgets/:id', async (req, reply) => {
+    const r = await tenantQuery(req,
+      `DELETE FROM dashboard_widgets WHERE id=$1 AND user_id IS NOT DISTINCT FROM $2 RETURNING id`,
+      [req.params.id, req.auth?.userId ?? null])
+    if (!r.rows.length) return reply.code(404).send({ error: 'widget not found' })
+    return { ok: true }
+  })
+
+  // ---- Phase 6.5: suggestions (human settlement of AI-proposed changes) ----
+  // Accept applies ONE whitelisted field through the staff pool (RLS); the
+  // agent itself can never write. Reject only marks. Table/field names come
+  // from this server-side whitelist — suggestion rows only index into it.
+  const SUGGESTION_TARGETS = {
+    company: { table: 'companies', fields: new Set(['name', 'type', 'industry', 'website', 'phone', 'email', 'address', 'notes', 'status']) },
+    contact: { table: 'contacts', fields: new Set(['full_name', 'first_name', 'last_name', 'title', 'email', 'phone', 'mobile', 'linkedin', 'status']) },
+    lead: { table: 'leads', fields: new Set(['name', 'company_name', 'contact_name', 'email', 'phone', 'source', 'value', 'status']) },
+    deal: { table: 'deals', fields: new Set(['name', 'stage', 'status', 'value', 'probability', 'currency']) },
+  }
+
+  fastify.get('/data/suggestions', async (req) => {
+    const r = await tenantQuery(req,
+      `SELECT id, entity_type, entity_id, field, current_value, proposed_value, evidence, status, resolved_at, created_at
+       FROM ai_suggestions ORDER BY (status='pending') DESC, created_at DESC LIMIT 100`)
+    return { suggestions: r.rows }
+  })
+
+  fastify.post('/data/suggestions/:id/resolve', async (req, reply) => {
+    const { id } = req.params
+    const { action } = req.body || {}
+    if (!['accept', 'reject'].includes(action)) return reply.code(400).send({ error: 'action must be accept or reject' })
+    const found = await tenantQuery(req, `SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions WHERE id=$1`, [id])
+    const sug = found.rows[0]
+    if (!sug) return reply.code(404).send({ error: 'suggestion not found' })
+    if (sug.status !== 'pending') return reply.code(409).send({ error: `suggestion already ${sug.status}` })
+    if (action === 'accept') {
+      const target = SUGGESTION_TARGETS[sug.entity_type]
+      if (!target || !target.fields.has(sug.field)) return reply.code(400).send({ error: `unsupported target: ${sug.entity_type}.${sug.field}` })
+      const upd = await tenantQuery(req,
+        `UPDATE ${target.table} SET ${sug.field} = $1 WHERE id = $2 RETURNING id`, [sug.proposed_value, sug.entity_id])
+      if (!upd.rows.length) return reply.code(404).send({ error: 'target record not found in this tenant' })
+      await writeAudit(req, 'suggestion_accept', target.table, String(sug.entity_id), { suggestion_id: id, field: sug.field, value: sug.proposed_value })
+      capture(req.auth?.userId || 'anonymous', 'suggestion_accepted', { entity_type: sug.entity_type, field: sug.field })
+    } else {
+      await writeAudit(req, 'suggestion_reject', 'ai_suggestions', String(id), {})
+      capture(req.auth?.userId || 'anonymous', 'suggestion_rejected', { entity_type: sug.entity_type, field: sug.field })
+    }
+    await tenantQuery(req,
+      `UPDATE ai_suggestions SET status=$1, resolved_at=now(), resolved_by=$2 WHERE id=$3`,
+      [action === 'accept' ? 'accepted' : 'rejected', req.auth?.userId ?? null, id])
+    return { id, status: action === 'accept' ? 'accepted' : 'rejected' }
+  })
+
+  // The tenant's durable agent task queue (scheduled by the assistant or API).
+  fastify.get('/data/agent-tasks', async (req) => {
+    const r = await tenantQuery(req,
+      `SELECT id, task_type, payload, status, due_at, attempts, result, error, created_at, updated_at
+       FROM agent_tasks ORDER BY (status='pending') DESC, created_at DESC LIMIT 50`)
+    return { tasks: r.rows }
+  })
+
+  // ---- Predictions (Phase 5): proxy the forecast job, read stored forecasts ----
+  fastify.post('/data/forecast', async (req, reply) => {
+    const res = await fetch(`${PREDICTIONS_SERVICE_URL}/forecast`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
+      body: JSON.stringify(req.body || {}),
+    })
+    reply.code(res.status)
+    reply.send(await res.text())
+  })
+
+  fastify.get('/data/forecast/:series', async (req) => {
+    const r = await tenantQuery(req,
+      'SELECT series, model, horizon, history, forecast, generated_at FROM predictions WHERE series = $1',
+      [req.params.series])
+    return { forecast: r.rows[0] || null }
+  })
+
+  // ---- Phase 8 metering: plan caps on rolling 24h AI tokens ----
+  // Enforced BEFORE forwarding to the AI service. Fails OPEN on missing plan
+  // config (a vendor config error must not brick tenants; usage stays visible
+  // on /data/usage/summary). Enforced per tenant via the staff pool + RLS.
+  async function aiCapExceeded(req) {
+    const r = await staffQuery(req, `SELECT p.name AS plan_name, p.ai_token_cap_24h AS cap,
+      (SELECT coalesce(sum(tokens_in + tokens_out), 0)::int FROM ai_usage_logs
+        WHERE created_at > now() - interval '24 hours') AS used
+      FROM app.tenants t JOIN plans p ON p.key = t.plan_key
+      WHERE t.id = app.current_tenant()`)
+    const row = r.rows[0]
+    if (!row) return null
+    if (row.used < row.cap) return null
+    return { error: 'plan limit reached — contact your account manager', plan: row.plan_name, used_24h: row.used, cap: row.cap }
+  }
+
+  fastify.get('/data/usage/summary', async (req) => {
+    const r = await staffQuery(req, `SELECT p.key AS plan_key, p.name AS plan_name, p.ai_token_cap_24h AS cap,
+      p.seats, p.price_usd, p.modules,
+      coalesce((SELECT tokens_24h FROM app.tenant_usage_24h WHERE tenant_id = app.current_tenant()), 0) AS used_24h,
+      coalesce((SELECT requests_24h FROM app.tenant_usage_24h WHERE tenant_id = app.current_tenant()), 0) AS requests_24h
+      FROM app.tenants t JOIN plans p ON p.key = t.plan_key WHERE t.id = app.current_tenant()`)
+    return r.rows[0] || { plan: null }
+  })
+
   // Proxy to AI service (approve the AI contexts)
   fastify.post('/ai/chat', async (req, reply) => {
+    const capped = await aiCapExceeded(req)
+    if (capped) return reply.code(429).send(capped)
     const res = await fetch(`${AI_SERVICE_URL}/chat`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
@@ -399,6 +840,8 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
 
   // Reindex the tenant's knowledge base (records/tickets/parties → embeddings).
   fastify.post('/ai/reindex', async (req, reply) => {
+    const capped = await aiCapExceeded(req)
+    if (capped) return reply.code(429).send(capped)
     const res = await fetch(`${AI_SERVICE_URL}/index`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
@@ -409,6 +852,8 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
 
   // Generate tenant insights (top customer/grade, issue mix, trend, totals).
   fastify.post('/ai/insights', async (req, reply) => {
+    const capped = await aiCapExceeded(req)
+    if (capped) return reply.code(429).send(capped)
     const res = await fetch(`${AI_SERVICE_URL}/insights`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
@@ -427,6 +872,8 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
 
   // Streaming chat (SSE) — passthrough the ai-service event stream.
   fastify.post('/ai/chat/stream', async (req, reply) => {
+    const capped = await aiCapExceeded(req)
+    if (capped) return reply.code(429).send(capped)
     const res = await fetch(`${AI_SERVICE_URL}/chat/stream`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-tenant-id': req.tenantId },
@@ -459,19 +906,29 @@ export async function buildApp({ pool, adminPool, aiServiceUrl, logger = true } 
 }
 
 // Helper: run a query scoped to the request's tenant via RLS.
+// Customer-role requests must arrive on the app_customer POOL (a separate login
+// role — see infra/migrations/003_auth_roles.sql for why SET ROLE/membership is
+// forbidden here). The company GUC drives the restrictive company policy.
 // Exported separately so tests can pin the connection-cleanup contract.
 export function makeTenantQuery(pool) {
   return async function tenantQuery(req, text, params = []) {
     const client = await pool.connect()
+    const isCustomer = req.auth?.role === 'customer'
     try {
       // is_local=false → session-level (persists across this connection's queries)
       await client.query("SELECT set_config('app.tenant_id', $1, false)", [req.tenantId])
+      if (isCustomer) {
+        await client.query("SELECT set_config('app.company_id', $1, false)", [req.auth.companyId])
+      }
       return await client.query(text, params)
     } finally {
       // Clear so a pooled connection can't leak a tenant into the next request.
       // RESET failures mean the connection itself is gone; still release so the
       // pool can discard it instead of leaking the client.
-      try { await client.query("RESET app.tenant_id") } catch { /* connection lost */ }
+      try {
+        if (isCustomer) await client.query('RESET app.company_id')
+        await client.query('RESET app.tenant_id')
+      } catch { /* connection lost */ }
       client.release()
     }
   }

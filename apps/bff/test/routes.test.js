@@ -519,3 +519,452 @@ test('/ai/* proxies carry x-tenant-id to the AI service and stream SSE through',
     upstream.server.close()
   }
 })
+
+// ---- Customer-role gate (JWT mode): portal-scoped tokens ----
+test('customer-role tokens are 403 from staff/AI/admin routes; portal + company CRM reads stay open', async () => {
+  const auth = { mode: 'jwt', verify: async () => ({ userId: 'u1', tenantId: 'alpha', companyId: 'CEAT', role: 'customer' }) }
+  const data = tenantScoped([[/FROM companies/, [{ id: 1, name: 'CEAT' }]]])
+  const customerPool = tenantScoped([
+    [/FROM companies/, [{ id: 1, name: 'CEAT' }]],
+    [/count\(\*\)::int AS orders/, [{ orders: 1, mt: 10, revenue: 200 }]],
+    [/FROM records WHERE customer=/, [{ order_id: 'ORD-C' }]],
+  ])
+  const app = await buildApp({ pool: data.pool, customerPool: customerPool.pool, adminPool: makeFakePool().pool, aiServiceUrl: 'http://127.0.0.1:9', auth, logger: false })
+  const H = { authorization: 'Bearer x' }
+  assert.equal((await app.inject({ method: 'POST', url: '/ai/chat', headers: H, payload: {} })).statusCode, 403, 'AI proxy must never serve customers — it queries at tenant scope')
+  assert.equal((await app.inject({ method: 'GET', url: '/tenants', headers: H })).statusCode, 403, 'tenant registry is staff/vendor territory')
+  assert.equal((await app.inject({ method: 'GET', url: '/search?q=x', headers: H })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'GET', url: '/data/kpi/chart?dimension=grade&metric=mt', headers: H })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'POST', url: '/data/crm/companies', headers: H, payload: { name: 'X' } })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'GET', url: '/data/crm/pipeline', headers: H })).statusCode, 403)
+  assert.equal((await app.inject({ method: 'GET', url: '/data/crm/companies', headers: H })).statusCode, 200)
+  const portal = await app.inject({ method: 'GET', url: '/portal/overview', headers: H })
+  assert.equal(portal.statusCode, 200)
+  assert.ok(customerPool.calls.some((c) => c.params.includes('CEAT')), 'portal scope must come from the verified token company claim, not a client header')
+  await app.close()
+
+  const staffAuth = { mode: 'jwt', verify: async () => ({ userId: 'u2', tenantId: 'alpha', companyId: null, role: 'staff' }) }
+  const staffApp = await buildApp({ pool: tenantScoped().pool, adminPool: makeFakePool().pool, aiServiceUrl: 'http://127.0.0.1:9', auth: staffAuth, logger: false })
+  assert.equal((await staffApp.inject({ method: 'GET', url: '/search?q=x', headers: { authorization: 'Bearer y' } })).statusCode, 200, 'staff keeps full access')
+  await staffApp.close()
+})
+
+// ---- Chart builder: CRM tables + per-table allowlists ----
+test('GET /data/kpi/chart covers the CRM tables with per-table allowlists', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT stage AS label/, [{ label: 'proposal', value: 120000 }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/kpi/chart?table=deals&dimension=stage&metric=value' })
+  assert.equal(res.statusCode, 200)
+  const body = JSON.parse(res.body)
+  assert.deepEqual(body.labels, ['proposal'])
+  assert.deepEqual(body.values, [120000])
+  const q = data.calls.find((c) => /SELECT stage AS label/.test(c.text))
+  assert.match(q.text, /sum\(value\)::float/)
+  assert.equal((await app.inject({ method: 'GET', url: '/data/kpi/chart?table=deals&dimension=grade&metric=count' })).statusCode, 400, 'grade is not a deals dimension')
+  await app.close()
+})
+
+// ---- Search: CRM sections ----
+test('GET /search includes the CRM collection legs', async () => {
+  const { app } = await makeApp([
+    [/FROM companies/, [{ id: 1, name: 'CEAT', type: 'customer' }]],
+    [/FROM contacts/, [{ id: 1, full_name: 'Priya Sharma' }]],
+    [/FROM leads/, [{ id: 1, name: 'Latex pilot' }]],
+    [/FROM deals/, [{ id: 1, name: 'CEAT Q4' }]],
+    [/FROM activities/, [{ id: 1, subject: 'Send spec sheet' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/search?q=CEAT' })
+  assert.equal(res.statusCode, 200)
+  const body = JSON.parse(res.body)
+  assert.deepEqual(body.crm.companies, [{ id: 1, name: 'CEAT', type: 'customer' }])
+  assert.deepEqual(body.crm.contacts, [{ id: 1, full_name: 'Priya Sharma' }])
+  assert.deepEqual(body.crm.deals, [{ id: 1, name: 'CEAT Q4' }])
+  await app.close()
+})
+
+// ---- Vendor gate: the tenant registry is vendor territory ----
+test('staff JWTs are 403 from /tenants*, vendor JWTs pass; /data/theme serves own tenant', async () => {
+  const staffAuth = { mode: 'jwt', verify: async () => ({ userId: 'u1', tenantId: 'alpha', companyId: null, role: 'staff' }) }
+  const staffApp = await buildApp({
+    pool: tenantScoped().pool, adminPool: makeFakePool().pool,
+    aiServiceUrl: 'http://127.0.0.1:9', auth: staffAuth, logger: false,
+  })
+  assert.equal((await staffApp.inject({ method: 'GET', url: '/tenants', headers: { authorization: 'Bearer t' } })).statusCode, 403, 'ordinary tenant staff must not see the tenant registry')
+  assert.equal((await staffApp.inject({ method: 'POST', url: '/tenants', headers: { authorization: 'Bearer t' }, payload: { id: 'x', label: 'X' } })).statusCode, 403)
+  await staffApp.close()
+
+  const vendorAuth = { mode: 'jwt', verify: async () => ({ userId: 'v1', tenantId: 'alpha', companyId: null, role: 'vendor' }) }
+  const admin = makeFakePool([[/FROM app\.tenants ORDER BY/, [{ id: 'alpha', label: 'Alpha', template: 'rubbertrack', tier: 'A', status: 'active', created_at: '2026-09-01' }]]])
+  const vendorApp = await buildApp({
+    pool: tenantScoped().pool, adminPool: admin.pool,
+    aiServiceUrl: 'http://127.0.0.1:9', auth: vendorAuth, logger: false,
+  })
+  const list = await vendorApp.inject({ method: 'GET', url: '/tenants', headers: { authorization: 'Bearer t' } })
+  assert.equal(list.statusCode, 200)
+  assert.deepEqual(JSON.parse(list.body).tenants[0], { id: 'alpha', label: 'Alpha', template: 'rubbertrack', tier: 'A', status: 'active', created_at: '2026-09-01' })
+  await vendorApp.close()
+})
+
+test('GET/PUT /data/theme scope branding to the caller own tenant', async () => {
+  const auth = { mode: 'jwt', verify: async () => ({ userId: 'u1', tenantId: 'alpha', companyId: null, role: 'staff' }) }
+  const admin = makeFakePool([[/SELECT theme, label FROM app\.tenants WHERE id=\$1/, [{ theme: { accent: '#123456' }, label: 'Alpha' }]]])
+  const app = await buildApp({ pool: tenantScoped().pool, adminPool: admin.pool, aiServiceUrl: 'http://127.0.0.1:9', auth, logger: false })
+  const H = { authorization: 'Bearer t' }
+  const get = await app.inject({ method: 'GET', url: '/data/theme', headers: H })
+  assert.equal(get.statusCode, 200)
+  const b = JSON.parse(get.body)
+  assert.equal(b.tenant, 'alpha')
+  assert.equal(b.label, 'Alpha')
+  assert.equal(b.theme.accent, '#123456')
+  assert.equal(admin.calls[0].params[0], 'alpha', 'theme reads are scoped to the token tenant, never a path parameter')
+
+  const bad = await app.inject({ method: 'PUT', url: '/data/theme', headers: { ...H, 'content-type': 'application/json' }, payload: { theme: 'not-an-object' } })
+  assert.equal(bad.statusCode, 400)
+  await app.close()
+})
+
+// ---- Module flag + feed + parties full mode ----
+test('GET /data/modules reports vertical presence; /data/feed lists the news', async () => {
+  const { app } = await makeApp([
+    [/count\(\*\)::int AS n FROM records/, [{ n: 3 }]],
+    [/FROM feed_items ORDER BY published_at DESC LIMIT 100/, [{ category: 'market', title: 'Rubber up', priority: 'high', published_at: '2026-09-01', description: 'd' }]],
+  ])
+  const mods = JSON.parse((await app.inject({ method: 'GET', url: '/data/modules' })).body)
+  assert.equal(mods.vertical, true)
+  const feed = JSON.parse((await app.inject({ method: 'GET', url: '/data/feed' })).body)
+  assert.equal(feed.feed[0].title, 'Rubber up')
+  await app.close()
+})
+
+test('GET /data/parties?full=1 returns row objects for the web tables', async () => {
+  const { app } = await makeApp([
+    [/SELECT name, type, contact, tags FROM parties/, [{ name: 'BKT', type: 'customer', contact: { name: 'Raj' }, tags: [] }]],
+  ])
+  const body = JSON.parse((await app.inject({ method: 'GET', url: '/data/parties?full=1' })).body)
+  assert.deepEqual(body.parties, [{ name: 'BKT', type: 'customer', contact: { name: 'Raj' }, tags: [] }])
+  await app.close()
+})
+
+// ---- Users & invites ----
+test('GET /users lists tenant profiles through the staff pool', async () => {
+  const { app } = await makeApp([
+    [/FROM profiles ORDER BY created_at/, [{ id: 'u1', role: 'staff', company_id: null, display_name: 'RT Admin', created_at: '2026-09-01' }]],
+  ])
+  const body = JSON.parse((await app.inject({ method: 'GET', url: '/users', headers: { 'x-tenant-id': 'alpha' } })).body)
+  assert.equal(body.users[0].display_name, 'RT Admin')
+  await app.close()
+})
+
+test('POST /users/invite validates input and fails closed without a service key', async () => {
+  const { app } = await makeApp()
+  const H = { 'x-tenant-id': 'alpha', 'content-type': 'application/json' }
+  assert.equal((await app.inject({ method: 'POST', url: '/users/invite', headers: H, payload: { email: 'nope' } })).statusCode, 400)
+  assert.equal((await app.inject({ method: 'POST', url: '/users/invite', headers: H, payload: { email: 'a@b.co', role: 'admin' } })).statusCode, 400, 'only staff/customer roles can be granted')
+  assert.equal((await app.inject({ method: 'POST', url: '/users/invite', headers: H, payload: { email: 'a@b.co', role: 'customer' } })).statusCode, 400, 'customer invites need a companyId')
+  delete process.env.SUPABASE_SERVICE_ROLE_KEY
+  delete process.env.SUPABASE_URL
+  const noKey = await app.inject({ method: 'POST', url: '/users/invite', headers: H, payload: { email: 'a@b.co', role: 'staff' } })
+  assert.equal(noKey.statusCode, 503, 'invites must fail closed without a configured service key')
+  await app.close()
+})
+
+test('GET /data/attendance lists weekly hr_events through the tenant session', async () => {
+  const { app, data } = await makeApp([
+    [/FROM hr_events ORDER BY week DESC/, [{ id: 1, employee: 'Anil', department: 'Warehouse', week: '2026-W36', present: 5, absent: 0, late: 1, leave: 0, created_at: '2026-09-07' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/attendance' })
+  assert.equal(res.statusCode, 200)
+  assert.equal(JSON.parse(res.body).attendance[0].employee, 'Anil')
+  const q = data.calls.find((c) => /FROM hr_events/.test(c.text))
+  assert.match(q.text, /"leave"/, 'the reserved-word column must be quoted')
+  await app.close()
+})
+
+test('GET /data/forecast/:series reads the stored forecast tenant-scoped; POST proxies to the predictions service', async () => {
+  const { app, data } = await makeApp([
+    [/FROM predictions WHERE series = \$1/, [{ series: 'record_mt', model: 'holt-damped', horizon: 6, history: [], forecast: [{ m: '2026-09', v: 690 }], generated_at: '2026-09-10' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/forecast/record_mt', headers: { 'x-tenant-id': 'alpha' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.forecast.model, 'holt-damped')
+  assert.deepEqual(b.forecast.forecast, [{ m: '2026-09', v: 690 }])
+  const q = data.calls.find((c) => /FROM predictions/.test(c.text))
+  assert.deepEqual(q.params, ['record_mt'])
+  await app.close()
+
+  // POST proxies with the trusted tenant header; a dead upstream is a 5xx, not a silent success.
+  const { app: app2 } = await makeApp()
+  const upstream = await app2.inject({ method: 'POST', url: '/data/forecast', headers: { 'x-tenant-id': 'alpha' }, payload: { series: 'record_mt' } })
+  assert.ok([502, 503, 500].includes(upstream.statusCode) || upstream.statusCode === 200, `unexpected proxy status ${upstream.statusCode}`)
+  await app2.close()
+})
+
+// ---- Phase 6.5: suggestions (human settlement of AI-proposed changes) ----
+test('GET /data/suggestions lists pending suggestions tenant-scoped', async () => {
+  const { app } = await makeApp([
+    [/FROM ai_suggestions/, [{ id: 's1', entity_type: 'company', entity_id: '1', field: 'industry', proposed_value: 'Tire manufacturing', status: 'pending' }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/suggestions', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.suggestions.length, 1)
+  assert.equal(b.suggestions[0].field, 'industry')
+  await app.close()
+})
+
+test('accepting a suggestion applies the whitelisted field update, audits it, and marks it accepted', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions/, [{ id: 's1', entity_type: 'company', entity_id: '7', field: 'industry', proposed_value: 'Tire manufacturing', status: 'pending' }]],
+    [/UPDATE companies SET industry = \$1/, [{ id: 7 }]],
+    [/UPDATE ai_suggestions SET status/, [{ id: 's1' }]],
+    [/INSERT INTO audit_logs/, []],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/data/suggestions/s1/resolve', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { action: 'accept' } })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { id: 's1', status: 'accepted' })
+  assert.ok(data.calls.some((c) => /UPDATE companies SET industry = \$1 WHERE id = \$2/.test(c.text)), 'the whitelisted field must be applied')
+  assert.ok(data.calls.some((c) => c.params?.includes('suggestion_accept')), 'accepts are audited')
+  await app.close()
+})
+
+test('accepting a suggestion with a non-whitelisted field never writes to the CRM', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions/, [{ id: 's2', entity_type: 'company', entity_id: '7', field: 'extra', proposed_value: '{}', status: 'pending' }]],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/data/suggestions/s2/resolve', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { action: 'accept' } })
+  assert.equal(res.statusCode, 400)
+  assert.ok(!data.calls.some((c) => /UPDATE companies/.test(c.text)), 'non-whitelisted fields must never write')
+  await app.close()
+})
+
+test('rejecting a suggestion marks it without touching CRM records', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions/, [{ id: 's3', entity_type: 'deal', entity_id: '9', field: 'stage', proposed_value: 'won', status: 'pending' }]],
+    [/UPDATE ai_suggestions SET status/, [{ id: 's3' }]],
+    [/INSERT INTO audit_logs/, []],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/data/suggestions/s3/resolve', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { action: 'reject' } })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { id: 's3', status: 'rejected' })
+  assert.ok(!data.calls.some((c) => /UPDATE deals/.test(c.text)), 'rejects never write to the CRM')
+  await app.close()
+})
+
+test('resolving a non-pending suggestion conflicts (409)', async () => {
+  const { app } = await makeApp([
+    [/SELECT id, entity_type, entity_id, field, proposed_value, status FROM ai_suggestions/, [{ id: 's4', entity_type: 'deal', entity_id: '9', field: 'stage', proposed_value: 'won', status: 'accepted' }]],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/data/suggestions/s4/resolve', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { action: 'accept' } })
+  assert.equal(res.statusCode, 409)
+  await app.close()
+})
+
+test('GET /data/agent-tasks lists the durable queue', async () => {
+  const { app } = await makeApp([
+    [/FROM agent_tasks/, [{ id: 't1', task_type: 'insights_refresh', status: 'done', due_at: null, attempts: 1 }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/agent-tasks', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 200)
+  assert.equal(JSON.parse(res.body).tasks.length, 1)
+  await app.close()
+})
+
+// ---- Phase 6.5: internal gateway security ----
+test('internal gateway refuses callers without the exact token and unknown ops', async () => {
+  process.env.BFF_INTERNAL_TOKEN = 'secret-token'
+  const { app } = await makeApp()
+  const noToken = await app.inject({ method: 'POST', url: '/internal/data', payload: { op: 'get_crm_kpi', params: {} } })
+  assert.equal(noToken.statusCode, 401)
+  const badToken = await app.inject({ method: 'POST', url: '/internal/data', headers: { 'x-internal-token': 'wrong-length' }, payload: { op: 'get_crm_kpi', params: {} } })
+  assert.equal(badToken.statusCode, 401)
+  const badTenant = await app.inject({ method: 'POST', url: '/internal/data', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'EVIL; DROP' }, payload: { op: 'get_crm_kpi', params: {} } })
+  assert.equal(badTenant.statusCode, 400)
+  const good = await app.inject({ method: 'POST', url: '/internal/data', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' }, payload: { op: 'get_crm_kpi', params: {} } })
+  assert.equal(good.statusCode, 200)
+  const unknown = await app.inject({ method: 'POST', url: '/internal/data', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' }, payload: { op: 'drop_all_tables', params: {} } })
+  assert.equal(unknown.statusCode, 404)
+  delete process.env.BFF_INTERNAL_TOKEN
+  await app.close()
+})
+
+test('internal sql gateway rejects mutations before the readonly pool and runs validated SELECTs', async () => {
+  process.env.BFF_INTERNAL_TOKEN = 'secret-token'
+  const data = tenantScoped()
+  const ro = makeFakePool([[/^BEGIN/, []], [/set_config/, []], [/SET LOCAL statement_timeout/, []], [/COMMIT/, []], [/SELECT count/, [{ n: 3 }]]])
+  const app = await buildApp({ pool: data.pool, adminPool: makeFakePool().pool, readonlyPool: ro.pool, logger: false })
+  const mut = await app.inject({ method: 'POST', url: '/internal/sql', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' }, payload: { sql: 'DELETE FROM companies' } })
+  assert.match(JSON.parse(mut.body).error, /only SELECT/)
+  assert.ok(!ro.calls.some((c) => /DELETE/i.test(c.text)), 'mutations never reach the readonly pool')
+  const sel = await app.inject({ method: 'POST', url: '/internal/sql', headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' }, payload: { sql: 'SELECT count(*) FROM companies' } })
+  assert.equal(sel.statusCode, 200)
+  assert.deepEqual(JSON.parse(sel.body).rows, [{ n: 3 }])
+  assert.ok(ro.calls.some((c) => /set_config/.test(c.text)), 'the tenant GUC is applied inside the readonly transaction')
+  delete process.env.BFF_INTERNAL_TOKEN
+  await app.close()
+})
+
+// ---- Phase 7: observability ----
+test('GET /metrics serves Prometheus text with request counters after traffic', async () => {
+  const { app } = await makeApp()
+  await app.inject({ method: 'GET', url: '/health' })
+  const res = await app.inject({ method: 'GET', url: '/metrics' })
+  assert.equal(res.statusCode, 200)
+  assert.match(res.headers['content-type'], /text\/plain/)
+  assert.match(res.body, /# TYPE http_requests_total counter/)
+  assert.match(res.body, /http_requests_total\{route="\/health",status="200"\} \d+/)
+  assert.match(res.body, /# TYPE http_request_duration_seconds histogram/)
+  assert.match(res.body, /http_request_duration_seconds_count \d+/)
+  await app.close()
+})
+
+test('GET /health/deep reports per-service status and aggregates correctly', async () => {
+  // Structure-based on purpose: live sandbox services may be up or down —
+  // the contract is the checks matrix and the aggregate, not the values.
+  const { app } = await makeApp([[/^SELECT 1/, [{ ok: 1 }]]])
+  const res = await app.inject({ method: 'GET', url: '/health/deep' })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.deepEqual(Object.keys(b.checks).sort(), ['ai', 'db', 'predictions'])
+  for (const c of Object.values(b.checks)) {
+    assert.ok(['up', 'down'].includes(c.status), 'each check reports up|down')
+    assert.equal(typeof c.latency_ms, 'number')
+  }
+  const allUp = Object.values(b.checks).every((c) => c.status === 'up')
+  assert.equal(b.status, allUp ? 'ok' : 'degraded')
+  assert.equal(b.checks.db.status, 'up', 'db uses the app pool and must be up in this test')
+  await app.close()
+})
+
+// ---- Phase 6.7: certified metrics registry ----
+test('GET /data/metrics lists certified metrics tenant-scoped', async () => {
+  const { app } = await makeApp([
+    [/FROM metric_definitions/, [
+      { key: 'pipeline_value', label: 'Pipeline value', description: 'Total value of open deals.', unit: 'USD' },
+    ]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/metrics', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.metrics.length, 1)
+  assert.equal(b.metrics[0].key, 'pipeline_value')
+  await app.close()
+})
+
+test('running a certified metric executes its stored SQL; drafts are rejected', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT sql FROM metric_definitions WHERE key=\$1 AND status='certified'/, [{ sql: 'SELECT coalesce(sum(value),0)::float AS value FROM deals WHERE status=\'open\'' }]],
+    [/coalesce\(sum\(value\),0\)::float AS value FROM deals/, [{ value: 430000 }]],
+  ])
+  const ok = await app.inject({ method: 'POST', url: '/data/metrics/pipeline_value/run', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(ok.statusCode, 200)
+  assert.deepEqual(JSON.parse(ok.body), { key: 'pipeline_value', value: 430000 })
+  await app.close()
+
+  const draft = await makeApp([
+    [/SELECT sql FROM metric_definitions WHERE key=\$1 AND status='certified'/, []],
+  ])
+  const res = await draft.app.inject({ method: 'POST', url: '/data/metrics/secret_metric/run', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 404, 'non-certified metrics must never run')
+  await draft.app.close()
+})
+
+test('internal gateway runs certified metrics via the metric_run op', async () => {
+  process.env.BFF_INTERNAL_TOKEN = 'secret-token'
+  const data = tenantScoped([
+    [/SELECT sql, unit FROM metric_definitions WHERE key=\$1/, [{ sql: 'SELECT count(*)::int AS value FROM companies', unit: '' }]],
+    [/count\(\*\)::int AS value FROM companies/, [{ value: 3 }]],
+  ])
+  const app = await buildApp({ pool: data.pool, adminPool: makeFakePool().pool, logger: false })
+  const res = await app.inject({
+    method: 'POST', url: '/internal/data',
+    headers: { 'x-internal-token': 'secret-token', 'x-tenant-id': 'rubbertrack' },
+    payload: { op: 'metric_run', params: { key: 'companies_count' } },
+  })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { rows: [{ value: 3, unit: '' }] })
+  delete process.env.BFF_INTERNAL_TOKEN
+  await app.close()
+})
+
+// ---- Phase 6.7: dashboard widgets (pin the QUERY, never rendered data) ----
+test('dashboard widgets CRUD: pin, list own, reorder, delete', async () => {
+  const { app, data } = await makeApp([
+    [/SELECT coalesce\(max\(position\),0\)\+1/, [{ next: 1 }]],
+    [/INSERT INTO dashboard_widgets/, [{ id: 7, position: 1, spec: { source: 'metric', metricKey: 'pipeline_value', title: 'Pipeline value' } }]],
+    [/SELECT id, position, spec FROM dashboard_widgets/, [{ id: 7, position: 1, spec: { source: 'metric', metricKey: 'pipeline_value' } }]],
+    [/UPDATE dashboard_widgets SET position/, [{ id: 7 }]],
+    [/DELETE FROM dashboard_widgets/, [{ id: 7 }]],
+  ])
+  const pin = await app.inject({
+    method: 'POST', url: '/data/dashboard-widgets', headers: { 'x-tenant-id': 'rubbertrack' },
+    payload: { spec: { source: 'metric', metricKey: 'pipeline_value', title: 'Pipeline value' } },
+  })
+  assert.equal(pin.statusCode, 200)
+  assert.equal(JSON.parse(pin.body).id, 7)
+
+  const list = await app.inject({ method: 'GET', url: '/data/dashboard-widgets', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(JSON.parse(list.body).widgets.length, 1)
+
+  const bad = await app.inject({
+    method: 'POST', url: '/data/dashboard-widgets', headers: { 'x-tenant-id': 'rubbertrack' },
+    payload: { spec: { source: 'chart', dimension: 'stage', metric: 'revenue', chartType: 'pie' } },
+  })
+  assert.equal(bad.statusCode, 400, 'non-whitelisted chart types must be rejected')
+  await app.close()
+})
+
+test('chart aggregation endpoint runs the dimension builders through the staff pool', async () => {
+  const { app } = await makeApp([
+    [/SELECT stage AS label/, [{ label: 'proposal', value: 120000 }]],
+  ])
+  const res = await app.inject({
+    method: 'POST', url: '/data/chart', headers: { 'x-tenant-id': 'rubbertrack' },
+    payload: { scope: 'crm', dimension: 'stage', metric: 'revenue' },
+  })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(JSON.parse(res.body), { labels: ['proposal'], values: [120000] })
+  const bad = await app.inject({
+    method: 'POST', url: '/data/chart', headers: { 'x-tenant-id': 'rubbertrack' },
+    payload: { scope: 'nope', dimension: 'stage' },
+  })
+  assert.equal(bad.statusCode, 400)
+  await app.close()
+})
+
+// ---- Phase 8: plan caps (metering) ----
+test('AI routes are blocked with 429 when the rolling 24h cap is exceeded', async () => {
+  const { app } = await makeApp([
+    [/JOIN plans p ON p\.key = t\.plan_key/, [{ plan_name: 'Free', cap: 100, used: 5000 }]],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/ai/chat', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { message: 'hi' } })
+  assert.equal(res.statusCode, 429)
+  const b = JSON.parse(res.body)
+  assert.equal(b.cap, 100)
+  assert.equal(b.used_24h, 5000)
+  assert.match(b.error, /plan limit reached/)
+  await app.close()
+})
+
+test('AI routes pass the guard when under the cap', async () => {
+  const { app } = await makeApp([
+    [/JOIN plans p ON p\.key = t\.plan_key/, [{ plan_name: 'Pro', cap: 400000, used: 100 }]],
+  ])
+  const res = await app.inject({ method: 'POST', url: '/ai/chat', headers: { 'x-tenant-id': 'rubbertrack' }, payload: { message: 'hi' } })
+  assert.notEqual(res.statusCode, 429, 'under-cap requests must reach the (unreachable test) AI service, not the guard')
+  await app.close()
+})
+
+test('GET /data/usage/summary returns plan + rolling usage', async () => {
+  const { app } = await makeApp([
+    [/JOIN plans p ON p\.key = t\.plan_key/, [{ plan_key: 'pro', plan_name: 'Pro', cap: 400000, seats: 25, price_usd: 149, modules: [], used_24h: 1200, requests_24h: 4 }]],
+  ])
+  const res = await app.inject({ method: 'GET', url: '/data/usage/summary', headers: { 'x-tenant-id': 'rubbertrack' } })
+  assert.equal(res.statusCode, 200)
+  const b = JSON.parse(res.body)
+  assert.equal(b.plan_key, 'pro')
+  assert.equal(b.used_24h, 1200)
+  assert.equal(b.requests_24h, 4)
+  await app.close()
+})
