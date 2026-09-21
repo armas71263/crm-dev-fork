@@ -327,12 +327,12 @@ export async function buildApp({ gateway, logger = true }) {
     // run_sql: LLM- or user-written SELECT, executed behind the guardrails.
     // Phase 5 completion: predicted probability that a deal will be won
     // (logistic model trained on the tenant deal corpus; interpretable).
-    get_win_probability: async (tenantId, { dealId }) => {
+    get_win_probability: async (tenantId, { dealId, model }) => {
       if (!dealId) return { error: 'dealId is required' }
       const res = await fetch(`${process.env.PREDICTIONS_SERVICE_URL || 'http://localhost:5100'}/win-probability`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-tenant-id': tenantId },
-        body: JSON.stringify({ deal_id: dealId }),
+        body: JSON.stringify({ deal_id: dealId, ...(model === 'mitra' ? { model: 'mitra' } : {}) }),
       })
       if (!res.ok) return { error: `predictions service ${res.status}` }
       return await res.json()
@@ -405,8 +405,8 @@ export async function buildApp({ gateway, logger = true }) {
         s: { type: 'object', properties: { series: { type: 'string', description: 'series key: record_mt or deal_value' } } },
       },
       get_win_probability: {
-        d: 'Get the predicted probability (0-1) that a specific open deal will be won, from the win-probability model trained on the deal history. Provide the numeric deal id.',
-        s: { type: 'object', properties: { dealId: { type: 'number', description: 'the numeric deal id' } }, required: ['dealId'] },
+        d: 'Get the predicted probability (0-1) that a specific open deal will be won, from the win-probability model trained on the deal history (logit default; pass model mitra for the opt-in Mitra foundation-model challenger). Provide the numeric deal id.',
+        s: { type: 'object', properties: { dealId: { type: 'number', description: 'the numeric deal id' }, model: { type: 'string', description: 'omit for the default logit model, or mitra for the challenger' } } },
       },      get_metric: {
         d: 'Run a CERTIFIED business metric (pipeline_value, open_deals_count, open_leads_count, companies_count, order_volume_mt, revenue_total, open_tasks_count, overdue_tasks_count, open_issues_count...). Certified metrics are the single source of truth — prefer this over recomputing numbers in SQL.',
         s: { type: 'object', properties: { key: { type: 'string', description: 'the metric key' } }, required: ['key'] },
