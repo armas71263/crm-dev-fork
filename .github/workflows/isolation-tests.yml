@@ -34,5 +34,5 @@ jobs:
             psql "postgresql://app_role:apppass@localhost:5432/rubbertrack" \
             < tests/isolation.sql
       - name: Teardown
-        if: always
+        if: always()
         run: docker compose down -v

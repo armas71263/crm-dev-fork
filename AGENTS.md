@@ -133,3 +133,7 @@ Local git only (`/workspace/project`, branch `feat/phase0-1-template-engine`). N
 - **Cap guard fail-open on missing plan config is deliberate** (vendor config error must not brick tenants) — but the drill must set a REAL plan row to prove the block.
 - **app.tenants columns: id, label, template, tier, status, theme, created_at, plan_key** (NO name column) — restore scripts must copy label/template/tier when creating the registry row.
 - **Restore drills: quote every identifier** (hr_events has the reserved word `leave`), drop row ids (fresh bigserial), create the registry row FIRST (FK target), restore into a NEW tenant id never in place, verify per-table counts, self-clean.
+
+## Mitra win-probability challenger (2026-09-21)
+- `apps/predictions/mitra_winprob.py`: flag-gated (`PREDICTIONS_USE_MITRA=1`) zero-shot Mitra (`hyperparameters={"MITRA": {"fine_tune": False}}`); every failure path falls back to Logit with a `fallback` note. `batch_predict_mitra` is ONE in-context predict_proba pass, never N separate fits. Real fits need ~7GB RAM + GPU (AutoGluon warns CPU is 12-63x slower) — promote past challenger only on real-hardware numbers over real closed deals.
+- **GitHub Actions `if:` must be a valid expression**: bare `always` (missing parens) fails the workflow BEFORE any job starts — the run completes `failure` in 0s with zero jobs and no logs; must be `always()`. Every run on this repo failed this way until the fix. Diagnose via `gh run view` ("This run likely failed because of a workflow file issue") and lint with actionlint.
