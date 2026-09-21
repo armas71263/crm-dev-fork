@@ -21,7 +21,8 @@ check() { # expected-line
 echo "== Staff session (app_role) =="
 OUT=$(psql "$STAFF_DSN" -tA -v ON_ERROR_STOP=1 -f tests/isolation.sql 2>&1) || { echo "$OUT"; exit 1; }
 echo "$OUT" | grep -q 'A3_OK' && echo '✓ A3 cross-tenant INSERT blocked' || { echo '❌ A3 not blocked'; fail=1; }
-check 'A1_rt_records=7'
+# 7 base rows (005) + 69 deterministic ORD-HIST rows (008 seed: 23 months x 3)
+check 'A1_rt_records=76'
 check 'A2_rt_sees_lexley=0'
 check 'B1_lexley_records=1'
 check 'B2_lexley_tickets=0'
@@ -40,7 +41,7 @@ check 'F2_lexley_configs=0'
 echo "== Customer session (app_customer) =="
 OUT=$(psql "$CUSTOMER_DSN" -tA -v ON_ERROR_STOP=1 -f tests/isolation-customer.sql 2>&1) || { echo "$OUT"; exit 1; }
 echo "$OUT" | grep -q 'D8_OK' && echo '✓ D8 customer write denied' || { echo '❌ D8 customer write not denied'; fail=1; }
-check 'D1_ceat_records=1'
+check 'D1_ceat_records=16'
 check 'D2_ceat_non_own=0'
 check 'D3_ceat_companies=1'
 check 'D4_ceat_deals=2'

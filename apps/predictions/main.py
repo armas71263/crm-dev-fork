@@ -78,8 +78,12 @@ def forecast(body: dict, x_tenant_id: str = Header(None)):
 
 # ---- Phase 5 completion: win-probability (deal outcome) ----
 from winprob import train as train_winprob, predict as predict_winprob  # noqa: E402
+from mitra_winprob import (  # noqa: E402
+    mitra_available, train_mitra, holdout_accuracy, batch_predict_mitra,
+)
 
 _WINPROB_CACHE = {}
+_MITRA_CACHE = {}
 
 
 def _trained(tenant):
@@ -94,6 +98,34 @@ def _trained(tenant):
     return _WINPROB_CACHE[tenant]
 
 
+_MITRA_CORPUS_SQL = (
+    "SELECT value, stage, company_type, source, days_open, activities_count, won "
+    "FROM deal_history"
+)
+
+
+def _challenger_payload(mt):
+    if mt["ok"]:
+        out = {"ok": True, "n": mt["n"]}
+        if mt.get("accuracy") is not None:
+            out["accuracy"] = round(mt["accuracy"], 4)
+        return out
+    return {"ok": False, "error": mt.get("error", "mitra unavailable")}
+
+
+def _trained_mitra(tenant):
+    if tenant not in _MITRA_CACHE:
+        if not mitra_available():
+            _MITRA_CACHE[tenant] = {"ok": False, "error": "mitra disabled"}
+        else:
+            history = tenant_query(tenant, _MITRA_CORPUS_SQL)
+            t = train_mitra(history)
+            if t["ok"]:
+                t["accuracy"] = holdout_accuracy(t, history)
+            _MITRA_CACHE[tenant] = t
+    return _MITRA_CACHE[tenant]
+
+
 @app.get("/win-probability/model")
 def win_probability_model(x_tenant_id: str = Header(None)):
     if not x_tenant_id:
@@ -101,12 +133,14 @@ def win_probability_model(x_tenant_id: str = Header(None)):
     t = _trained(x_tenant_id)
     if not t["ok"]:
         return t
+    challenger = _challenger_payload(_trained_mitra(x_tenant_id))
     return {
         "ok": True,
         "n": t["n"],
         "accuracy": round(t["accuracy"], 4),
         "pseudo_r2": round(t["pseudo_r2"], 4),
         "coef": dict(zip(t["feature_names"], [round(c, 4) for c in t["coef"]])),
+        "challenger": challenger,
     }
 
 
@@ -114,11 +148,20 @@ def win_probability_model(x_tenant_id: str = Header(None)):
 def win_probability(body: dict, x_tenant_id: str = Header(None)):
     tenant = x_tenant_id or body.get("tenant")
     deal_id = body.get("deal_id")
+    want_mitra = (body.get("model") or "").lower() == "mitra"
     if not tenant or not deal_id:
         raise HTTPException(status_code=400, detail="x-tenant-id and deal_id required")
     t = _trained(tenant)
     if not t["ok"]:
         return {"ok": False, "error": t["error"]}
+    model_meta = {"name": "logit", "n": t["n"], "accuracy": round(t["accuracy"], 4)}
+    use_mitra = False
+    if want_mitra:
+        mt = _trained_mitra(tenant)
+        if mt["ok"]:
+            use_mitra = True
+        else:
+            model_meta["fallback"] = mt.get("error", "mitra unavailable")
     deals = tenant_query(
         tenant,
         """SELECT d.name, d.value::float AS value, d.stage,
@@ -135,13 +178,27 @@ def win_probability(body: dict, x_tenant_id: str = Header(None)):
     )
     if not deals:
         return {"ok": False, "error": "deal not found in this tenant"}
+    if use_mitra:
+        mt = _trained_mitra(tenant)
+        p = batch_predict_mitra([deals[0]], mt)
+        if p["ok"]:
+            meta = {"name": "mitra", **_challenger_payload(mt)}
+            del meta["ok"]
+            return {
+                "ok": True,
+                "deal": deals[0].get("name"),
+                "deal_id": deal_id,
+                "probability": p["probabilities"][0],
+                "model": meta,
+            }
+        model_meta["fallback"] = p.get("error", "mitra predict failed")
     p = predict_winprob(deals[0], t)
     if not p["ok"]:
         return p
     return {
         "ok": True,
-        "deal": deals[0]["name"],
+        "deal": deals[0].get("name"),
         "deal_id": deal_id,
         "probability": p["probability"],
-        "model": {"n": t["n"], "accuracy": round(t["accuracy"], 4)},
+        "model": model_meta,
     }
