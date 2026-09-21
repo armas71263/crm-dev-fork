@@ -24,15 +24,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Boot stack
-        run: docker compose up -d --wait
-      - name: Wait for schema init
-        run: sleep 20
-      - name: Run isolation tests A-F
+      - name: Boot Postgres
+        run: docker compose up -d --wait postgres
+      - name: Wait for Postgres readiness
         run: |
-          docker exec -i rubbertrack-platform-postgres-1 \
-            psql "postgresql://app_role:apppass@localhost:5432/rubbertrack" \
-            < tests/isolation.sql
+          for i in $(seq 1 30); do
+            docker exec rubbertrack-platform-postgres-1 pg_isready -U postgres && break
+            sleep 1
+          done
+      - name: Apply migrations (schema, roles, demo seeds)
+        run: ./infra/scripts/migrate.sh
+      - name: Run isolation suite (staff, customer, readonly)
+        run: bash tests/run-isolation.sh
       - name: Teardown
         if: always()
         run: docker compose down -v
