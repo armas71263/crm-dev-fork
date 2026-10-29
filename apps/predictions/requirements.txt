@@ -3,3 +3,6 @@ uvicorn[standard]
 pandas
 statsmodels
 psycopg[binary]
+# Test runner + TestClient transport (README's pytest command)
+pytest
+httpx2
